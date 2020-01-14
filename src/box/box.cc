@@ -76,7 +76,13 @@
 #include "func.h"
 #include "sequence.h"
 #include "sql_stmt_cache.h"
+#include "uuid/tt_uuid.h"
+#include <sched.h>
+#include "core/shmem.h"
+#include <sys/sysinfo.h>
+#include <semaphore.h>
 
+static const int CPU_COUNT = get_nprocs();
 static char status[64] = "unknown";
 
 /** box.stat rmean */
@@ -530,6 +536,15 @@ box_check_replicaset_uuid(struct tt_uuid *uuid)
 	box_check_uuid(uuid, "replicaset_uuid");
 }
 
+static void
+box_check_cluster_uuid(struct tt_uuid *uuid)
+{
+	*uuid = uuid_nil;
+	const char *uuid_str = cfg_gets("cluster_uuid");
+	if (uuid_str != NULL && tt_uuid_from_string(uuid_str, uuid) != 0)
+		tnt_raise(ClientError, ER_CFG, "cluster_uuid", uuid_str);
+}
+
 static enum wal_mode
 box_check_wal_mode(const char *mode_name)
 {
@@ -650,6 +665,7 @@ box_check_config()
 	box_check_uri(cfg_gets("listen"), "listen");
 	box_check_instance_uuid(&uuid);
 	box_check_replicaset_uuid(&uuid);
+	box_check_cluster_uuid(&uuid);
 	box_check_replication();
 	box_check_replication_timeout();
 	box_check_replication_connect_timeout();
@@ -1900,6 +1916,28 @@ box_set_replicaset_uuid(const struct tt_uuid *replicaset_uuid)
 		diag_raise();
 }
 
+/** Bind current process to free CPU */
+void
+box_bind_cpu()
+{
+	char cluster_uuid_str[UUID_STR_LEN + 1];
+	char replicaset_uuid_str[UUID_STR_LEN + 1];
+	tt_uuid_to_string(&REPLICASET_UUID, replicaset_uuid_str);
+	tt_uuid_to_string(&CLUSTER_UUID, cluster_uuid_str);
+
+	node_info_init(cluster_uuid_str, get_nprocs());
+	node_info_find_or_create_instance(replicaset_uuid_str);
+}
+
+/** Clean bind CPU resources */
+void
+bind_cpu_free()
+{
+	char cluster_uuid_str[UUID_STR_LEN + 1];
+	tt_uuid_to_string(&CLUSTER_UUID, cluster_uuid_str);
+	node_info_close(cluster_uuid_str);
+}
+
 void
 box_free(void)
 {
@@ -1916,6 +1954,7 @@ box_free(void)
 		tuple_free();
 		port_free();
 #endif
+		bind_cpu_free();
 		iproto_free();
 		replication_free();
 		sequence_free();
@@ -2337,6 +2376,12 @@ box_cfg_xc(void)
 	rmean_box = rmean_new(iproto_type_strs, IPROTO_TYPE_STAT_MAX);
 	rmean_error = rmean_new(rmean_error_strings, RMEAN_ERROR_LAST);
 
+	struct tt_uuid instance_uuid, replicaset_uuid, cluster_uuid;
+	box_check_instance_uuid(&instance_uuid);
+	box_check_replicaset_uuid(&replicaset_uuid);
+	box_check_cluster_uuid(&cluster_uuid);
+	box_bind_cpu();
+
 	gc_init();
 	engine_init();
 	schema_init();
@@ -2355,12 +2400,9 @@ box_cfg_xc(void)
 
 	title("loading");
 
-	struct tt_uuid instance_uuid, replicaset_uuid;
-	box_check_instance_uuid(&instance_uuid);
-	box_check_replicaset_uuid(&replicaset_uuid);
-
-	if (box_set_prepared_stmt_cache_size() != 0)
+    if (box_set_prepared_stmt_cache_size() != 0)
 		diag_raise();
+
 	box_set_net_msg_max();
 	box_set_readahead();
 	box_set_too_long_threshold();

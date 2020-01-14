@@ -160,5 +160,5 @@ add_library(box STATIC
     ${bin_sources})
 
 target_link_libraries(box box_error tuple stat xrow xlog vclock crc32 scramble
-                      sql ${common_libraries})
+	                  rt sql ${common_libraries})
 add_dependencies(box build_bundled_libs)

@@ -14,6 +14,8 @@ include_directories(${CURL_INCLUDE_DIRS})
 
 add_library(unit STATIC unit.c)
 
+add_executable(shm.test shm.c)
+target_link_libraries(shm.test rt unit box)
 add_executable(heap.test heap.c)
 target_link_libraries(heap.test unit)
 add_executable(heap_iterator.test heap_iterator.c)
@@ -213,7 +215,7 @@ add_executable(checkpoint_schedule.test
     checkpoint_schedule.c
     ${PROJECT_SOURCE_DIR}/src/box/checkpoint_schedule.c
 )
-target_link_libraries(checkpoint_schedule.test m unit)
+target_link_libraries(checkpoint_schedule.test m unit box)
 
 add_executable(sio.test sio.c)
 target_link_libraries(sio.test unit core)

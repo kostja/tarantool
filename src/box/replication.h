@@ -173,8 +173,18 @@ replication_free(void);
 extern uint32_t instance_id;
 /** UUID of the instance. */
 extern struct tt_uuid INSTANCE_UUID;
-/** UUID of the replica set. */
+/** UUID of the replica set.
+ * Replicasets are distributed across instances.
+ * For example, if there are two nodes with 16 CPU cores for each,
+ * we get 16 replicasets on each of the nodes.
+ * All replicas will have a common cluster identifier.
+ * Due to this, they automatically receive a common memory
+ * with information about surrent CPU binding
+ * (see box_bind_cpu() function).
+ */
 extern struct tt_uuid REPLICASET_UUID;
+/** UUID of the cluster. */
+extern struct tt_uuid CLUSTER_UUID;
 
 typedef rb_tree(struct replica) replica_hash_t;
 

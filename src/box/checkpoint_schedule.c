@@ -33,6 +33,11 @@
 #include <assert.h>
 #include <math.h>
 #include <stdlib.h>
+#include <sys/sysinfo.h>
+
+#include "uuid/tt_uuid.h"
+#include "replication.h"
+#include "shmem.h"
 
 void
 checkpoint_schedule_cfg(struct checkpoint_schedule *sched,
@@ -46,8 +51,31 @@ checkpoint_schedule_cfg(struct checkpoint_schedule *sched,
 	 * simultaneous checkpointing when multiple instances
 	 * are running on the same host.
 	 */
-	if (interval > 0)
-		sched->start_time += fmod(rand(), interval);
+	if (interval > 0) {
+		struct node_info *ci;
+		char cluster_uuid_str[UUID_STR_LEN + 1];
+		tt_uuid_to_string(&CLUSTER_UUID, cluster_uuid_str);
+		char replicaset_uuid_str[UUID_STR_LEN + 1];
+		tt_uuid_to_string(&REPLICASET_UUID, replicaset_uuid_str);
+		ci = node_info_init(cluster_uuid_str, get_nprocs());
+		struct instance_info *cur_elem = node_info_find_or_create_instance(replicaset_uuid_str);
+		struct instance_info *elem = (struct instance_info *)ci->inst_info_data;
+
+		double f_val = fmod(rand(), interval);
+		sched->start_time += f_val;
+		int i = 0;
+		while (i < ci->curr_num_of_items) {
+			if (fabs(sched->start_time - elem[i].sched_start_time) < __DBL_EPSILON__) {
+				sched->start_time -= f_val;
+				f_val = fmod(rand(), interval);
+				sched->start_time += f_val;
+				i = 0;
+				continue;
+			}
+			++i;
+		}
+		cur_elem->sched_start_time = sched->start_time;
+	}
 }
 
 void

@@ -3,7 +3,12 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/wait.h>
+#include <sys/sysinfo.h>
 
+#include "uuid/tt_uuid.h"
+#include "replication.h"
+#include "shmem.h"
 #include "unit.h"
 #include "checkpoint_schedule.h"
 
@@ -13,8 +18,8 @@ feq(double a, double b)
 	return fabs(a - b) <= 1;
 }
 
-int
-main()
+void
+one_process_check()
 {
 	header();
 	plan(38);
@@ -89,8 +94,73 @@ main()
 		   interval);
 	}
 
+	char cluster_uuid_str[UUID_STR_LEN + 1];
+	tt_uuid_to_string(&CLUSTER_UUID, cluster_uuid_str);
+	node_info_close(cluster_uuid_str);
+
 	check_plan();
 	footer();
+}
 
+void
+several_processes_check()
+{
+	header();
+	int i = 0, j = 0;
+	int n = get_nprocs();
+	pid_t pids[n];
+	char instance_id_child[n][UUID_STR_LEN + 1];
+	while(j < 10) {
+		for (i = 0; i < n; ++i) {
+			if ((pids[i] = fork()) < 0) {
+				say_error("fork");
+				abort();
+			} else if (pids[i] == 0) {
+				sprintf(instance_id_child[i], "24ffedc8-cbae-4f93-a05e-349f3ab70ba%d", i);
+				struct tt_uuid uu;
+				if (tt_uuid_from_string(instance_id_child[i], &uu) != 0) {
+					say_error("wrong uuid\n");
+				}
+				REPLICASET_UUID = uu;
+
+				char replicaset_uuid_str[UUID_STR_LEN + 1];
+				tt_uuid_to_string(&REPLICASET_UUID, replicaset_uuid_str);
+
+				srand(time(NULL));
+				double now = rand();
+				struct checkpoint_schedule sched;
+				checkpoint_schedule_cfg(&sched, now, 123);
+				sleep(5);
+				exit(0);
+			}
+		}
+		int status;
+		for (i = 0; i < n; ++i) {
+			if (waitpid(pids[i], &status, 0) == -1 ) {
+					perror("waitpid failed");
+			}
+		}
+		i = 1;
+		struct node_info *ci;
+		char cluster_uuid_str[UUID_STR_LEN + 1];
+		tt_uuid_to_string(&CLUSTER_UUID, cluster_uuid_str);
+		ci = node_info_init(cluster_uuid_str, get_nprocs());
+		struct instance_info *elem = (struct instance_info *)ci->inst_info_data;
+		struct instance_info *control_elem = &elem[0];
+		while (i != ci->curr_num_of_items) {
+			fail_if(fabs(control_elem->sched_start_time - elem[i].sched_start_time) < __DBL_EPSILON__);
+			++i;
+		}
+		node_info_close(cluster_uuid_str);
+		j++;
+	}
+	footer();
+}
+
+int
+main()
+{
+	one_process_check();
+	several_processes_check();
 	return 0;
 }

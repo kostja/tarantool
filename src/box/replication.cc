@@ -46,6 +46,7 @@
 uint32_t instance_id = REPLICA_ID_NIL;
 struct tt_uuid INSTANCE_UUID;
 struct tt_uuid REPLICASET_UUID;
+struct tt_uuid CLUSTER_UUID;
 
 double replication_timeout = 1.0; /* seconds */
 double replication_connect_timeout = 30.0; /* seconds */
