@@ -1,0 +1,57 @@
+## feature/build
+
+* add box_tuple_data_offset function (return offset of the messagePack encoded data from the begin of the tuple)
+* export functions/simbols. Exported:
+    * port_destroy
+    * cord_slab_cache
+    * obuf_create
+    * obuf_destroy
+    * sql_prepare
+    * sql_stmt_finalize
+    * sql_unprepare
+    * sql_stmt_query_str
+    * sql_stmt_calculate_id
+    * sql_bind_list_decode
+    * decNumberToString
+    * decimal_precision
+    * decimal_scale
+    * decimal_zero
+    * decimal_is_int
+    * strtodec
+    * decimal_from_double
+    * decimal_from_int64
+    * decimal_from_uint64
+    * decimal_to_int64
+    * decimal_to_uint64
+    * decimal_compare
+    * decimal_round
+    * decimal_floor
+    * decimal_trim
+    * decimal_rescale
+    * decimal_remainder
+    * decimal_abs
+    * decimal_minus
+    * decimal_add
+    * decimal_sub
+    * decimal_mul
+    * decimal_div
+    * decimal_log10
+    * decimal_ln
+    * decimal_pow
+    * decimal_exp
+    * decimal_sqrt
+    * decimal_len
+    * decimal_pack
+    * CTID_DECIMAL
+    * tuple_field_raw_by_full_path
+    * box_tuple_data_offset
+    * ipc_value_delete
+    * TIMEOUT_INFINITY
+    * ipc_value_new
+    * fiber_channel_delete
+    * fiber_channel_close
+    * fiber_channel_put_msg_timeout
+    * fiber_channel_get_msg_timeout
+    * fiber_channel_has_readers
+    * fiber_channel_has_writers
+    * fiber_channel_new

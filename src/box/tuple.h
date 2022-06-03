@@ -137,6 +137,13 @@ size_t
 box_tuple_bsize(box_tuple_t *tuple);
 
 /**
+ * Return the number of bytes to the MessagePack from the begin of the tuple.
+ * \param tuple a tuple
+ */
+uint16_t
+box_tuple_data_offset(box_tuple_t *tuple);
+
+/**
  * Dump raw MsgPack data to the memory buffer \a buf of size \a size.
  *
  * Store tuple fields in the memory buffer.

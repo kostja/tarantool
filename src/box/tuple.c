@@ -618,6 +618,13 @@ box_tuple_bsize(box_tuple_t *tuple)
 	return tuple_bsize(tuple);
 }
 
+uint16_t
+box_tuple_data_offset(box_tuple_t *tuple)
+{
+	assert(tuple != NULL);
+	return tuple_data_offset(tuple);
+}
+
 ssize_t
 tuple_to_buf(struct tuple *tuple, char *buf, size_t size)
 {
