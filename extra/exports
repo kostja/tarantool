@@ -558,6 +558,7 @@ sql_unprepare
 sql_stmt_query_str
 sql_stmt_calculate_id
 sql_bind_list_decode
+sql_execute_prepared_ext
 # picodata decimal
 decNumberToString
 decimal_precision

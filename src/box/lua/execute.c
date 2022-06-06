@@ -273,6 +273,14 @@ port_sql_dump_lua(struct port *port, struct lua_State *L, bool is_flat)
 	}
 }
 
+int
+sql_execute_prepared_ext(uint32_t stmt_id, const struct sql_bind *bind,
+			 uint32_t bind_count, struct port *port)
+{
+	return sql_execute_prepared(stmt_id, bind, bind_count, port,
+								&fiber()->gc);
+}
+
 /**
  * Decode a single bind column from Lua stack.
  *
