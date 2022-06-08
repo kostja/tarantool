@@ -1,0 +1,3 @@
+tarantool-picodata: unstripped-binary-or-object usr/bin/tarantool
+tarantool-picodata: embedded-library usr/bin/tarantool: curl
+tarantool-picodata: embedded-library usr/bin/tarantool: libyaml

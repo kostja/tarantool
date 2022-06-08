@@ -1,0 +1,22 @@
+--
+-- System-wide settings for tarantoolctl and init scripts
+--
+-- This file is meant to enable the usage of tarantoolctl inside
+-- docker containers. Since there is no init system, most of its
+-- functionality will not work, except 'tarantoolctl enter' or
+-- 'tarantoolctl status'.
+--
+
+default_cfg = {
+    pid_file   = "/var/run/tarantool", -- /var/run/tarantool/${INSTANCE}.pid
+    wal_dir    = "/var/lib/tarantool", -- /var/lib/tarantool/${INSTANCE}/
+    snap_dir   = "/var/lib/tarantool", -- /var/lib/tarantool/${INSTANCE}
+    vinyl_dir  = "/var/lib/tarantool", -- /var/lib/tarantool/${INSTANCE}
+    logger     = "/var/log/tarantool", -- /var/log/tarantool/${INSTANCE}.log
+    username   = "tarantool",
+}
+
+-- instances.available - all available instances
+-- instances.enabled - instances to autostart by sysvinit
+instance_dir = "/usr/local/etc/tarantool/instances.enabled"
+-- vim: set ft=lua :

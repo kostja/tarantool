@@ -1,0 +1,296 @@
+variables:
+    # set larger git depth, so git describe works properly
+    GIT_DEPTH: 0
+    USER: 'tarantool'
+
+stages:
+  - test
+  - build
+  - build_rpm
+  - build_ubuntu
+  - build_debian
+  - build_altlinux
+  - build_redos
+  - sign
+  - deploy
+  - test_rpm
+  - docker
+
+luacheck:
+    stage: test
+    tags: [docker]
+    image: docker-public.binary.picodata.io/tarantool-testing:latest
+    before_script:
+      - git submodule update --init --recursive
+      - git submodule foreach --recursive 'git clean -xffd'
+      - git clean -xffd
+    script:
+      - make -f .test.mk luacheck
+
+test:
+    stage: test
+    retry: 2
+    tags: [docker]
+    image: docker-public.binary.picodata.io/tarantool-testing:latest
+    before_script:
+      - git submodule update --init --recursive
+      - git submodule foreach --recursive 'git clean -xffd'
+      - git clean -xffd
+    script:
+      - make -f .test.mk test-release
+
+checkpatch:
+    stage: test
+    tags: [shell_p_t]
+    before_script:
+      - git submodule update --init --recursive
+      - git submodule foreach --recursive 'git clean -xffd'
+      - git clean -xffd
+      - git clone git@github.com:tarantool/checkpatch.git
+    script:
+      - checkpatch/checkpatch.pl --color=always --git HEAD~1..HEAD
+
+# run long tests and coverage on release build
+coverage:
+    stage: build
+    only:
+      - web
+      - tags
+    retry: 2
+    tags: [docker]
+    image: docker-public.binary.picodata.io/tarantool-testing:latest
+    variables:
+      TEST_RUN_RETRIES: 3
+      SERVER_START_TIMEOUT: 400
+      REPLICATION_SYNC_TIMEOUT: 400
+      TEST_TIMEOUT: 400
+      NO_OUTPUT_TIMEOUT: 400
+    before_script:
+      - git submodule update --init --recursive
+      - git submodule foreach --recursive 'git clean -xffd'
+      - git clean -xffd
+    script:
+      - make -f .test.mk test-coverage
+
+.pack:
+  tags:
+    - shell_p_t
+  only:
+    - web
+    - tags
+  variables:
+    MAKE_CHECK: 'false'
+    PRESERVE_ENVVARS: MAKE_CHECK
+  before_script:
+    - git describe --long
+    - git submodule update --init --recursive
+    - git submodule foreach --recursive 'git clean -xffd'
+    - git clean -xffd
+    - rm rpm/tarantool.spec
+    - rm -rf debian
+    - cp -r debian-picodata debian
+  timeout: 2h
+  dependencies: []
+
+build-package-centos:
+  stage: build_rpm
+  extends: .pack
+  script:
+    - OS=centos DIST=7 BUILDDIR=$PWD/build_rpm/ make -f .pack.mk package
+    - OS=centos DIST=8 BUILDDIR=$PWD/build_rpm/ make -f .pack.mk package
+  artifacts:
+    paths:
+      - build_rpm/tarantool*.rpm
+
+build-package-altlinux:
+  stage: build_altlinux
+  extends: .pack
+  script:
+    - git clone https://github.com/packpack/packpack.git packpack
+    - DOCKER_REPO=docker-picodata.binary.picodata.io/packpack/alt DOCKER_IMAGE=p9 BUILDDIR=$PWD/build_rpm/ packpack/packpack
+    - DOCKER_REPO=docker-picodata.binary.picodata.io/packpack/alt DOCKER_IMAGE=p10 BUILDDIR=$PWD/build_rpm/ packpack/packpack
+  artifacts:
+    paths:
+      - build_rpm/tarantool*.rpm
+
+build-package-ubuntu:
+  stage: build_ubuntu
+  extends: .pack
+  script:
+    - OS=ubuntu DIST=focal BUILDDIR=$PWD/build_${DIST}/ RELEASE=${DIST} make -f .pack.mk package
+    - OS=ubuntu DIST=jammy BUILDDIR=$PWD/build_${DIST}/ RELEASE=${DIST} make -f .pack.mk package
+  artifacts:
+    paths:
+      - build_focal/*.deb
+      - build_jammy/*.deb
+
+build-package-debian:
+  stage: build_debian
+  extends: .pack
+  script:
+    - OS=debian DIST=bullseye BUILDDIR=$PWD/build_${DIST}/ RELEASE=${DIST} make -f .pack.mk package
+  artifacts:
+    paths:
+      - build_bullseye/*.deb
+
+build-package-redos:
+  stage: build_redos
+  extends: .pack
+  script:
+    - OS=redos DIST=7.3 BUILDDIR=$PWD/build_redos/ make -f .pack.mk package
+  artifacts:
+    paths:
+      - build_redos/tarantool*.rpm
+
+sign-rpm-packages:
+  variables:
+    DOCKER_AUTH_CONFIG: $DOCKER_AUTH_RO
+  stage: sign
+  tags:
+    - shell_p_t
+  only:
+    - web
+    - tags
+  before_script:
+    - mkdir -p $CI_PROJECT_DIR/.docker
+    - echo $DOCKER_AUTH_RW > $CI_PROJECT_DIR/.docker/config.json
+    - echo "$GPG_KEY_KDY" | base64 -d > build_rpm/kdy.asc
+    - echo "$GPG_KEY_KDY" | base64 -d > build_redos/kdy.asc
+  script:
+    - docker run --rm -e KEY_FILE=kdy.asc -v $PWD/build_rpm:/build docker-picodata.binary.picodata.io/rpmsign:centos7
+    - docker run --rm -e KEY_FILE=kdy.asc -v $PWD/build_redos:/build docker-picodata.binary.picodata.io/rpmsign:centos7
+  artifacts:
+    paths:
+      - build_rpm/tarantool*.rpm
+      - build_redos/tarantool*.rpm
+  dependencies:
+    - build-package-centos
+    - build-package-altlinux
+    - build-package-redos
+
+deploy-job:
+  stage: deploy
+  tags:
+    - shell_p_t
+  only:
+    - web
+    - tags
+  before_script:
+    - eval $(ssh-agent -s)
+    - echo "$DEPLOY_PROD_SSH_KEY" | base64 -d | ssh-add -
+    - echo "$GPG_KEY_KDY" | base64 -d > /tmp/key.asc
+  script:
+    - echo "Deploying application..."
+    - echo
+    - echo "Deploying rpm-packets..."
+    # CentOS7
+    - scp -o stricthostkeychecking=no build_rpm/tarantool*.el7.*rpm ansible@94.26.239.246:/data/nginx/www/packrepo/tarantool-picodata/el/7/x86_64/
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "cd /data/nginx/www/packrepo/tarantool-picodata/el/7/ && createrepo --update x86_64 && gpg --no-tty --yes -u kdy@picodata.io --detach-sign --armor x86_64/repodata/repomd.xml"
+    # CentOS8
+    - scp -o stricthostkeychecking=no build_rpm/tarantool*.el8.*rpm ansible@94.26.239.246:/data/nginx/www/packrepo/tarantool-picodata/el/8/x86_64/
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "cd /data/nginx/www/packrepo/tarantool-picodata/el/8/ && createrepo --update x86_64 && gpg --no-tty --yes -u kdy@picodata.io --detach-sign --armor x86_64/repodata/repomd.xml"
+    - echo "rpm-packets successfully deployed."
+    - echo
+    # Ubuntu focal
+    - echo "Deploying deb-packets..."
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "mkdir -p ~/.deb/tnt-focal"
+    - scp -o stricthostkeychecking=no build_focal/tarantool*deb ansible@94.26.239.246:.deb/tnt-focal/
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "reprepro -b /data/nginx/www/packrepo/tarantool-picodata/ubuntu/ -C main includedeb focal ~/.deb/tnt-focal/tarantool*deb; rm -rf ~/.deb/tnt-focal"
+    # Ubuntu jammy
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "mkdir -p ~/.deb/tnt-jammy"
+    - scp -o stricthostkeychecking=no build_jammy/tarantool*deb ansible@94.26.239.246:.deb/tnt-jammy/
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "reprepro -b /data/nginx/www/packrepo/tarantool-picodata/ubuntu/ -C main includedeb jammy ~/.deb/tnt-jammy/tarantool*deb; rm -rf ~/.deb/tnt-jammy"
+    # Debian bullseye
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "mkdir -p ~/.deb/tnt-bullseye"
+    - scp -o stricthostkeychecking=no build_bullseye/tarantool*deb ansible@94.26.239.246:.deb/tnt-bullseye/
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "reprepro -b /data/nginx/www/packrepo/tarantool-picodata/debian/ -C main includedeb bullseye ~/.deb/tnt-bullseye/tarantool*deb; rm -rf ~/.deb/tnt-bullseye"
+    - echo "deb-packets successfully deployed."
+    - echo
+    # Altlinux p9
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "mkdir -p /tmp/altlinux/"
+    - echo "Deploying altlinux-p9 packet..."
+    - scp -o stricthostkeychecking=no build_rpm/tarantool*.p9.*rpm ansible@94.26.239.246:/tmp/altlinux/
+    - echo "altlinux-p9 packet successfully deployed."
+    - echo
+    # Altlinux p10
+    - echo "Deploying altlinux-p10 packet..."
+    - scp -o stricthostkeychecking=no build_rpm/tarantool*.p10.*rpm ansible@94.26.239.246:/tmp/altlinux/
+    - echo "altlinux-p10 packet successfully deployed."
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "/usr/local/bin/repogen.sh"
+    - echo "Altlinux packets successfully deployed."
+    - echo
+    # RedOS
+    - echo "Deploying RedOS 7 packet..."
+    - scp -o stricthostkeychecking=no build_redos/tarantool*.el7.*rpm ansible@94.26.239.246:/data/nginx/www/packrepo/tarantool-picodata/redos/7/x86_64/
+    - ssh -o stricthostkeychecking=no ansible@94.26.239.246 "cd /data/nginx/www/packrepo/tarantool-picodata/redos/7/ && createrepo --update x86_64 && gpg --no-tty --yes -u kdy@picodata.io --detach-sign --armor x86_64/repodata/repomd.xml"
+    - echo "RedOS 7 packet successfully deployed."
+    - echo "Application successfully deployed."
+  dependencies:
+    - build-package-debian
+    - build-package-ubuntu
+    - sign-rpm-packages
+
+check_el7:
+  stage: test_rpm
+  only:
+    - web
+    - tags
+  tags: [docker]
+  image: centos:7
+  before_script:
+    - rpm --import https://download.picodata.io/tarantool-picodata/el/RPM-GPG-KEY-kdy
+    - yum install -y https://download.picodata.io/tarantool-picodata/el/7/x86_64/picodata-release-1.1.1.0-1.el7.x86_64.rpm
+  script:
+    - yum install -y tarantool-picodata tarantool-picodata-devel
+  needs:
+    - deploy-job
+
+check_el8:
+  stage: test_rpm
+  only:
+    - web
+    - tags
+  tags: [docker]
+  image: rockylinux:8
+  before_script:
+    - rpm --import https://download.picodata.io/tarantool-picodata/el/RPM-GPG-KEY-kdy
+    - yum install -y https://download.picodata.io/tarantool-picodata/el/8/x86_64/picodata-release-1.1.1.0-1.el8.x86_64.rpm
+  script:
+    - yum install -y tarantool-picodata tarantool-picodata-devel
+  needs:
+    - deploy-job
+
+check_redos:
+  stage: test_rpm
+  only:
+    - web
+    - tags
+  tags: [docker]
+  image: packpack/packpack:redos-7.3
+  before_script:
+    - rpm --import https://download.picodata.io/tarantool-picodata/el/RPM-GPG-KEY-kdy
+    - yum install -y https://download.picodata.io/tarantool-picodata/redos/7/x86_64/picodata-release-1.1.1.0-1.el7.x86_64.rpm
+  script:
+    - yum install -y tarantool-picodata tarantool-picodata-devel
+  needs:
+    - deploy-job
+
+docker:
+  stage: docker
+  only:
+    - web
+    - tags
+  variables:
+    DOCKER_REGISTRY_PUB: docker-public.binary.picodata.io
+    DOCKER_AUTH_CONFIG: $DOCKER_AUTH_RW
+  tags:
+    - shell_p_t
+  before_script:
+    - mkdir -p $CI_PROJECT_DIR/.docker
+    - echo $DOCKER_AUTH_RW > $CI_PROJECT_DIR/.docker/config.json
+    - TAG=$(git describe | awk -F- '{print $1}')
+    - echo $TAG
+  script:
+    - docker build docker/ -t $DOCKER_REGISTRY_PUB/tarantool:$TAG
+    - docker --config $CI_PROJECT_DIR/.docker/ push $DOCKER_REGISTRY_PUB/tarantool:$TAG
+  dependencies: []

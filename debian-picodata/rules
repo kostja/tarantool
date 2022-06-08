@@ -1,0 +1,77 @@
+#!/usr/bin/make -f
+
+VERSION  := $(shell dpkg-parsechangelog|grep ^Version|awk '{print $$2}')
+UVERSION := $(shell echo $(VERSION)|sed 's/-[[:digit:]]\+$$//')
+
+ifneq ($(wildcard /usr/bin/dh_systemd_start),)
+WITH_SYSTEMD:=ON
+else
+WITH_SYSTEMD:=OFF
+endif
+
+DEB_CMAKE_EXTRA_FLAGS := \
+	-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+	-DCMAKE_INSTALL_LIBDIR=lib/$(DEB_HOST_MULTIARCH) \
+	-DCMAKE_INSTALL_SYSCONFDIR=/etc \
+	-DCMAKE_INSTALL_LOCALSTATEDIR=/var \
+	-DENABLE_DIST=ON \
+	-DWITH_SYSVINIT=ON \
+	-DWITH_SYSTEMD=$(WITH_SYSTEMD)
+
+# Append -DLUAJIT_ENABLE_GC64=ON flag if ${GC64} env variable is 'true'.
+ifeq ($(GC64), true)
+	DEB_CMAKE_EXTRA_FLAGS += -DLUAJIT_ENABLE_GC64=ON
+endif
+
+ifneq ($(MAKE_CHECK), false)
+	DEB_MAKE_CHECK_TARGET := test-force
+endif
+
+# Install tarantool.service within tarantool-common package, but does not
+# install it within tarantool and tarantool-dev packages.
+DEB_DH_INSTALLINIT_ARGS                     := --name=tarantool-picodata
+DEB_DH_SYSTEMD_ENABLE_ARGS_tarantool        := --name=tarantool-picodata
+DEB_DH_SYSTEMD_ENABLE_ARGS_tarantool-common := --name=tarantool-picodata tarantool.service
+DEB_DH_SYSTEMD_START_ARGS_tarantool-common  := --no-restart-on-upgrade tarantool.service
+
+# Needed for proper backtraces in fiber.info()
+DEB_DH_STRIP_ARGS	        := -X/usr/bin/tarantool
+DPKG_EXPORT_BUILDFLAGS = 1
+
+include /usr/share/dpkg/buildflags.mk
+include /usr/share/cdbs/1/rules/debhelper.mk
+include /usr/share/cdbs/1/class/cmake.mk
+
+debian/tarantool-picodata-common.install:
+ifneq ($(wildcard /usr/bin/dh_systemd_start),)
+	cp -p debian/tarantool-picodata-common.install.systemd.in $@
+else
+	cp -p debian/tarantool-picodata-common.install.sysvinit.in $@
+endif
+
+build-indep: debian/tarantool-picodata-common.install
+
+tarball: clean
+	git describe --long --always > VERSION
+	tar --exclude=.git --exclude=debian		\
+		--exclude=doc/www					\
+		--exclude=doc/sphinx				\
+		--exclude=src/lib/small/debian		\
+		--exclude=src/lib/msgpuck/debian    \
+		--exclude=test-run/lib/tarantool-python/debian \
+		--exclude=third_party/luafun/debian \
+		--exclude=FreeBSD \
+		--exclude="*.exe" \
+		--exclude="*.dll" \
+		--transform='s,^\.,tarantool-picodata_$(UVERSION),S' \
+		-czf ../tarantool-picodata_$(UVERSION).orig.tar.gz .
+
+clean::
+	find -type f -name \*.pyc -delete
+	find -type d -name CMakeFiles -exec rm -fr '{}' +
+	rm -f CMakeCache.txt
+	rm -f CPackConfig.cmake
+	rm -f CPackSourceConfig.cmake
+	rm -f src/trivia/config.h
+
+install/tarantool-picodata::

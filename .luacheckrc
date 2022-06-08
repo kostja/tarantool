@@ -33,6 +33,7 @@ include_files = {
 }
 
 exclude_files = {
+    "docker/files/*.lua",
     "build/**/*.lua",
     "test-run/**/*.lua",
     "test/app/*.test.lua",
