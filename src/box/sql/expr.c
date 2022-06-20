@@ -1386,7 +1386,11 @@ expr_new_variable(struct Parse *parse, const struct Token *spec,
 	struct Expr *expr = sql_expr_new_empty(parse->db, TK_VARIABLE, len + 1);
 	if (expr == NULL)
 		return NULL;
-	expr->type = FIELD_TYPE_BOOLEAN;
+	if (spec->n == 1 && spec->z[0] == '?') {
+		expr->type = FIELD_TYPE_ANY;
+	} else {
+		expr->type = FIELD_TYPE_BOOLEAN;
+	}
 	expr->flags = EP_Leaf;
 	expr->u.zToken = (char *)(expr + 1);
 	expr->u.zToken[0] = spec->z[0];
