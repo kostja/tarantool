@@ -118,6 +118,11 @@ struct luaL_serializer {
 	int encode_invalid_numbers;
 	/** Floating point numbers precision (YAML, CJSON only) */
 	int encode_number_precision;
+	/**
+	 * Encode decimal as JSON number instead of string
+	 * potentially losing precision on decoding)
+	 */
+	int encode_decimal_as_number;
 
 	/**
 	 * Enables __serialize meta-value checking:

@@ -21,7 +21,7 @@ end
 
 tap.test("json", function(test)
     local serializer = require('json')
-    test:plan(58)
+    test:plan(61)
 
     test:test("unsigned", common.test_unsigned, serializer)
     test:test("signed", common.test_signed, serializer)
@@ -71,6 +71,20 @@ tap.test("json", function(test)
             '{"a":0.123}', 'precision is 3')
     test:is(serializer.cfg.encode_number_precision, orig_encode_number_precision,
             'global option remains unchanged')
+
+    local orig_encode_decimal_as_number =
+        serializer.cfg.encode_decimal_as_number
+    local dec_num = require('decimal').new('0.123456789123456789')
+    serializer.cfg({encode_decimal_as_number = true})
+    test:ok(serializer.encode({a = dec_num}) == '{"a":0.123456789123456789}',
+            'decimal is encoded as number')
+    serializer.cfg({encode_decimal_as_number = orig_encode_decimal_as_number})
+    test:ok(serializer.encode({a = dec_num}) == '{"a":"0.123456789123456789"}',
+            'decimal is encoded as string')
+    test:is(
+        serializer.cfg.encode_decimal_as_number,
+        orig_encode_decimal_as_number,
+        'global option remains unchanged')
 
     local orig_decode_invalid_numbers = serializer.cfg.decode_invalid_numbers
     serializer.cfg({decode_invalid_numbers = false})

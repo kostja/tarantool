@@ -259,6 +259,32 @@ static void json_append_string(struct luaL_serializer *cfg, strbuf_t *json,
     strbuf_append_char_unsafe(json, '\"');
 }
 
+/* json_append_unescaped_string args:
+ * - lua_State
+ * - JSON strbuf
+ * - String (Lua stack index)
+ *
+ * Returns nothing. Doesn't remove string from Lua stack */
+static void json_append_decimal(struct luaL_serializer *cfg, strbuf_t *json,
+                   decimal_t * decNumber)
+{
+    const char *str = decimal_str(decNumber);
+    const size_t len = strlen(str);
+
+    if (! cfg->encode_decimal_as_number) {
+        return json_append_string(cfg, json, str, len);
+    }
+
+    (void) cfg;
+
+    // append decimal as unescaped string to represent JSON number
+    strbuf_ensure_empty_length(json, len);
+    size_t i;
+    for (i = 0; i < len; i++) {
+        strbuf_append_char_unsafe(json, str[i]);
+    }
+}
+
 static void json_append_data(lua_State *l, struct luaL_serializer *cfg,
                              int current_depth, strbuf_t *json);
 
@@ -422,8 +448,7 @@ static void json_append_data(lua_State *l, struct luaL_serializer *cfg,
         switch (field.ext_type) {
         case MP_DECIMAL:
         {
-            const char *str = decimal_str(field.decval);
-            return json_append_string(cfg, json, str, strlen(str));
+            return json_append_decimal(cfg, json, field.decval);
         }
         case MP_UUID:
             return json_append_string(cfg, json, tt_uuid_str(field.uuidval),

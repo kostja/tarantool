@@ -72,6 +72,7 @@ static struct {
 	OPTION(LUA_TBOOLEAN, encode_deep_as_nil, 0),
 	OPTION(LUA_TBOOLEAN, encode_invalid_numbers, 1),
 	OPTION(LUA_TNUMBER,  encode_number_precision, 14),
+	OPTION(LUA_TBOOLEAN,  encode_decimal_as_number, 0),
 	OPTION(LUA_TBOOLEAN, encode_load_metatables, 1),
 	OPTION(LUA_TBOOLEAN, encode_use_tostring, 0),
 	OPTION(LUA_TBOOLEAN, encode_invalid_as_nil, 0),
