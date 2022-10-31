@@ -487,6 +487,7 @@ int tarantoolsqlEphemeralDelete(BtCursor *pCur)
 
 	char *key;
 	uint32_t key_size;
+	size_t region_svp = region_used(&fiber()->gc);
 	key = tuple_extract_key(pCur->last_tuple,
 				pCur->iter->index->def->key_def,
 				MULTIKEY_NONE, &key_size);
@@ -494,6 +495,7 @@ int tarantoolsqlEphemeralDelete(BtCursor *pCur)
 		return -1;
 
 	int rc = space_ephemeral_delete(pCur->space, key);
+	region_truncate(&fiber()->gc, region_svp);
 	if (rc != 0) {
 		diag_log();
 		return -1;
@@ -512,13 +514,16 @@ int tarantoolsqlDelete(BtCursor *pCur, u8 flags)
 	char *key;
 	uint32_t key_size;
 
+	size_t region_svp = region_used(&fiber()->gc);
 	key = tuple_extract_key(pCur->last_tuple,
 				pCur->iter->index->def->key_def,
 				MULTIKEY_NONE, &key_size);
 	if (key == NULL)
 		return -1;
-	return sql_delete_by_key(pCur->space, pCur->index->def->iid, key,
-				 key_size);
+	int rc = sql_delete_by_key(pCur->space, pCur->index->def->iid, key,
+				   key_size);
+	region_truncate(&fiber()->gc, region_svp);
+	return rc;
 }
 
 int
@@ -564,9 +569,13 @@ int tarantoolsqlEphemeralClearTable(BtCursor *pCur)
 	uint32_t  key_size;
 
 	while (iterator_next(it, &tuple) == 0 && tuple != NULL) {
+		size_t region_svp = region_used(&fiber()->gc);
 		key = tuple_extract_key(tuple, it->index->def->key_def,
 					MULTIKEY_NONE, &key_size);
-		if (space_ephemeral_delete(pCur->space, key) != 0) {
+		int rc = space_ephemeral_delete(pCur->space, key);
+		region_truncate(&fiber()->gc, region_svp);
+
+		if (rc != 0) {
 			iterator_delete(it);
 			return -1;
 		}
@@ -597,10 +606,12 @@ int tarantoolsqlClearTable(struct space *space, uint32_t *tuple_count)
 	if (iter == NULL)
 		return -1;
 	while (iterator_next(iter, &tuple) == 0 && tuple != NULL) {
+		size_t region_svp = region_used(&fiber()->gc);
 		request.key = tuple_extract_key(tuple, pk->def->key_def,
 						MULTIKEY_NONE, &key_size);
 		request.key_end = request.key + key_size;
 		rc = box_process1(&request, &unused);
+		region_truncate(&fiber()->gc, region_svp);
 		if (rc != 0) {
 			iterator_delete(iter);
 			return -1;
@@ -699,6 +710,7 @@ sql_rename_table(uint32_t space_id, const char *new_name)
 	struct region *region = &fiber()->gc;
 	/* 32 + name_len is enough to encode one update op. */
 	size_t size = 32 + name_len;
+	size_t region_svp = region_used(&fiber()->gc);
 	char *raw = (char *) region_alloc(region, size);
 	if (raw == NULL) {
 		diag_set(OutOfMemory, size, "region_alloc", "raw");
@@ -715,7 +727,9 @@ sql_rename_table(uint32_t space_id, const char *new_name)
 	pos = mp_encode_str(pos, "=", 1);
 	pos = mp_encode_uint(pos, BOX_SPACE_FIELD_NAME);
 	pos = mp_encode_str(pos, new_name, name_len);
-	return box_update(BOX_SPACE_ID, 0, raw, ops, ops, pos, 0, NULL);
+	int rc = box_update(BOX_SPACE_ID, 0, raw, ops, ops, pos, 0, NULL);
+	region_truncate(&fiber()->gc, region_svp);
+	return rc;
 }
 
 int

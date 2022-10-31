@@ -189,6 +189,8 @@ lbox_select(lua_State *L)
 				  "limit, key)");
 	}
 
+	uint32_t svp = region_used(&fiber()->gc);
+
 	uint32_t space_id = lua_tonumber(L, 1);
 	uint32_t index_id = lua_tonumber(L, 2);
 	int iterator = lua_tonumber(L, 3);
@@ -201,7 +203,7 @@ lbox_select(lua_State *L)
 	struct port port;
 	if (box_select(space_id, index_id, iterator, offset, limit,
 		       key, key + key_len, &port) != 0) {
-		return luaT_error(L);
+		goto fail;
 	}
 
 	/*
@@ -215,7 +217,12 @@ lbox_select(lua_State *L)
 	 */
 	port_dump_lua(&port, L, false);
 	port_destroy(&port);
-	return 1; /* lua table with tuples */
+
+	region_truncate(&fiber()->gc, svp);
+	return 1;
+fail:
+	region_truncate(&fiber()->gc, svp);
+	return luaT_error(L);
 }
 
 /* }}} */

@@ -60,7 +60,6 @@ test_basic(void)
 	vy_mem_delete(mem);
 	key_def_delete(key_def);
 
-	fiber_gc();
 	footer();
 
 	check_plan();
@@ -323,8 +322,6 @@ test_iterator_restore_after_insertion()
 	tuple_format_unref(format);
 	lsregion_destroy(&lsregion);
 	key_def_delete(key_def);
-
-	fiber_gc();
 
 	check_plan();
 

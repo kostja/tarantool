@@ -2541,6 +2541,7 @@ index_fill_def(struct Parse *parse, struct index *index,
 
 	struct key_def *key_def = NULL;
 	size_t size;
+	size_t region_svp = region_used(&fiber()->gc);
 	struct key_part_def *key_parts =
 		region_alloc_array(&fiber()->gc, typeof(key_parts[0]),
 				   expr_list->nExpr, &size);
@@ -2600,6 +2601,7 @@ index_fill_def(struct Parse *parse, struct index *index,
 	index->def->iid = iid;
 	rc = 0;
 cleanup:
+	region_truncate(&fiber()->gc, region_svp);
 	if (key_def != NULL)
 		key_def_delete(key_def);
 	return rc;

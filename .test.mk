@@ -63,7 +63,10 @@ run-test: install-test-deps
 # Release build
 
 .PHONY: test-release
-test-release: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON
+test-release: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                             -DENABLE_WERROR=ON \
+                             -DTEST_BUILD=ON
+
 test-release: build run-luajit-test run-test
 
 # Release ASAN build
@@ -82,7 +85,8 @@ test-release-asan: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo \
                                   -DENABLE_ASAN=ON \
                                   -DENABLE_UB_SANITIZER=ON \
                                   -DFIBER_STACK_SIZE=640Kb \
-                                  -DENABLE_FUZZER=ON
+                                  -DENABLE_FUZZER=ON \
+                                  -DTEST_BUILD=ON
 # Some checks are temporary suppressed in the scope of the issue
 # https://github.com/tarantool/tarantool/issues/4360:
 #   - ASAN: to suppress failures of memory error checks caught while tests run, the asan/asan.supp
@@ -109,13 +113,17 @@ test-release-asan: build run-luajit-test run-test
 # Debug build
 
 .PHONY: test-debug
-test-debug: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=Debug
+test-debug: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=Debug \
+                           -DTEST_BUILD=ON
 test-debug: build run-luajit-test run-test
 
 # Static build
 
 .PHONY: test-static
-test-static: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON -DBUILD_STATIC=ON
+test-static: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                            -DENABLE_WERROR=ON \
+                            -DBUILD_STATIC=ON \
+                            -DTEST_BUILD=ON
 test-static: build run-luajit-test run-test
 
 # Static build (cmake)
@@ -123,7 +131,7 @@ test-static: build run-luajit-test run-test
 .PHONY: test-static-cmake
 test-static-cmake: SRC_DIR = ${STATIC_DIR}
 test-static-cmake: BUILD_DIR = ${STATIC_DIR}
-test-static-cmake: CMAKE_PARAMS = -DCMAKE_TARANTOOL_ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo;-DENABLE_WERROR=ON"
+test-static-cmake: CMAKE_PARAMS = -DCMAKE_TARANTOOL_ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo;-DENABLE_WERROR=ON;-DTEST_BUILD=ON"
 test-static-cmake: CTEST = true
 test-static-cmake: LUAJIT_TEST_BUILD_DIR = ${STATIC_BIN_DIR}
 test-static-cmake: TEST_RUN_PARAMS = --builddir ${PWD}/${STATIC_BIN_DIR}
@@ -132,7 +140,10 @@ test-static-cmake: build run-luajit-test run-test
 # Coverage build
 
 .PHONY: test-coverage
-test-coverage: CMAKE_PARAMS = -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_GCOV=ON
+test-coverage: CMAKE_PARAMS = -G Ninja \
+                              -DCMAKE_BUILD_TYPE=Debug \
+                              -DENABLE_GCOV=ON \
+                              -DTEST_BUILD=ON
 test-coverage: TEST_RUN_PARAMS += --long
 test-coverage: OUTPUT_FILE = coverage.info
 test-coverage: build run-luajit-test run-test
@@ -164,7 +175,9 @@ pretest-osx:
 # Release build
 
 .PHONY: test-osx-release
-test-osx-release: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON
+test-osx-release: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                                 -DENABLE_WERROR=ON \
+                                 -DTEST_BUILD=ON
 test-osx-release: prebuild-osx build run-luajit-test pretest-osx run-test
 
 # FIXME: Temporary target without tests. Use 'test-release-osx' target instead
@@ -172,13 +185,16 @@ test-osx-release: prebuild-osx build run-luajit-test pretest-osx run-test
 #   LuaJIT tests - https://github.com/tarantool/tarantool/issues/4819
 #   Tarantool tests - https://github.com/tarantool/tarantool/issues/6068
 .PHONY: test-osx-release-arm64
-test-osx-release-arm64: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON
+test-osx-release-arm64: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                                       -DENABLE_WERROR=ON \
+                                       -DTEST_BUILD=ON
 test-osx-release-arm64: prebuild-osx build
 
 # Debug build
 
 .PHONY: test-osx-debug
-test-osx-debug: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=Debug
+test-osx-debug: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=Debug \
+                               -DTEST_BUILD=ON
 test-osx-debug: prebuild-osx build run-luajit-test pretest-osx run-test
 
 # FIXME: Temporary target without tests. Use 'test-debug-osx' target instead
@@ -186,7 +202,8 @@ test-osx-debug: prebuild-osx build run-luajit-test pretest-osx run-test
 #   LuaJIT tests - https://github.com/tarantool/tarantool/issues/4819
 #   Tarantool tests - https://github.com/tarantool/tarantool/issues/6068
 .PHONY: test-osx-debug-arm64
-test-osx-debug-arm64: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=Debug
+test-osx-debug-arm64: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=Debug \
+                                     -DTEST_BUILD=ON
 test-osx-debug-arm64: prebuild-osx build
 
 # Static build
@@ -194,7 +211,7 @@ test-osx-debug-arm64: prebuild-osx build
 .PHONY: test-osx-static-cmake
 test-osx-static-cmake: SRC_DIR = ${STATIC_DIR}
 test-osx-static-cmake: BUILD_DIR = ${STATIC_DIR}
-test-osx-static-cmake: CMAKE_PARAMS = -DCMAKE_TARANTOOL_ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo;-DENABLE_WERROR=ON"
+test-osx-static-cmake: CMAKE_PARAMS = -DCMAKE_TARANTOOL_ARGS="-DCMAKE_BUILD_TYPE=RelWithDebInfo;-DENABLE_WERROR=ON;-DTEST_BUILD=ON"
 test-osx-static-cmake: CTEST = true
 test-osx-static-cmake: LUAJIT_TEST_BUILD_DIR = ${STATIC_BIN_DIR}
 test-osx-static-cmake: TEST_RUN_PARAMS = --builddir ${PWD}/${STATIC_BIN_DIR}
@@ -225,7 +242,9 @@ prebuild-freebsd:
 # Release build
 
 .PHONY: test-freebsd-release
-test-freebsd-release: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON
+test-freebsd-release: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                                     -DENABLE_WERROR=ON \
+                                     -DTEST_BUILD=ON
 test-freebsd-release: prebuild-freebsd build run-luajit-test run-test
 
 ##############################
@@ -240,7 +259,10 @@ prebuild-jepsen:
 	git config --get user.email || git config --global user.email "nobody@nowhere.com"
 
 .PHONY: test-jepsen
-test-jepsen: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON -DWITH_JEPSEN=ON
+test-jepsen: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                            -DENABLE_WERROR=ON \
+                            -DWITH_JEPSEN=ON \
+                            -DTEST_BUILD=ON
 test-jepsen: configure prebuild-jepsen
 	${CMAKE_BUILD} --target run-jepsen
 
@@ -249,7 +271,9 @@ test-jepsen: configure prebuild-jepsen
 ##############################
 
 .PHONY: build-coverity
-build-coverity: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_WERROR=ON
+build-coverity: CMAKE_PARAMS = -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                               -DENABLE_WERROR=ON \
+                               -DTEST_BUILD=ON
 build-coverity: CMAKE_BUILD_ENV = PATH=${PATH}:/cov-analysis/bin cov-build --dir ${COVERITY_DIR}
 build-coverity: configure
 	${CMAKE_BUILD}
