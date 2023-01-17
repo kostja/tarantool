@@ -266,7 +266,7 @@ backtrace_frame_resolve(const struct backtrace_frame *frame,
 	 * result will be truncated.
 	 */
 	if (rc != 0 && rc != -UNW_ENOMEM) {
-		say_error("unwinding error: `get_proc_name` accessor failed: "
+		say_debug("unwinding error: `get_proc_name` accessor failed: "
 			  "%s", unw_strerror(rc));
 		return NULL;
 	}
