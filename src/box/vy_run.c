@@ -2507,8 +2507,13 @@ vy_run_remove_files_f(va_list ap)
 	for (int type = 0; type < vy_file_MAX; type++) {
 		vy_run_snprint_path(path, sizeof(path), dir,
 				    space_id, iid, run_id, type);
-		if (!xlog_remove_file(path, XLOG_RM_VERBOSE))
-			ret = -1;
+		if (unlink(path) < 0) {
+			if (errno != ENOENT) {
+				say_syserror("error while removing %s", path);
+				ret = -1;
+			}
+		} else
+			say_info("removed %s", path);
 	}
 	/* Remove the root directory if it's empty. */
 	vy_lsm_snprint_path(path, sizeof(path), dir, space_id, iid);
