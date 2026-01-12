@@ -719,6 +719,16 @@ vy_lsm_range_size(struct vy_lsm *lsm)
 	 * create four times more than that for better smoothing.
 	 */
 	int range_count = 4 * vy_lsm_dumps_per_compaction(lsm);
+	/*
+	 * As soon as the index gets large enough, we can expect
+	 * the dump to impact enough ranges to avoid the need for
+	 * smaller ranges, so use the actual range count. Besides,
+	 * if the workload is skewed towards the edge of the
+	 * range, dumps per compaction average out around 2-3 and
+	 * the heuristics above tends to over-reduce the target
+	 * range size.
+	 */
+	range_count = MAX(range_count, lsm->range_count);
 	int64_t range_size = range_count == 0 ? 0 :
 		lsm->stat.disk.last_level_count.bytes / range_count;
 	range_size = MAX(range_size, VY_MIN_RANGE_SIZE);
