@@ -62,6 +62,10 @@ g.test_deferred_delete_compaction = function(cg)
         s:insert({1, 10})
         box.snapshot()
 
+        -- To trigger compaction, we need an extra run
+        s:replace({1, 10})
+        box.snapshot()
+
         -- Create the primary index run file with DELETE{1}.
         --
         -- Generation of DELETE{1,10} for the secondary index is deferred

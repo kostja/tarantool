@@ -27,8 +27,13 @@ space:replace({2,2})
 space:upsert({2},{{'+',4,5}}) -- bad upsert
 box.snapshot() -- create the second run
 
+-- create the third run
+space:replace({2,2})
+space:upsert({2},{{'+',4,5}}) -- bad upsert
+box.snapshot() -- create the third run
+
 -- wait for compaction
-while vyinfo().run_count >= 2 do fiber.sleep(0.1) end
+test_run:wait_cond(function() return vyinfo().run_count < 2 end, 10)
 vyinfo().run_count == 1
 
 -- gh-1571: bad upsert should log on compaction

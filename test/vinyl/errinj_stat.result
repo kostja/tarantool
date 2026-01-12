@@ -64,17 +64,6 @@ dump()
 dump()
 ---
 ...
-i:stat().disk.compaction.queue -- 30 statements
----
-- bytes_compressed: <bytes_compressed>
-  pages: 3
-  rows: 30
-  bytes: 411
-...
-i:stat().disk.compaction.queue.bytes == box.stat.vinyl().scheduler.compaction_queue
----
-- true
-...
 dump()
 ---
 ...
@@ -103,15 +92,29 @@ i:stat().disk.compaction.queue.bytes == box.stat.vinyl().scheduler.compaction_qu
 ---
 - true
 ...
+dump()
+---
+...
+i:stat().disk.compaction.queue -- 60 statements
+---
+- bytes_compressed: <bytes_compressed>
+  pages: 6
+  rows: 60
+  bytes: 822
+...
+i:stat().disk.compaction.queue.bytes == box.stat.vinyl().scheduler.compaction_queue
+---
+- true
+...
 box.stat.reset() -- doesn't affect queue size
 ---
 ...
-i:stat().disk.compaction.queue -- 50 statements
+i:stat().disk.compaction.queue -- 60 statements
 ---
 - bytes_compressed: <bytes_compressed>
-  pages: 5
-  rows: 50
-  bytes: 685
+  pages: 6
+  rows: 60
+  bytes: 822
 ...
 i:stat().disk.compaction.queue.bytes == box.stat.vinyl().scheduler.compaction_queue
 ---

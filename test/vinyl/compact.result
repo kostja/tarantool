@@ -68,9 +68,22 @@ box.snapshot() -- create the second run
 ---
 - ok
 ...
--- wait for compaction
-while vyinfo().run_count >= 2 do fiber.sleep(0.1) end
+-- create the third run
+space:replace({2,2})
 ---
+- [2, 2]
+...
+space:upsert({2},{{'+',4,5}}) -- bad upsert
+---
+...
+box.snapshot() -- create the third run
+---
+- ok
+...
+-- wait for compaction
+test_run:wait_cond(function() return vyinfo().run_count < 2 end, 10)
+---
+- true
 ...
 vyinfo().run_count == 1
 ---
