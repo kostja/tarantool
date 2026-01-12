@@ -185,6 +185,7 @@ stat_diff(istat(), st, 'cache')
 
 -- range split
 for i = 1, 100 do put(i) end
+for i = 1, 100 do put(i) end
 st = istat()
 box.snapshot()
 wait(istat, st, 'disk.compaction.count', 2)

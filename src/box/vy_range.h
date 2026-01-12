@@ -136,6 +136,37 @@ struct vy_range {
 };
 
 /**
+ * When looking for the best range split point, this structure
+ * represents a single slice begin/end - a split candidate.
+ */
+struct vy_split_point {
+	/** Slice owning this split point. */
+	struct vy_slice *slice;
+	/** Key definition to compare split points. */
+	struct key_def *cmp_def;
+	enum vy_split_point_type {
+		VY_SPLIT_POINT_BEGIN = 0,
+		VY_SPLIT_POINT_END = 1,
+	} type;
+	/** Balance weight: total bytes of the owning slice. */
+	uint64_t bytes;
+};
+
+/**
+ * Return the raw key and hint for a split point boundary.
+ * Used by range split selection when scoring candidates.
+ */
+const char *
+vy_split_key(const struct vy_split_point *p, hint_t *hint);
+
+/**
+ * Compare split points for ordering in the sweep algorithm:
+ * first by key, then by boundary type.
+ */
+int
+vy_split_point_cmp(const void *a, const void *b);
+
+/**
  * Heap of all ranges of the same LSM tree, prioritized by
  * vy_range->compaction_priority.
  */
@@ -252,6 +283,18 @@ vy_range_update_compaction_priority(struct vy_range *range,
  */
 void
 vy_range_update_dumps_per_compaction(struct vy_range *range);
+
+/**
+ * Choose the best split key for a range.
+ *
+ * @param range         The range.
+ * @param range_size    Target range size.
+ *
+ * @retval NULL         If no suitable split key found.
+ * @retval not NULL     Key to split the range by.
+ */
+const char *
+vy_range_find_best_split(struct vy_range *range, uint64_t range_size);
 
 /**
  * Check if a range needs to be split in two.

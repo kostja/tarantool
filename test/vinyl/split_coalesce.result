@@ -55,6 +55,7 @@ end
 while vyinfo().range_count < range_count do
     iter = iter + 1
     for k = key_count,1,-1 do s:replace(gen_tuple(k)) end
+    for k = 1, key_count, keys_per_range do s:replace(gen_tuple(k)) end
     box.snapshot()
     fiber.sleep(0.01)
 end;
@@ -188,5 +189,89 @@ s:drop()
 ---
 ...
 var:drop()
+---
+...
+--
+-- Disjoint dumps should split a range without compaction.
+--
+test_run:cmd("setopt delimiter ';'")
+---
+- true
+...
+fiber = require('fiber')
+s = box.schema.space.create('split', {engine = 'vinyl'})
+_ = s:create_index('pk', {unique = true, parts = {1, 'unsigned'},
+              page_size = 256, range_size = 1024,
+              run_count_per_level = 1, run_size_ratio = 1000})
+test_run:cmd("setopt delimiter ''");
+---
+...
+test_run:cmd("setopt delimiter ';'")
+---
+- true
+...
+function vinfo()
+    return s.index.pk:stat()
+end;
+---
+...
+pad_size = math.floor(s.index.pk.options.range_size / 2)
+assert(pad_size >= 16)
+function put_range(a, b)
+    for i = a, b do
+        local pad = {}
+        for j = 1, pad_size do
+            pad[j] = string.char(math.random(65, 90))
+        end
+        s:replace{i, table.concat(pad)}
+    end
+end;
+---
+...
+function wait_ranges(cnt)
+    test_run:wait_cond(function()
+        return vinfo().range_count >= cnt
+    end, 10)
+end;
+---
+...
+test_run:cmd("setopt delimiter ''");
+---
+- true
+...
+put_range(1, 5)
+---
+...
+box.snapshot()
+---
+- ok
+...
+put_range(100, 104)
+---
+...
+box.snapshot()
+---
+- ok
+...
+wait_ranges(2)
+---
+...
+vinfo().disk.compaction.count -- 0
+---
+- 0
+...
+vinfo().range_count -- 2
+---
+- 2
+...
+vinfo().run_count -- 2
+---
+- 2
+...
+vinfo().run_avg -- 1
+---
+- 1
+...
+s:drop()
 ---
 ...

@@ -256,6 +256,21 @@ vy_range_init_slice(struct vy_range *range, struct vy_slice *slice)
 		return;
 	}
 
+	/*
+	 * The run's key range must intersect the range.
+	 * A phantom slice (run data entirely outside the range)
+	 * wastes disk references and confuses the compaction
+	 * scheduler.
+	 */
+	assert(range->begin.stmt == NULL ||
+	       vy_entry_compare_with_raw_key(
+			range->begin, run->info.max_key,
+			HINT_NONE, range->cmp_def) <= 0);
+	assert(range->end.stmt == NULL ||
+	       vy_entry_compare_with_raw_key(
+			range->end, run->info.min_key,
+			HINT_NONE, range->cmp_def) > 0);
+
 	struct vy_page_info *page0 = vy_run_page_info(slice->run, 0);
 
 	/* slice->begin = MAX(range::begin, run::min_key) */
@@ -546,26 +561,309 @@ vy_range_update_dumps_per_compaction(struct vy_range *range)
 	}
 }
 
+const char *
+vy_split_key(const struct vy_split_point *p, hint_t *hint)
+{
+	struct vy_slice *slice = p->slice;
+	if (p->type == VY_SPLIT_POINT_BEGIN) {
+		if (slice->begin.stmt != NULL) {
+			*hint = slice->begin.hint;
+			return tuple_data(slice->begin.stmt);
+		}
+		*hint = HINT_NONE;
+		return slice->run->info.min_key;
+	}
+	/* END: use end_bound. */
+	*hint = slice->end_bound.hint;
+	return tuple_data(slice->end_bound.stmt);
+}
+
+/**
+ * Compare two split points by key, then by boundary type.
+ */
+int
+vy_split_point_cmp(const void *a, const void *b)
+{
+	const struct vy_split_point *pa = a;
+	const struct vy_split_point *pb = b;
+
+	hint_t hint_a, hint_b;
+	const char *key_a = vy_split_key(pa, &hint_a);
+	const char *key_b = vy_split_key(pb, &hint_b);
+	int rc = vy_key_compare(key_a, hint_a, key_b, hint_b,
+				pa->cmp_def);
+	if (rc != 0)
+		return rc;
+	/* BEGIN < END at the same key. */
+	if (pa->type != pb->type)
+		return (int)pa->type - (int)pb->type;
+	/*
+	 * Among ENDs at the same key: exclusive before inclusive.
+	 * An inclusive end's weight transfer must be deferred
+	 * until we advance past this key, so it must sort after
+	 * any exclusive end that is evaluated as a candidate here.
+	 */
+	if (pa->type == VY_SPLIT_POINT_END)
+		return (int)!vy_entry_is_exclusive(pa->slice->end_bound) -
+		       (int)!vy_entry_is_exclusive(pb->slice->end_bound);
+	return 0;
+}
+
+/** Update left/right/active balance counters for split points. */
+static void
+vy_split_update_balance(struct vy_split_point *start,
+			struct vy_split_point *end,
+			uint64_t *left, uint64_t *right, uint64_t *active)
+{
+	for (struct vy_split_point *p = start; p < end; ++p) {
+		switch (p->type) {
+		case VY_SPLIT_POINT_BEGIN:
+			/* When advancing to a point which is
+			 * right to the begin we must add
+			 * slice weight to 'active' and subtract it from
+			 * 'right'.
+			 */
+			*active += p->bytes;
+			*right -= p->bytes;
+			break;
+		case VY_SPLIT_POINT_END:
+			if (!vy_entry_is_exclusive(p->slice->end_bound)) {
+				/*
+				 * Inclusive end: the slice is fully
+				 * to the left only past this key.
+				 */
+				*left += p->bytes;
+				*active -= p->bytes;
+			}
+			/*
+			 * Exclusive end: the weight was already
+			 * transferred eagerly when this point
+			 * became a split candidate.
+			 */
+			break;
+		}
+	}
+}
+
+/**
+ * Sweep-based split key search minimizing slice splits.
+ */
+const char *
+vy_range_find_best_split(struct vy_range *range, uint64_t range_size)
+{
+	uint64_t total = 0, left = 0, right = 0;
+	const char *best_key = NULL;
+
+	/*
+	 * Each slice contributes a BEGIN point and an END point.
+	 * The END type (INCLUSIVE or EXCLUSIVE) is determined by
+	 * slice->end_bound, which already picks the tightest
+	 * upper bound (run->info.max_key or range boundary).
+	 */
+	size_t point_vec_size = range->slice_count * 2;
+
+	if (range->slice_count == 0)
+		return NULL;
+
+	struct vy_split_point *point_vec =
+		xmalloc(sizeof(*point_vec) * point_vec_size);
+
+	struct vy_split_point *p = point_vec;
+	struct vy_slice *slice;
+
+	rlist_foreach_entry(slice, &range->slices, in_range) {
+		*p++ = (struct vy_split_point) {
+			slice, range->cmp_def,
+			VY_SPLIT_POINT_BEGIN,
+			slice->count.bytes
+		};
+		*p++ = (struct vy_split_point) {
+			slice, range->cmp_def,
+			VY_SPLIT_POINT_END,
+			slice->count.bytes
+		};
+		/**
+		 * We could trust range->count.bytes, but best
+		 * if the algorithm does not rely on
+		 * range->count.bytes == sum(slice->count.bytes).
+		 */
+		total += slice->count.bytes;
+	}
+	point_vec_size = p - point_vec;
+
+	qsort(point_vec, point_vec_size, sizeof(*point_vec),
+	      vy_split_point_cmp);
+
+	right = total;
+	/* The total size of runs split by the current split key. */
+	uint64_t active = 0;
+	/* The lowest byte count of runs being cut by the best split key. */
+	uint64_t best_active = UINT64_MAX;
+	/* The lowest size difference of left and right ranges. */
+	uint64_t best_balance = UINT64_MAX;
+	/*
+	 * If the previous point was a begin,
+	 * we increase 'active' *after* we advance to the next
+	 * point.
+	 * If it was an end, it's not a good split candidate, so
+	 * we skip it. But we can move the slice fully to the
+	 * left only when we move to a split point that's fully
+	 * to the right of an inclusive end.
+	 */
+	struct vy_split_point *p_prev = NULL;
+	for (p = point_vec; p < point_vec + point_vec_size; p++) {
+		if (p->type == VY_SPLIT_POINT_END &&
+		    !vy_entry_is_exclusive(p->slice->end_bound)) {
+			/*
+			 * Inclusive end is never a split
+			 * candidate, because it still cuts off
+			 * a little piece of a slice into a new
+			 * range.
+			 */
+			continue;
+		}
+		if (p->type == VY_SPLIT_POINT_BEGIN && p_prev != NULL) {
+			hint_t hint_p, hint_prev;
+			const char *key_p = vy_split_key(p, &hint_p);
+			const char *key_prev = vy_split_key(p_prev,
+							    &hint_prev);
+			if (vy_key_compare(key_p, hint_p,
+					   key_prev, hint_prev,
+					   p->cmp_def) == 0) {
+				/*
+				 * Multiple equal BEGINs: they "move"
+				 * together from left to right, so we
+				 * shift them all at once when advancing
+				 * to the next split candidate.
+				 */
+				continue;
+			}
+		}
+		vy_split_update_balance(p_prev ? p_prev : point_vec,
+					p, &left, &right, &active);
+		if (p->type == VY_SPLIT_POINT_END) {
+			/* Exclusive end: eagerly transfer weight. */
+			left += p->bytes;
+			active -= p->bytes;
+		}
+		/*
+		 * Splitting a run that does not participate in
+		 * future compaction may permanently increase
+		 * space amplification and page index size.
+		 *
+		 * We cannot reliably predict whether a run will
+		 * be compacted in the future. The only observable
+		 * proxy for the risk of space amplification is
+		 * the number (or total size) of slices that
+		 * overlap the split point ("active" slices).
+		 *
+		 * Therefore, the split key selection follows
+		 * a two-step heuristic:
+		 *
+		 * 1. The resulting left/right ranges must be
+		 *    reasonably balanced in size.
+		 *
+		 * 2.  Among all candidate keys that satisfy the
+		 *     above constraint, we choose the one that
+		 *     minimizes the amount of overlapping runs.
+		 */
+		uint64_t small, large;
+		if (left < right) {
+			small = left;
+			large = right;
+		} else {
+			small = right;
+			large = left;
+		}
+		uint64_t balance = large - small;
+
+		if ((small > range_size * 2 / 3 || small > total / 3) &&
+		    (best_key == NULL || active < best_active ||
+		     (active == 0 && balance < best_balance))) {
+			hint_t _u;
+			best_active = active;
+			best_balance = balance;
+			best_key = vy_split_key(p, &_u);
+		}
+		p_prev = p;
+	}
+	/* Call last time to satisfy the assert below. */
+	vy_split_update_balance(p_prev ? p_prev : point_vec,
+				p, &left, &right, &active);
+	assert(active == 0);
+
+	free(point_vec);
+
+	return best_key;
+}
+
 /**
  * Return true and set split_key accordingly if the range needs to be
  * split in two.
  *
- * - We should never split a range until it was merged at least once
- *   (actually, it should be a function of run_count_per_level/number
- *   of runs used for the merge: with low run_count_per_level it's more
- *   than once, with high run_count_per_level it's once).
- * - We should use the last run size as the size of the range.
- * - We should split around the last run middle key.
- * - We should only split if the last run size is greater than
- *   4/3 * range_size.
+ * The decision is two-phase:
+ *
+ * 1. First, try the sweep-based balance heuristic
+ *    (vy_range_find_best_split): it picks a split key that minimizes
+ *    the number of runs shared (cut) between the two new ranges while
+ *    keeping both halves reasonably balanced. This is attempted once
+ *    the range grows to at least 3/2 * range_size -- the 3/2 threshold
+ *    ensures both halves can satisfy the inner balance requirement
+ *    (each >= 1/3 of total, i.e. >= range_size/2).
+ *
+ * 2. If no good sweep-based split is found and the range has grown to
+ *    at least 2 * range_size, fall back to splitting around the median
+ *    key of the last (oldest) level's page index. This fallback
+ *    requires at least one prior compaction (n_compactions >= 1) so
+ *    the last level provides a reasonable approximation of the key
+ *    distribution.
  */
 bool
 vy_range_needs_split(struct vy_range *range, int64_t range_size,
 		     const char **p_split_key)
 {
+	if (range->count.bytes < range_size * 3 / 2) {
+		/*
+		 * Allow the range to grow at least 50% beyond
+		 * range_size to avoid oscillation of split and
+		 * coalesce. We coalesce two ranges only if each
+		 * shrinks below 50% of range_size.
+		 *
+		 * This threshold also ensures the sweep heuristic
+		 * can find a balanced split: with total >= 1.5 *
+		 * range_size, both halves can be >= range_size / 2,
+		 * satisfying the inner balance requirement
+		 * (each half > total / 3).
+		 */
+		return false;
+	}
+	/*
+	 * Try to find a split key which would:
+	 * - minimize the binary footprint of runs that are
+	 *   *shared* between the two formed ranges, e.g. are cut
+	 *   in the middle
+	 * - preserve the needed balance of left and right range
+	 *   sizes.
+	 */
+	*p_split_key = vy_range_find_best_split(range, range_size);
+	if (*p_split_key)
+		return true;
+	/*
+	 * We haven't found a nice way to cut the range into two while
+	 * keeping the amount of runs that are shared between the
+	 * newly formed ranges low. Proceed further only if the
+	 * range is really big.
+	 */
+	if (range->count.bytes < range_size * 2)
+		return false;
 	struct vy_slice *slice;
-
-	/* The range hasn't been merged yet - too early to split it. */
+	/*
+	 * The next step is to find a median key by looking up in
+	 * the page index of the last level, assuming a uniform
+	 * distribution of keys. Then, if the range has been
+	 * compacted at least once, the last level should provide
+	 * a good approximation of key distribution in the range.
+	 */
 	if (range->n_compactions < 1)
 		return false;
 
