@@ -2691,7 +2691,8 @@ vy_env_new(const char *path, size_t memory,
 	mempool_create(&e->iterator_pool, slab_cache,
 	               sizeof(struct vinyl_iterator));
 	vy_cache_env_create(&e->cache_env, slab_cache);
-	vy_run_env_create(&e->run_env, read_threads);
+	vy_run_env_create(&e->run_env, e->stmt_env.key_format,
+			  read_threads);
 	vy_log_init(e->path);
 	return e;
 

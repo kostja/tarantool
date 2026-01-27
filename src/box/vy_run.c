@@ -177,9 +177,12 @@ vy_run_env_stop_readers(struct vy_run_env *env)
  * Initialize vinyl run environment
  */
 void
-vy_run_env_create(struct vy_run_env *env, int read_threads)
+vy_run_env_create(struct vy_run_env *env, struct tuple_format *key_format,
+		  int read_threads)
 {
 	memset(env, 0, sizeof(*env));
+	env->key_format = key_format;
+	tuple_format_ref(key_format);
 	env->reader_pool_size = read_threads;
 	tt_pthread_key_create(&env->zdctx_key, vy_free_zdctx);
 	mempool_create(&env->read_task_pool, cord_slab_cache(),
@@ -198,6 +201,7 @@ vy_run_env_destroy(struct vy_run_env *env)
 		vy_run_env_stop_readers(env);
 	mempool_destroy(&env->read_task_pool);
 	tt_pthread_key_delete(env->zdctx_key);
+	tuple_format_unref(env->key_format);
 }
 
 /**
@@ -327,25 +331,7 @@ vy_run_bloom_size(struct vy_run *run)
 	return run->info.bloom == NULL ? 0 : tuple_bloom_size(run->info.bloom);
 }
 
-/**
- * Find a page from which the iteration of a given key must be started.
- * LE and LT: the found page definitely contains the position
- *  for iteration start.
- * GE, GT, EQ: Since page search uses only min_key of pages,
- *  it may happen that the found page doesn't contain the position
- *  for iteration start. In this case it is certain that the iteration
- *  must be started from the beginning of the next page.
- *
- * @param run - run
- * @param key - key to find
- * @param key_def - key_def for comparison
- * @param itype - iterator type (see above)
- * @param equal_key: *equal_key is set to true if there is a page
- *  with min_key equal to the given key.
- * @return offset of the page in page index OR run->info.page_count if
- *  there no pages fulfilling the conditions.
- */
-static uint32_t
+uint32_t
 vy_page_index_find_page(struct vy_run *run, struct vy_entry key,
 			struct key_def *cmp_def, enum iterator_type itype,
 			bool *equal_key)
@@ -411,8 +397,7 @@ vy_page_index_find_page(struct vy_run *run, struct vy_entry key,
 }
 
 struct vy_slice *
-vy_slice_new(int64_t id, struct vy_run *run, struct vy_entry begin,
-	     struct vy_entry end, struct key_def *cmp_def)
+vy_slice_new(int64_t id, struct vy_run *run)
 {
 	struct vy_slice *slice = malloc(sizeof(*slice));
 	if (slice == NULL) {
@@ -431,52 +416,12 @@ vy_slice_new(int64_t id, struct vy_run *run, struct vy_entry begin,
 	slice->seed = rand_r(&run->env->seed);
 	vy_run_ref(run);
 	run->slice_count++;
-	if (begin.stmt != NULL)
-		tuple_ref(begin.stmt);
-	slice->begin = begin;
-	if (end.stmt != NULL)
-		tuple_ref(end.stmt);
-	slice->end = end;
 	rlist_create(&slice->in_range);
 	fiber_cond_create(&slice->pin_cond);
-	if (run->info.page_count == 0) {
-		/* The run is empty hence the slice is empty too. */
-		return slice;
-	}
-	/** Lookup the first and the last pages spanned by the slice. */
-	bool unused;
-	if (slice->begin.stmt == NULL) {
-		slice->first_page_no = 0;
-	} else {
-		slice->first_page_no =
-			vy_page_index_find_page(run, slice->begin, cmp_def,
-						ITER_GE, &unused);
-		assert(slice->first_page_no < run->info.page_count);
-	}
-	if (slice->end.stmt == NULL) {
-		slice->last_page_no = run->info.page_count - 1;
-	} else {
-		slice->last_page_no =
-			vy_page_index_find_page(run, slice->end, cmp_def,
-						ITER_LT, &unused);
-		if (slice->last_page_no == run->info.page_count) {
-			/* It's an empty slice */
-			slice->first_page_no = 0;
-			slice->last_page_no = 0;
-			return slice;
-		}
-	}
-	assert(slice->last_page_no >= slice->first_page_no);
-	/** Estimate the number of statements in the slice. */
-	uint32_t run_pages = run->info.page_count;
-	uint32_t slice_pages = slice->last_page_no - slice->first_page_no + 1;
-	slice->count.pages = slice_pages;
-	slice->count.rows = DIV_ROUND_UP(run->count.rows *
-					 slice_pages, run_pages);
-	slice->count.bytes = DIV_ROUND_UP(run->count.bytes *
-					  slice_pages, run_pages);
-	slice->count.bytes_compressed = DIV_ROUND_UP(
-		run->count.bytes_compressed * slice_pages, run_pages);
+	/*
+	 * Slice becomes usable only after range-dependent bounds
+	 * are initialized.
+	 */
 	return slice;
 }
 
@@ -489,8 +434,8 @@ vy_slice_delete(struct vy_slice *slice)
 	vy_run_unref(slice->run);
 	if (slice->begin.stmt != NULL)
 		tuple_unref(slice->begin.stmt);
-	if (slice->end.stmt != NULL)
-		tuple_unref(slice->end.stmt);
+	if (slice->end_bound.stmt != NULL)
+		tuple_unref(slice->end_bound.stmt);
 	fiber_cond_destroy(&slice->pin_cond);
 	TRASH(slice);
 	free(slice);
@@ -503,27 +448,15 @@ vy_slice_cut(struct vy_slice *slice, int64_t id, struct vy_entry begin,
 {
 	*result = NULL;
 
-	if (begin.stmt != NULL && slice->end.stmt != NULL &&
-	    vy_entry_compare(begin, slice->end, cmp_def) >= 0)
-		return 0; /* no intersection: begin >= slice->end */
+	if (begin.stmt != NULL &&
+	    vy_bound_cmp(begin, slice->end_bound, cmp_def) > 0)
+		return 0; /* no intersection: begin past end_bound */
 
-	if (end.stmt != NULL && slice->begin.stmt != NULL &&
+	if (end.stmt != NULL &&
 	    vy_entry_compare(end, slice->begin, cmp_def) <= 0)
-		return 0; /* no intersection: end <= slice->end */
+		return 0; /* no intersection: end <= slice->begin */
 
-	/* begin = MAX(begin, slice->begin) */
-	if (slice->begin.stmt != NULL &&
-	    (begin.stmt == NULL || vy_entry_compare(begin, slice->begin,
-						    cmp_def) < 0))
-		begin = slice->begin;
-
-	/* end = MIN(end, slice->end) */
-	if (slice->end.stmt != NULL &&
-	    (end.stmt == NULL || vy_entry_compare(end, slice->end,
-						  cmp_def) > 0))
-		end = slice->end;
-
-	*result = vy_slice_new(id, slice->run, begin, end, cmp_def);
+	*result = vy_slice_new(id, slice->run);
 	if (*result == NULL)
 		return -1; /* OOM */
 
@@ -1254,8 +1187,7 @@ vy_run_iterator_find_lsn(struct vy_run_iterator *itr, struct vy_entry *ret)
 	}
 	/* Check if the result is within the slice boundaries. */
 	if (itr->iterator_type == ITER_LE || itr->iterator_type == ITER_LT) {
-		if (slice->begin.stmt != NULL &&
-		    vy_entry_compare(itr->curr, slice->begin, cmp_def) < 0) {
+		if (vy_entry_compare(itr->curr, slice->begin, cmp_def) < 0) {
 			vy_run_iterator_stop(itr);
 			return 0;
 		}
@@ -1263,8 +1195,7 @@ vy_run_iterator_find_lsn(struct vy_run_iterator *itr, struct vy_entry *ret)
 		assert(itr->iterator_type == ITER_GE ||
 		       itr->iterator_type == ITER_GT ||
 		       itr->iterator_type == ITER_EQ);
-		if (slice->end.stmt != NULL &&
-		    vy_entry_compare(itr->curr, slice->end, cmp_def) >= 0) {
+		if (vy_bound_cmp(itr->curr, slice->end_bound, cmp_def) > 0) {
 			vy_run_iterator_stop(itr);
 			return 0;
 		}
@@ -1382,9 +1313,8 @@ vy_run_iterator_seek(struct vy_run_iterator *itr, struct vy_entry last,
 	}
 
 	/* Take slice boundaries into account. */
-	if (slice->begin.stmt != NULL &&
-	    (iterator_type == ITER_GT || iterator_type == ITER_GE ||
-	     iterator_type == ITER_EQ)) {
+	if (iterator_type == ITER_GT || iterator_type == ITER_GE ||
+	    iterator_type == ITER_EQ) {
 		/*
 		 *    original   |     start
 		 * --------------+-------+-----+
@@ -1410,23 +1340,16 @@ vy_run_iterator_seek(struct vy_run_iterator *itr, struct vy_entry last,
 			key = slice->begin;
 		}
 	}
-	if (slice->end.stmt != NULL &&
-	    (iterator_type == ITER_LT || iterator_type == ITER_LE)) {
+	if (iterator_type == ITER_LT || iterator_type == ITER_LE) {
 		/*
-		 *    original   |     start
-		 * --------------+-------+-----+
-		 *   KEY   | DIR |  KEY  | DIR |
-		 * --------+-----+-------+-----+
-		 * < end   | *   | key   | *   |
-		 * = end   | lt  | key   | lt  |
-		 *         | le  | end   | lt  |
-		 * > end   | lt  | end   | lt  |
-		 *         | le  | end   | lt  |
+		 * Clamp the backward seek to the slice's end bound.
+		 * If key is past end_bound in the bound-comparison
+		 * sense, start from end_bound instead.
 		 */
-		int cmp = vy_entry_compare(key, slice->end, cmp_def);
-		if (cmp > 0 || (cmp == 0 && iterator_type != ITER_LT)) {
-			iterator_type = ITER_LT;
-			key = slice->end;
+		if (vy_bound_cmp(key, slice->end_bound, cmp_def) > 0) {
+			iterator_type = vy_entry_is_exclusive(
+				slice->end_bound) ? ITER_LT : ITER_LE;
+			key = slice->end_bound;
 		}
 	}
 
@@ -2699,9 +2622,9 @@ vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 		return -1;
 
 	/* Check that the tuple is not out of slice bounds = */
-	if (stream->slice->end.stmt != NULL &&
-	    stream->page_no >= stream->slice->last_page_no &&
-	    vy_entry_compare(entry, stream->slice->end, stream->cmp_def) >= 0) {
+	if (stream->page_no >= stream->slice->last_page_no &&
+	    vy_bound_cmp(entry, stream->slice->end_bound,
+			 stream->cmp_def) > 0) {
 		tuple_unref(entry.stmt);
 		*ret = vy_entry_none();
 		return 0;

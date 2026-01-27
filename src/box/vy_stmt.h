@@ -139,6 +139,12 @@ enum {
 	 */
 	VY_STMT_FLAGS_ALL = (VY_STMT_DEFERRED_DELETE | VY_STMT_SKIP_READ |
 			     VY_STMT_UPDATE),
+	/**
+	 * The key marks an exclusive upper bound (data_end of a
+	 * slice clipped by a range boundary).  Transient: never
+	 * persisted, not included in VY_STMT_FLAGS_ALL.
+	 */
+	VY_STMT_EXCLUSIVE_BOUND		= 1 << 3,
 };
 
 /**
@@ -244,6 +250,13 @@ static inline void
 vy_stmt_set_flags(struct tuple *stmt, uint8_t flags)
 {
 	((struct vy_stmt *)stmt)->flags = flags;
+}
+
+/** Check if the entry has VY_STMT_EXCLUSIVE_BOUND flag set. */
+static inline bool
+vy_entry_is_exclusive(struct vy_entry entry)
+{
+	return vy_stmt_flags(entry.stmt) & VY_STMT_EXCLUSIVE_BOUND;
 }
 
 /**
@@ -797,6 +810,37 @@ vy_entry_compare_with_raw_key(struct vy_entry entry,
 {
 	return vy_stmt_compare_with_raw_key(entry.stmt, entry.hint,
 					    key, key_hint, key_def);
+}
+
+/**
+ * Compare two entries as upper bounds with INCLUSIVE/EXCLUSIVE
+ * semantics.  At equal keys, an EXCLUSIVE bound (flagged with
+ * VY_STMT_EXCLUSIVE_BOUND) sorts before an INCLUSIVE one.
+ */
+static inline int
+vy_bound_cmp(struct vy_entry a, struct vy_entry b,
+	     struct key_def *cmp_def)
+{
+	int rc = vy_entry_compare(a, b, cmp_def);
+	if (rc != 0)
+		return rc;
+	return (int)!vy_entry_is_exclusive(a) -
+	       (int)!vy_entry_is_exclusive(b);
+}
+
+/**
+ * Compare an upper bound (entry with optional VY_STMT_EXCLUSIVE_BOUND
+ * flag) against a raw key point (always treated as inclusive).
+ * Returns < 0 if the bound is before the point.
+ */
+static inline int
+vy_bound_cmp_raw(struct vy_entry bound, const char *key,
+		 hint_t hint, struct key_def *cmp_def)
+{
+	int rc = vy_entry_compare_with_raw_key(bound, key, hint, cmp_def);
+	if (rc != 0)
+		return rc;
+	return vy_entry_is_exclusive(bound) ? -1 : 0;
 }
 
 /**

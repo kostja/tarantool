@@ -1192,8 +1192,7 @@ vy_task_dump_complete(struct vy_task *task)
 	}
 	for (range = begin_range, i = 0; range != end_range;
 	     range = vy_range_tree_next(&lsm->range_tree, range), i++) {
-		slice = vy_slice_new(vy_log_next_id(), new_run,
-				     range->begin, range->end, lsm->cmp_def);
+		slice = vy_slice_new(vy_log_next_id(), new_run);
 		if (slice == NULL)
 			goto fail_free_slices;
 
@@ -1212,7 +1211,7 @@ vy_task_dump_complete(struct vy_task *task)
 		slice = new_slices[i];
 		vy_log_insert_slice(range->id, new_run->id, slice->id,
 				    tuple_data_or_null(slice->begin.stmt),
-				    tuple_data_or_null(slice->end.stmt));
+				    tuple_data_or_null(range->end.stmt));
 	}
 	vy_log_dump_lsm(lsm->id, dump_lsn);
 	if (vy_log_tx_commit() < 0)
@@ -1488,9 +1487,7 @@ vy_task_compaction_complete(struct vy_task *task)
 	 * compacted runs.
 	 */
 	if (!vy_run_is_empty(new_run)) {
-		new_slice = vy_slice_new(vy_log_next_id(), new_run,
-					 vy_entry_none(), vy_entry_none(),
-					 lsm->cmp_def);
+		new_slice = vy_slice_new(vy_log_next_id(), new_run);
 		if (new_slice == NULL)
 			return -1;
 	}
@@ -1530,7 +1527,7 @@ vy_task_compaction_complete(struct vy_task *task)
 				  new_run->dump_count);
 		vy_log_insert_slice(range->id, new_run->id, new_slice->id,
 				    tuple_data_or_null(new_slice->begin.stmt),
-				    tuple_data_or_null(new_slice->end.stmt));
+				    tuple_data_or_null(range->end.stmt));
 	}
 	if (vy_log_tx_commit() < 0) {
 		if (new_slice != NULL)

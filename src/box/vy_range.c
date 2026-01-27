@@ -231,9 +231,114 @@ vy_range_snprint(char *buf, int size, const struct vy_range *range)
 	return total;
 }
 
+/*
+ * Initialize run slice boundaries using range constraints.
+ * Assumes the slice is not initialized yet.
+ */
+static void
+vy_range_init_slice(struct vy_range *range, struct vy_slice *slice)
+{
+	assert(slice->count.pages == 0);
+	struct vy_run *run = slice->run;
+	struct vy_run_env *env = run->env;
+
+	if (slice->begin.stmt) {
+		tuple_unref(slice->begin.stmt);
+		slice->begin = vy_entry_none();
+	}
+	if (slice->end_bound.stmt != NULL) {
+		tuple_unref(slice->end_bound.stmt);
+		slice->end_bound = vy_entry_none();
+	}
+
+	if (run->info.page_count == 0) {
+		/* The run is empty hence the slice is empty too. */
+		return;
+	}
+
+	struct vy_page_info *page0 = vy_run_page_info(slice->run, 0);
+
+	/* slice->begin = MAX(range::begin, run::min_key) */
+	if (range->begin.stmt != NULL &&
+	    vy_entry_compare_with_raw_key(range->begin, page0->min_key,
+					  page0->min_key_hint,
+					  range->cmp_def) >= 0) {
+		slice->begin = range->begin;
+		tuple_ref(range->begin.stmt);
+	} else {
+		/*
+		 * We get here when range->begin is -inf or when
+		 * range->begin < run::min_key, i.e. the run's
+		 * first key is fully inside the range. We dup
+		 * min_key so that the split heuristic can use
+		 * slice->begin as a candidate split point.
+		 */
+		slice->begin =
+			vy_entry_key_from_msgpack(env->key_format,
+						  range->cmp_def,
+						  page0->min_key);
+		if (slice->begin.stmt == NULL)
+			panic("failed to allocate slice begin");
+	}
+	/*
+	 * Compute end_bound: the tightest upper bound on keys
+	 * stored in this slice.
+	 *
+	 * When range->end <= max_key, the range boundary clips
+	 * the run: the slice exposes keys strictly less than
+	 * range->end (which is exclusive).
+	 *
+	 * When range->end > max_key (widened by a prior range
+	 * split) or range->end is NULL (+inf), the run's data
+	 * ends before the range boundary, so max_key is the
+	 * precise inclusive upper bound.
+	 */
+	if (range->end.stmt != NULL &&
+	    vy_entry_compare_with_raw_key(range->end, run->info.max_key,
+					  HINT_NONE, range->cmp_def) <= 0) {
+		slice->end_bound = range->end;
+		tuple_ref(range->end.stmt);
+		vy_stmt_set_flags(slice->end_bound.stmt,
+				  VY_STMT_EXCLUSIVE_BOUND);
+	} else {
+		slice->end_bound = vy_entry_key_from_msgpack(
+			env->key_format, range->cmp_def,
+			run->info.max_key);
+		if (slice->end_bound.stmt == NULL)
+			panic("failed to allocate slice end_bound");
+	}
+	/** Lookup the first and the last pages spanned by the slice. */
+	bool unused;
+	slice->first_page_no =
+		vy_page_index_find_page(run, slice->begin,
+					range->cmp_def, ITER_GE,
+					&unused);
+	assert(slice->first_page_no < run->info.page_count);
+	enum iterator_type itype =
+		vy_entry_is_exclusive(slice->end_bound) ?
+		ITER_LT : ITER_LE;
+	slice->last_page_no =
+		vy_page_index_find_page(run, slice->end_bound,
+					range->cmp_def, itype,
+					&unused);
+	assert(slice->last_page_no < run->info.page_count);
+	assert(slice->last_page_no >= slice->first_page_no);
+	/** Estimate the number of statements in the slice. */
+	uint32_t run_pages = run->info.page_count;
+	uint32_t slice_pages = slice->last_page_no - slice->first_page_no + 1;
+	slice->count.pages = slice_pages;
+	slice->count.rows = DIV_ROUND_UP(run->count.rows *
+					 slice_pages, run_pages);
+	slice->count.bytes = DIV_ROUND_UP(run->count.bytes *
+					  slice_pages, run_pages);
+	slice->count.bytes_compressed = DIV_ROUND_UP(
+		run->count.bytes_compressed * slice_pages, run_pages);
+}
+
 void
 vy_range_add_slice(struct vy_range *range, struct vy_slice *slice)
 {
+	vy_range_init_slice(range, slice);
 	rlist_add_entry(&range->slices, slice, in_range);
 	range->slice_count++;
 	vy_disk_stmt_counter_add(&range->count, &slice->count);
@@ -244,6 +349,7 @@ void
 vy_range_add_slice_before(struct vy_range *range, struct vy_slice *slice,
 			  struct vy_slice *next_slice)
 {
+	vy_range_init_slice(range, slice);
 	rlist_add_tail(&next_slice->in_range, &slice->in_range);
 	range->slice_count++;
 	vy_disk_stmt_counter_add(&range->count, &slice->count);
@@ -510,8 +616,8 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 	 * The median key can't be >= the end of the slice as we
 	 * take the min key of a page for the median key.
 	 */
-	assert(slice->end.stmt == NULL ||
-	       vy_entry_compare_with_raw_key(slice->end, mid_page->min_key,
+	assert(vy_entry_compare_with_raw_key(slice->end_bound,
+					     mid_page->min_key,
 					     mid_page->min_key_hint,
 					     range->cmp_def) > 0);
 	*p_split_key = mid_page->min_key;

@@ -62,6 +62,8 @@ struct vy_run_env {
 	pthread_key_t zdctx_key;
 	/** Pool of threads used for reading run files. */
 	struct vy_run_reader *reader_pool;
+	/** Tuple format to create vy_stmt from run min/max key. */
+	struct tuple_format *key_format;
 	/** Number of threads in the reader pool. */
 	int reader_pool_size;
 	/**
@@ -189,13 +191,20 @@ struct vy_slice {
 	/** Run this slice is for (increments vy_run::refs). */
 	struct vy_run *run;
 	/**
-	 * Slice begin and end (increments tuple::refs).
-	 * If @begin is NULL, the slice starts from the beginning
-	 * of the run. If @end is NULL, the slice ends at the end
-	 * of the run.
+	 * Slice begin (increments tuple::refs).
 	 */
 	struct vy_entry begin;
-	struct vy_entry end;
+	/**
+	 * Tightest upper bound on keys stored in this slice
+	 * (increments tuple::refs).
+	 *
+	 * An inclusive key (max_key) when the run's max key falls
+	 * within this range (typical case, non-shared runs).
+	 * An exclusive key (with VY_STMT_EXCLUSIVE_BOUND flag)
+	 * when the run extends past this range's boundary
+	 * (shared run clipped by range split).
+	 */
+	struct vy_entry end_bound;
 	/**
 	 * Random seed used for compaction randomization.
 	 * Lays in range [0, RAND_MAX].
@@ -310,14 +319,38 @@ struct vy_page {
 };
 
 /**
+ * Find a page from which the iteration of a given key must be started.
+ * LE and LT: the found page definitely contains the position
+ *  for iteration start.
+ * GE, GT, EQ: Since page search uses only min_key of pages,
+ *  it may happen that the found page doesn't contain the position
+ *  for iteration start. In this case it is certain that the iteration
+ *  must be started from the beginning of the next page.
+ *
+ * @param run - run
+ * @param key - key to find
+ * @param key_def - key_def for comparison
+ * @param itype - iterator type (see above)
+ * @param equal_key: *equal_key is set to true if there is a page
+ *  with min_key equal to the given key.
+ * @return offset of the page in page index OR run->info.page_count if
+ *  there no pages fulfilling the conditions.
+ */
+uint32_t
+vy_page_index_find_page(struct vy_run *run, struct vy_entry key,
+			struct key_def *cmp_def, enum iterator_type itype,
+			bool *equal_key);
+/**
  * Initialize vinyl run environment
  *
+ * @param key_format - plain format for run min/max keys
  * @param read_threads - max number of background threads to
  * use for disk reads; note background threads are not used
  * until vy_run_env_enable_coio() is called.
  */
 void
-vy_run_env_create(struct vy_run_env *env, int read_threads);
+vy_run_env_create(struct vy_run_env *env, struct tuple_format *key_format,
+		  int read_threads);
 
 /**
  * Destroy vinyl run environment
@@ -475,8 +508,7 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
  * This function increments @run->refs.
  */
 struct vy_slice *
-vy_slice_new(int64_t id, struct vy_run *run, struct vy_entry begin,
-	     struct vy_entry end, struct key_def *cmp_def);
+vy_slice_new(int64_t id, struct vy_run *run);
 
 /**
  * Free a run slice.

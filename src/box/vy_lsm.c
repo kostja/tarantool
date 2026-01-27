@@ -417,7 +417,7 @@ vy_lsm_recover_slice(struct vy_lsm *lsm, struct vy_range *range,
 	if (run == NULL)
 		goto out;
 
-	slice = vy_slice_new(slice_info->id, run, begin, end, lsm->cmp_def);
+	slice = vy_slice_new(slice_info->id, run);
 	if (slice == NULL)
 		goto out;
 
@@ -1171,9 +1171,10 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
 				    tuple_data_or_null(part->begin.stmt),
 				    tuple_data_or_null(part->end.stmt));
 		rlist_foreach_entry(slice, &part->slices, in_range)
-			vy_log_insert_slice(part->id, slice->run->id, slice->id,
+			vy_log_insert_slice(part->id, slice->run->id,
+					    slice->id,
 					    tuple_data_or_null(slice->begin.stmt),
-					    tuple_data_or_null(slice->end.stmt));
+					    tuple_data_or_null(part->end.stmt));
 	}
 	if (vy_log_tx_commit() < 0)
 		goto fail;
@@ -1246,9 +1247,11 @@ vy_lsm_coalesce_range(struct vy_lsm *lsm, struct vy_range *range)
 			vy_log_delete_slice(slice->id);
 		vy_log_delete_range(it->id);
 		rlist_foreach_entry(slice, &it->slices, in_range) {
-			vy_log_insert_slice(result->id, slice->run->id, slice->id,
+			vy_log_insert_slice(result->id,
+					    slice->run->id, slice->id,
 					    tuple_data_or_null(slice->begin.stmt),
-					    tuple_data_or_null(slice->end.stmt));
+					    tuple_data_or_null(
+							result->end.stmt));
 		}
 	}
 	if (vy_log_tx_commit() < 0)
