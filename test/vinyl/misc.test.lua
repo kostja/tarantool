@@ -166,7 +166,7 @@ s:select()
 s:drop()
 
 --
--- gh-2389: L1 runs are not compressed.
+-- gh-2389: L1 runs are compressed (this patch was reverted in Picodata).
 --
 s = box.schema.space.create('test', {engine = 'vinyl'})
 i = s:create_index('pk', {page_size = 100 * 1000, range_size = 1000 * 1000})

@@ -384,7 +384,7 @@ s:drop()
 ---
 ...
 --
--- gh-2389: L1 runs are not compressed.
+-- gh-2389: L1 runs are compressed (this patch was reverted in Picodata).
 --
 s = box.schema.space.create('test', {engine = 'vinyl'})
 ---
@@ -407,7 +407,7 @@ stat = i:stat().disk
 ...
 stat.bytes_compressed >= stat.bytes
 ---
-- true
+- false
 ...
 for k = 1, 10 do s:replace{k, pad} end
 ---

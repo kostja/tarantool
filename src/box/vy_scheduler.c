@@ -1058,7 +1058,7 @@ vy_task_deferred_delete_iface = {
 };
 
 static int
-vy_task_write_run(struct vy_task *task, bool no_compression)
+vy_task_write_run(struct vy_task *task)
 {
 	enum { YIELD_LOOPS = 32 };
 
@@ -1074,8 +1074,7 @@ vy_task_write_run(struct vy_task *task, bool no_compression)
 	if (vy_run_writer_create(&writer, task->new_run, lsm->env->path,
 				 lsm->space_id, lsm->index_id,
 				 task->cmp_def, task->key_def,
-				 &task->index_opts,
-				 no_compression) != 0)
+				 &task->index_opts) != 0)
 		goto fail;
 
 	if (wi->iface->start(wi) != 0)
@@ -1120,12 +1119,7 @@ static int
 vy_task_dump_execute(struct vy_task *task)
 {
 	ERROR_INJECT_SLEEP(ERRINJ_VY_DUMP_DELAY);
-	/*
-	 * Don't compress L1 runs as they are most frequently read
-	 * and smallest runs at the same time and so we would gain
-	 * nothing by compressing them.
-	 */
-	return vy_task_write_run(task, true);
+	return vy_task_write_run(task);
 }
 
 static int
@@ -1450,7 +1444,7 @@ static int
 vy_task_compaction_execute(struct vy_task *task)
 {
 	ERROR_INJECT_SLEEP(ERRINJ_VY_COMPACTION_DELAY);
-	return vy_task_write_run(task, false);
+	return vy_task_write_run(task);
 }
 
 static int

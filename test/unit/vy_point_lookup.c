@@ -27,7 +27,7 @@ write_run(struct vy_run *run, const char *dir_name,
 	if (vy_run_writer_create(&writer, run, dir_name,
 				 lsm->space_id, lsm->index_id,
 				 lsm->cmp_def, lsm->key_def,
-				 &index_opts, false) != 0)
+				 &index_opts) != 0)
 		goto fail;
 
 	if (wi->iface->start(wi) != 0)

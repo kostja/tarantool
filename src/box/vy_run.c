@@ -2038,7 +2038,7 @@ int
 vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 		     const char *dirpath, uint32_t space_id, uint32_t iid,
 		     struct key_def *cmp_def, struct key_def *key_def,
-		     struct index_opts *index_opts, bool no_compression)
+		     struct index_opts *index_opts)
 {
 	memset(writer, 0, sizeof(*writer));
 	writer->run = run;
@@ -2048,7 +2048,6 @@ vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 	writer->cmp_def = cmp_def;
 	writer->key_def = key_def;
 	writer->index_opts = *index_opts;
-	writer->no_compression = no_compression;
 	if (writer->index_opts.bloom_fpr < 1) {
 		writer->bloom = tuple_bloom_builder_new(key_def->part_count);
 		if (writer->bloom == NULL)
@@ -2085,7 +2084,6 @@ vy_run_writer_create_xlog(struct vy_run_writer *writer)
 	opts.rate_limit = writer->run->env->snap_io_rate_limit;
 	opts.sync_interval = VY_RUN_SYNC_INTERVAL;
 	opts.compression_level = writer->index_opts.compression_level;
-	opts.no_compression = writer->no_compression;
 	if (xlog_create(&writer->data_xlog, path, 0, &meta, &opts) != 0)
 		return -1;
 	return 0;

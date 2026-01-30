@@ -1,7 +1,9 @@
 test_run = require('test_run').new()
 
 fiber = require('fiber')
-fiber.set_max_slice(15)
+-- 30s (up from 15) because dumps are now always compressed,
+-- which makes upsert squashing slower.
+fiber.set_max_slice(30)
 
 s = box.schema.create_space('test', {engine = 'vinyl'})
 pk = s:create_index('pk')
