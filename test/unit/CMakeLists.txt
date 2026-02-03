@@ -429,12 +429,13 @@ create_unit_test(PREFIX vy_point_lookup
                          ${PROJECT_SOURCE_DIR}/src/box/vy_upsert.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_history.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_lsm.c
+                        ${PROJECT_SOURCE_DIR}/src/box/vy_dict.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_cache.c
                          ${PROJECT_SOURCE_DIR}/src/box/index_def.c
                          ${PROJECT_SOURCE_DIR}/src/box/schema_def.c
                          ${PROJECT_SOURCE_DIR}/src/box/identifier.c
                          core_test_utils.c
-                 LIBRARIES core tuple xrow xlog unit ${LIB_DL}
+                 LIBRARIES core tuple xrow xlog unit ${ZSTD_LIBRARIES} ${LIB_DL}
 )
 
 create_unit_test(PREFIX vy_split_point
@@ -447,11 +448,12 @@ create_unit_test(PREFIX vy_split_point
                          ${PROJECT_SOURCE_DIR}/src/box/vy_mem.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_upsert.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_history.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_dict.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_cache.c
                          ${PROJECT_SOURCE_DIR}/src/box/key_def.c
                          ${PROJECT_SOURCE_DIR}/src/box/index_def.c
                          core_test_utils.c
-                 LIBRARIES core tuple xrow xlog unit ${LIB_DL}
+                 LIBRARIES core tuple xrow xlog unit ${ZSTD_LIBRARIES} ${LIB_DL}
 )
 
 create_unit_test(PREFIX column_mask
@@ -464,9 +466,11 @@ create_unit_test(PREFIX vy_write_iterator
                          ${PROJECT_SOURCE_DIR}/src/box/vy_run.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_upsert.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_write_iterator.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_dict.c
+                         vy_log_stub.c
                          ${ITERATOR_TEST_SOURCES}
                          core_test_utils.c
-                 LIBRARIES xlog ${ITERATOR_TEST_LIBS} ${LIB_DL}
+                 LIBRARIES xlog ${ITERATOR_TEST_LIBS} ${ZSTD_LIBRARIES} ${LIB_DL}
 )
 
 create_unit_test(PREFIX vy_cache

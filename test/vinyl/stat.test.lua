@@ -77,6 +77,7 @@ function istat()
     st.latency = nil
     st.disk.dump.time = nil
     st.disk.compaction.time = nil
+    st.dict = nil
     return st
 end;
 

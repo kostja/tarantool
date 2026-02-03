@@ -94,6 +94,7 @@ function istat()
     st.latency = nil
     st.disk.dump.time = nil
     st.disk.compaction.time = nil
+    st.dict = nil
     return st
 end;
 ---
@@ -217,14 +218,9 @@ istat()
   upsert:
     squashed: 0
     applied: 0
-  bytes: 0
   put:
     rows: 0
     bytes: 0
-  skip:
-    rows: 0
-    bytes: 0
-  run_count: 0
   txw:
     bytes: 0
     rows: 0
@@ -233,6 +229,11 @@ istat()
       get:
         rows: 0
         bytes: 0
+  skip:
+    rows: 0
+    bytes: 0
+  run_count: 0
+  bytes: 0
   memory:
     bytes: 0
     index_size: 0
@@ -248,7 +249,18 @@ istat()
 ...
 gstat()
 ---
-- tx:
+- dict:
+    dicts_dropped: 0
+    train_rejected: 0
+    train_failed: 0
+    train_attempted: 0
+    dicts_bytes: 0
+    train_throttled: 0
+    dicts_created: 0
+    dicts_bytes_peak: 0
+    train_accepted: 0
+    dicts_active: 0
+  tx:
     conflict: 0
     commit: 0
     rollback: 0
@@ -308,9 +320,7 @@ wait(istat, st, 'disk.dump.count', 1)
 ...
 stat_diff(istat(), st)
 ---
-- put:
-    rows: 25
-    bytes: 26325
+- bytes: 26049
   rows: 25
   run_avg: 1
   run_count: 1
@@ -339,7 +349,9 @@ stat_diff(istat(), st)
     pages: 7
     bytes_compressed: <bytes_compressed>
     bloom_size: 70
-  bytes: 26049
+  put:
+    rows: 25
+    bytes: 26325
 ...
 gstat().memory.page_index == 294
 ---
@@ -363,9 +375,7 @@ stat_diff(istat(), st)
 ---
 - rows: 25
   run_avg: -1
-  put:
-    rows: 50
-    bytes: 52650
+  bytes: 26042
   range_count: 1
   disk:
     last_level:
@@ -402,7 +412,9 @@ stat_diff(istat(), st)
         pages: 13
         bytes_compressed: <bytes_compressed>
         rows: 50
-  bytes: 26042
+  put:
+    rows: 50
+    bytes: 52650
 ...
 -- point lookup from disk + cache put
 st = istat()
@@ -490,10 +502,10 @@ stat_diff(istat(), st)
     index_size: 49152
     bytes: 1053
     rows: 1
+  bytes: 1053
   put:
     rows: 1
     bytes: 1053
-  bytes: 1053
 ...
 -- point lookup from memory
 st = istat()
@@ -1125,14 +1137,9 @@ istat()
   upsert:
     squashed: 0
     applied: 0
-  bytes: 316158
   put:
     rows: 0
     bytes: 0
-  skip:
-    rows: 0
-    bytes: 0
-  run_count: 2
   txw:
     bytes: 0
     rows: 0
@@ -1141,6 +1148,11 @@ istat()
       get:
         rows: 0
         bytes: 0
+  skip:
+    rows: 0
+    bytes: 0
+  run_count: 2
+  bytes: 316158
   memory:
     bytes: 211783
     index_size: 49152
@@ -1156,7 +1168,18 @@ istat()
 ...
 gstat()
 ---
-- tx:
+- dict:
+    dicts_dropped: 0
+    train_rejected: 0
+    train_failed: 0
+    train_attempted: 0
+    dicts_bytes: 0
+    train_throttled: 0
+    dicts_created: 0
+    dicts_bytes_peak: 0
+    train_accepted: 0
+    dicts_active: 0
+  tx:
     conflict: 0
     commit: 0
     rollback: 0

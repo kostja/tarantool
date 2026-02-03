@@ -86,6 +86,10 @@ struct xlog_opts {
 	 * Set the compression level. If not set, the default is 3.
 	 */
 	int compression_level;
+	/** Optional dictionary for zstd compression. */
+	const void *dict;
+	/** Dictionary size in bytes. */
+	size_t dict_size;
 };
 
 extern const struct xlog_opts xlog_opts_default;
@@ -611,18 +615,18 @@ struct xlog_tx_cursor
 	size_t size;
 };
 
+struct xlog_cursor;
+
 /**
- * Create xlog tx iterator from memory data.
- * *data will be adjusted to end of tx
+ * Create xlog tx iterator from the xlog cursor read buffer.
+ * cursor->rbuf.rpos will be adjusted to end of tx.
  *
  * @retval 0 for Ok
  * @retval -1 for error
  * @retval >0 how many additional bytes should be read to parse tx
  */
 ssize_t
-xlog_tx_cursor_create(struct xlog_tx_cursor *cursor,
-		      const char **data, const char *data_end,
-		      ZSTD_DStream *zdctx);
+xlog_tx_cursor_create(struct xlog_cursor *cursor);
 
 /**
  * Destroy xlog tx cursor and free all associated memory
@@ -672,8 +676,32 @@ xlog_tx_cursor_pos(struct xlog_tx_cursor *tx_cursor)
 }
 
 /**
+ * Reset a ZSTD decompression stream, optionally loading a
+ * dictionary.  Must be called before each decompression session.
+ *
+ * Thread safety: the @a dict buffer is only read during this call
+ * (ZSTD processes it into internal state of @a zdctx), so multiple
+ * reader threads may pass the same dict data concurrently as long
+ * as each thread uses its own ZSTD_DStream instance.
+ */
+static inline void
+xlog_zdstream_reset(ZSTD_DStream *zdctx,
+		    const void *dict, size_t dict_size)
+{
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+	if (dict != NULL && dict_size > 0)
+		ZSTD_initDStream_usingDict(zdctx, dict, dict_size);
+	else
+		ZSTD_initDStream(zdctx);
+#pragma GCC diagnostic pop
+}
+
+/**
  * A conventional helper to decode rows from the raw tx buffer.
  * Decodes fixheader, checks crc32 and length, decompresses rows.
+ * The caller must call xlog_zdstream_reset() before this function
+ * if the data may be compressed.
  *
  * @param data a buffer with the raw tx data, including fixheader
  * @param data_end the end of @a data buffer
@@ -730,6 +758,10 @@ struct xlog_cursor {
 	struct xlog_tx_cursor tx_cursor;
 	/** ZSTD context for decompression */
 	ZSTD_DStream *zdctx;
+	/** Optional dictionary for zstd decompression. */
+	const void *dict;
+	/** Dictionary size in bytes. */
+	size_t dict_size;
 };
 
 /**
@@ -753,6 +785,17 @@ xlog_cursor_is_eof(const struct xlog_cursor *cursor)
 {
 	return (cursor->state == XLOG_CURSOR_EOF ||
 		cursor->state == XLOG_CURSOR_EOF_CLOSED);
+}
+
+/**
+ * Set the dictionary for zstd decompression.
+ */
+static inline void
+xlog_cursor_set_dict(struct xlog_cursor *cursor,
+		     const void *dict, size_t dict_size)
+{
+	cursor->dict = dict;
+	cursor->dict_size = dict_size;
 }
 
 /**

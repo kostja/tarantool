@@ -28,6 +28,7 @@ box.space.V1.index[0].options
   run_size_ratio: 5
   bloom_fpr: 0.1
   compression_level: 3
+  compression_dict: false
   range_size: 536870912
 ...
 box.execute('CREATE INDEX i1 ON v1(b);')
@@ -41,6 +42,7 @@ box.space.V1.index[1].options
   run_size_ratio: 5
   bloom_fpr: 0.1
   compression_level: 3
+  compression_dict: false
   range_size: 536870912
 ...
 box.space.V1:drop()

@@ -111,6 +111,22 @@ struct vy_txw_iterator_stat {
 	struct vy_stmt_counter get;
 };
 
+/** Per-index dictionary compression evaluation stats. */
+struct vy_dict_index_stat {
+	/** Sample size used for last evaluation. */
+	int64_t sample_size;
+	/** Relative gain vs no-dict compression. */
+	double dict_gain;
+	/** Compression rate with dictionary. */
+	double dict_rate;
+	/** CPU time with dictionary, in nanoseconds. */
+	int64_t dict_cpu_ns;
+	/** Compression rate without dictionary. */
+	double no_dict_rate;
+	/** CPU time without dictionary, in nanoseconds. */
+	int64_t no_dict_cpu_ns;
+};
+
 /** LSM tree statistics. */
 struct vy_lsm_stat {
 	/** Number of lookups in the LSM tree. */
@@ -179,6 +195,8 @@ struct vy_lsm_stat {
 		/** TX write set iterator statistics. */
 		struct vy_txw_iterator_stat iterator;
 	} txw;
+	/** Dictionary compression evaluation stats. */
+	struct vy_dict_index_stat dict;
 };
 
 /** Tuple cache statistics. */
@@ -212,6 +230,61 @@ struct vy_tx_stat {
 	/** Number of transactions aborted on conflict. */
 	int64_t conflict;
 };
+
+/** Dictionary compression statistics. */
+struct vy_dict_stat {
+	/** Number of dictionary training attempts. */
+	int64_t train_attempted;
+	/** Number of trainings skipped due to throttling. */
+	int64_t train_throttled;
+	/** Number of failed trainings. */
+	int64_t train_failed;
+	/** Number of trainings rejected due to low gain. */
+	int64_t train_rejected;
+	/** Number of accepted trainings. */
+	int64_t train_accepted;
+	/** Number of dictionaries created in memory. */
+	int64_t dicts_created;
+	/** Number of dictionaries dropped from memory. */
+	int64_t dicts_dropped;
+	/** Number of active dictionaries in memory. */
+	int64_t dicts_active;
+	/** Total bytes of active dictionaries. */
+	int64_t dicts_bytes;
+	/** Peak bytes of active dictionaries. */
+	int64_t dicts_bytes_peak;
+};
+
+/**
+ * Add dictionary training statistics accumulated in @s2 to @s1.
+ */
+static inline void
+vy_dict_stat_add(struct vy_dict_stat *s1, const struct vy_dict_stat *s2)
+{
+	s1->train_attempted += s2->train_attempted;
+	s1->train_throttled += s2->train_throttled;
+	s1->train_failed += s2->train_failed;
+	s1->train_rejected += s2->train_rejected;
+	s1->train_accepted += s2->train_accepted;
+}
+
+static inline void
+vy_dict_stat_on_create(struct vy_dict_stat *stat, size_t dict_size)
+{
+	stat->dicts_created++;
+	stat->dicts_active++;
+	stat->dicts_bytes += dict_size;
+	if (stat->dicts_bytes > stat->dicts_bytes_peak)
+		stat->dicts_bytes_peak = stat->dicts_bytes;
+}
+
+static inline void
+vy_dict_stat_on_drop(struct vy_dict_stat *stat, size_t dict_size)
+{
+	stat->dicts_dropped++;
+	stat->dicts_active--;
+	stat->dicts_bytes -= dict_size;
+}
 
 /**
  * Scheduler statistics.

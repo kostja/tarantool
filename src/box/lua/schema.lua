@@ -1398,6 +1398,7 @@ local index_options = {
     page_size = 'number',
     bloom_fpr = 'number',
     compression_level = 'number',
+    compression_dict = 'boolean',
     func = 'number, string',
     hint = 'boolean',
 }
@@ -1495,6 +1496,7 @@ box.schema.index.create = function(space_id, name, options)
             run_size_ratio = box.cfg.vinyl_run_size_ratio,
             bloom_fpr = box.cfg.vinyl_bloom_fpr,
             compression_level = box.cfg.vinyl_compression_level,
+            compression_dict = box.cfg.vinyl_compression_dict,
         }
     else
         options_defaults = {}
@@ -1542,6 +1544,9 @@ box.schema.index.create = function(space_id, name, options)
             run_size_ratio = options.run_size_ratio,
             bloom_fpr = options.bloom_fpr,
             compression_level = options.compression_level,
+            -- Omit compression_dict when false (the default) so that
+            -- older Tarantool versions don't see an unknown option.
+            compression_dict = options.compression_dict or nil,
             func = options.func,
             hint = options.hint,
     }

@@ -86,6 +86,8 @@ enum vy_log_key {
 	VY_LOG_KEY_DROP_LSN		= 14,
 	VY_LOG_KEY_GROUP_ID		= 15,
 	VY_LOG_KEY_DUMP_COUNT		= 16,
+	VY_LOG_KEY_DICT_ID		= 17,
+	VY_LOG_KEY_DICT_DATA		= 18,
 };
 
 /** vy_log_key -> human readable name. */
@@ -107,6 +109,8 @@ static const char *vy_log_key_name[] = {
 	[VY_LOG_KEY_DROP_LSN]		= "drop_lsn",
 	[VY_LOG_KEY_GROUP_ID]		= "group_id",
 	[VY_LOG_KEY_DUMP_COUNT]		= "dump_count",
+	[VY_LOG_KEY_DICT_ID]		= "dict_id",
+	[VY_LOG_KEY_DICT_DATA]		= "dict_data",
 };
 
 /** vy_log_type -> human readable name. */
@@ -129,6 +133,7 @@ static const char *vy_log_type_name[] = {
 	[VY_LOG_PREPARE_LSM]		= "prepare_lsm",
 	[VY_LOG_REBOOTSTRAP]		= "rebootstrap",
 	[VY_LOG_ABORT_REBOOTSTRAP]	= "abort_rebootstrap",
+	[VY_LOG_CREATE_DICT]		= "create_dict",
 };
 
 /** Batch of vylog records that must be written in one go. */
@@ -248,6 +253,10 @@ vy_log_record_snprint(char *buf, int size, const struct vy_log_record *record)
 		SNPRINT(total, snprintf, buf, size, "%s=%"PRIi64", ",
 			vy_log_key_name[VY_LOG_KEY_RUN_ID],
 			record->run_id);
+	if (record->dict_id > 0)
+		SNPRINT(total, snprintf, buf, size, "%s=%" PRIi64 ", ",
+			vy_log_key_name[VY_LOG_KEY_DICT_ID],
+			record->dict_id);
 	if (record->begin != NULL) {
 		SNPRINT(total, snprintf, buf, size, "%s=",
 			vy_log_key_name[VY_LOG_KEY_BEGIN]);
@@ -361,6 +370,16 @@ vy_log_record_encode(const struct vy_log_record *record,
 		size += mp_sizeof_uint(record->run_id);
 		n_keys++;
 	}
+	if (record->dict_id > 0) {
+		size += mp_sizeof_uint(VY_LOG_KEY_DICT_ID);
+		size += mp_sizeof_uint(record->dict_id);
+		n_keys++;
+	}
+	if (record->dict_data != NULL) {
+		size += mp_sizeof_uint(VY_LOG_KEY_DICT_DATA);
+		size += mp_sizeof_bin(record->dict_size);
+		n_keys++;
+	}
 	if (record->begin != NULL) {
 		size += mp_sizeof_uint(VY_LOG_KEY_BEGIN);
 		const char *p = record->begin;
@@ -455,6 +474,16 @@ vy_log_record_encode(const struct vy_log_record *record,
 	if (record->run_id > 0) {
 		pos = mp_encode_uint(pos, VY_LOG_KEY_RUN_ID);
 		pos = mp_encode_uint(pos, record->run_id);
+	}
+	if (record->dict_id > 0) {
+		pos = mp_encode_uint(pos, VY_LOG_KEY_DICT_ID);
+		pos = mp_encode_uint(pos, record->dict_id);
+	}
+	if (record->dict_data != NULL) {
+		pos = mp_encode_uint(pos, VY_LOG_KEY_DICT_DATA);
+		pos = mp_encode_binl(pos, record->dict_size);
+		memcpy(pos, record->dict_data, record->dict_size);
+		pos += record->dict_size;
 	}
 	if (record->begin != NULL) {
 		pos = mp_encode_uint(pos, VY_LOG_KEY_BEGIN);
@@ -583,6 +612,14 @@ vy_log_record_decode(struct vy_log_record *record,
 		case VY_LOG_KEY_RUN_ID:
 			record->run_id = mp_decode_uint(&pos);
 			break;
+		case VY_LOG_KEY_DICT_ID:
+			record->dict_id = mp_decode_uint(&pos);
+			break;
+		case VY_LOG_KEY_DICT_DATA:
+			record->dict_size = mp_decode_binl(&pos);
+			record->dict_data = pos;
+			pos += record->dict_size;
+			break;
 		case VY_LOG_KEY_BEGIN:
 			tmp = pos;
 			record->begin = mp_decode_array(&tmp) > 0 ? pos : NULL;
@@ -708,6 +745,11 @@ vy_log_record_dup(struct region *pool, const struct vy_log_record *src)
 		key_def_dump_parts(src->key_def, dst->key_parts, pool);
 		dst->key_part_count = src->key_def->part_count;
 		dst->key_def = NULL;
+	}
+	if (src->dict_data != NULL) {
+		dst->dict_data = xregion_alloc(pool, src->dict_size);
+		memcpy((char *)dst->dict_data, src->dict_data,
+		       src->dict_size);
 	}
 	return dst;
 }
@@ -1484,6 +1526,7 @@ vy_recovery_do_create_lsm(struct vy_recovery *recovery, int64_t id,
 	lsm->prepared = NULL;
 	rlist_create(&lsm->ranges);
 	rlist_create(&lsm->runs);
+	vy_recovery_dict_tree_new(&lsm->dicts);
 	/*
 	 * Keep newer LSM trees closer to the tail of the list
 	 * so that on log rotation we create/drop past incarnations
@@ -1637,6 +1680,20 @@ vy_recovery_drop_lsm(struct vy_recovery *recovery, int64_t id, int64_t drop_lsn)
 	return 0;
 }
 
+void
+vy_recovery_free_lsm(struct vy_lsm_recovery_info *lsm)
+{
+	/* Free any remaining dicts. */
+	struct vy_dict_recovery_info *dict;
+	while ((dict = vy_recovery_dict_tree_first(&lsm->dicts)) != NULL) {
+		vy_recovery_dict_tree_remove(&lsm->dicts, dict);
+		free(dict->dict_data);
+		free(dict);
+	}
+	free(lsm->key_parts);
+	free(lsm);
+}
+
 /**
  * Handle a VY_LOG_FORGET_LSM log record.
  * This function removes the LSM tree with ID @id from the context.
@@ -1664,8 +1721,7 @@ vy_recovery_forget_lsm(struct vy_recovery *recovery, int64_t id)
 	}
 	mh_i64ptr_del(h, k, NULL);
 	rlist_del_entry(lsm, in_recovery);
-	free(lsm->key_parts);
-	free(lsm);
+	vy_recovery_free_lsm(lsm);
 	return 0;
 }
 
@@ -1707,6 +1763,8 @@ vy_recovery_do_create_run(struct vy_recovery *recovery, int64_t run_id)
 	run->dump_lsn = -1;
 	run->gc_lsn = -1;
 	run->dump_count = 0;
+	run->dict_id = 0;
+	run->lsm = NULL;
 	run->is_incomplete = false;
 	run->is_dropped = false;
 	run->data = NULL;
@@ -1717,6 +1775,72 @@ vy_recovery_do_create_run(struct vy_recovery *recovery, int64_t run_id)
 }
 
 /**
+ * Remove a vinyl run from the hash and free it.
+ */
+static void
+vy_recovery_do_delete_run(struct vy_recovery *recovery,
+			  struct vy_run_recovery_info *run)
+{
+	struct mh_i64ptr_t *h = recovery->run_hash;
+	mh_int_t k = mh_i64ptr_find(h, run->id, NULL);
+	assert(k != mh_end(h));
+	mh_i64ptr_del(h, k, NULL);
+	rlist_del_entry(run, in_lsm);
+	free(run);
+}
+
+/**
+ * Look up a dictionary in the given LSM tree's dict tree.
+ */
+static struct vy_dict_recovery_info *
+vy_recovery_lookup_dict(struct vy_lsm_recovery_info *lsm, int64_t dict_id)
+{
+	return vy_recovery_dict_tree_search(&lsm->dicts, dict_id);
+}
+
+/**
+ * Handle a VY_LOG_CREATE_DICT log record.
+ * This function creates a new dictionary and adds it to the LSM tree.
+ * Return 0 on success, -1 on failure.
+ */
+static int
+vy_recovery_create_dict(struct vy_recovery *recovery, int64_t lsm_id,
+			int64_t dict_id, const char *dict_data,
+			size_t dict_size)
+{
+	struct vy_lsm_recovery_info *lsm;
+	lsm = vy_recovery_lookup_lsm(recovery, lsm_id);
+	if (lsm == NULL) {
+		diag_set(ClientError, ER_INVALID_VYLOG_FILE,
+			 tt_sprintf("Dict %lld created for unregistered "
+				    "LSM tree %lld", (long long)dict_id,
+				    (long long)lsm_id));
+		return -1;
+	}
+	if (vy_recovery_lookup_dict(lsm, dict_id) != NULL) {
+		diag_set(ClientError, ER_INVALID_VYLOG_FILE,
+			 tt_sprintf("Duplicate dict id %lld",
+				    (long long)dict_id));
+		return -1;
+	}
+	if (dict_data == NULL || dict_size == 0) {
+		diag_set(ClientError, ER_INVALID_VYLOG_FILE,
+			 "Bad record: missing dict data");
+		return -1;
+	}
+	struct vy_dict_recovery_info *dict = xmalloc(sizeof(*dict));
+	dict->id = dict_id;
+	dict->dict_data = xmalloc(dict_size);
+	memcpy(dict->dict_data, dict_data, dict_size);
+	dict->dict_size = dict_size;
+	dict->dict_refs = 0;
+	vy_recovery_dict_tree_insert(&lsm->dicts, dict);
+	if (recovery->max_id < dict_id)
+		recovery->max_id = dict_id;
+	return 0;
+}
+
+/**
  * Handle a VY_LOG_PREPARE_RUN log record.
  * This function creates a new incomplete vinyl run with ID @run_id
  * and adds it to the list of runs of the LSM tree with ID @lsm_id.
@@ -1724,7 +1848,7 @@ vy_recovery_do_create_run(struct vy_recovery *recovery, int64_t run_id)
  */
 static int
 vy_recovery_prepare_run(struct vy_recovery *recovery, int64_t lsm_id,
-			int64_t run_id)
+			int64_t run_id, int64_t dict_id)
 {
 	struct vy_lsm_recovery_info *lsm;
 	lsm = vy_recovery_lookup_lsm(recovery, lsm_id);
@@ -1743,7 +1867,22 @@ vy_recovery_prepare_run(struct vy_recovery *recovery, int64_t lsm_id,
 	}
 	struct vy_run_recovery_info *run;
 	run = vy_recovery_do_create_run(recovery, run_id);
+	run->lsm = lsm;
 	run->is_incomplete = true;
+	if (dict_id > 0) {
+		struct vy_dict_recovery_info *dict;
+		dict = vy_recovery_lookup_dict(lsm, dict_id);
+		if (dict == NULL) {
+			diag_set(ClientError, ER_INVALID_VYLOG_FILE,
+				 tt_sprintf("Dict %lld referenced by "
+					    "run %lld not found",
+					    (long long)dict_id,
+					    (long long)run_id));
+			return -1;
+		}
+		dict->dict_refs++;
+		run->dict_id = dict_id;
+	}
 	rlist_add_entry(&lsm->runs, run, in_lsm);
 	return 0;
 }
@@ -1779,6 +1918,7 @@ vy_recovery_create_run(struct vy_recovery *recovery, int64_t lsm_id,
 	}
 	if (run == NULL)
 		run = vy_recovery_do_create_run(recovery, run_id);
+	run->lsm = lsm;
 	run->dump_lsn = dump_lsn;
 	run->dump_count = dump_count;
 	run->is_incomplete = false;
@@ -1819,6 +1959,8 @@ vy_recovery_drop_run(struct vy_recovery *recovery, int64_t run_id,
 /**
  * Handle a VY_LOG_FORGET_RUN log record.
  * This function frees the vinyl run with ID @run_id.
+ * If the run references a dictionary, the dict's refcount
+ * is decremented, and the dict is freed when it reaches zero.
  * Return 0 on success, -1 if run not found.
  */
 static int
@@ -1833,9 +1975,21 @@ vy_recovery_forget_run(struct vy_recovery *recovery, int64_t run_id)
 		return -1;
 	}
 	struct vy_run_recovery_info *run = mh_i64ptr_node(h, k)->val;
-	mh_i64ptr_del(h, k, NULL);
-	rlist_del_entry(run, in_lsm);
-	free(run);
+	if (run->dict_id > 0 && run->lsm != NULL) {
+		struct vy_dict_recovery_info *dict;
+		dict = vy_recovery_lookup_dict(run->lsm, run->dict_id);
+		if (dict != NULL) {
+			assert(dict->dict_refs > 0);
+			dict->dict_refs--;
+			if (dict->dict_refs == 0) {
+				vy_recovery_dict_tree_remove(&run->lsm->dicts,
+							     dict);
+				free(dict->dict_data);
+				free(dict);
+			}
+		}
+	}
+	vy_recovery_do_delete_run(recovery, run);
 	return 0;
 }
 
@@ -2118,9 +2272,16 @@ vy_recovery_process_record(struct vy_recovery *recovery,
 	case VY_LOG_DELETE_RANGE:
 		rc = vy_recovery_delete_range(recovery, record->range_id);
 		break;
+	case VY_LOG_CREATE_DICT:
+		rc = vy_recovery_create_dict(recovery, record->lsm_id,
+					     record->dict_id,
+					     record->dict_data,
+					     record->dict_size);
+		break;
 	case VY_LOG_PREPARE_RUN:
 		rc = vy_recovery_prepare_run(recovery, record->lsm_id,
-					     record->run_id);
+					     record->run_id,
+					     record->dict_id);
 		break;
 	case VY_LOG_CREATE_RUN:
 		rc = vy_recovery_create_run(recovery, record->lsm_id,
@@ -2416,8 +2577,7 @@ vy_recovery_delete(struct vy_recovery *recovery)
 		}
 		rlist_foreach_entry_safe(run, &lsm->runs, in_lsm, next_run)
 			free(run);
-		free(lsm->key_parts);
-		free(lsm);
+		vy_recovery_free_lsm(lsm);
 	}
 	if (recovery->index_id_hash != NULL)
 		mh_i64ptr_delete(recovery->index_id_hash);
@@ -2473,19 +2633,46 @@ vy_log_append_lsm(struct xlog *xlog, struct vy_lsm_recovery_info *lsm)
 	if (vy_log_append_record(xlog, &record) != 0)
 		return -1;
 
-	rlist_foreach_entry(run, &lsm->runs, in_lsm) {
+	/*
+	 * Emit dictionaries before runs so that dict data is
+	 * available when referencing runs are loaded.  Only
+	 * dicts with dict_refs > 0 are present in the list
+	 * (zero-ref dicts are freed in vy_recovery_forget_run).
+	 */
+	struct vy_dict_recovery_info *dict;
+	for (dict = vy_recovery_dict_tree_first(&lsm->dicts); dict != NULL;
+	     dict = vy_recovery_dict_tree_next(&lsm->dicts, dict)) {
 		vy_log_record_init(&record);
-		if (run->is_incomplete) {
-			record.type = VY_LOG_PREPARE_RUN;
-		} else {
-			record.type = VY_LOG_CREATE_RUN;
-			record.dump_lsn = run->dump_lsn;
-			record.dump_count = run->dump_count;
-		}
+		record.type = VY_LOG_CREATE_DICT;
 		record.lsm_id = lsm->id;
-		record.run_id = run->id;
+		record.dict_id = dict->id;
+		record.dict_data = dict->dict_data;
+		record.dict_size = dict->dict_size;
 		if (vy_log_append_record(xlog, &record) != 0)
 			return -1;
+	}
+
+	/* Emit all runs in a single pass. */
+	rlist_foreach_entry(run, &lsm->runs, in_lsm) {
+		if (run->is_incomplete || run->dict_id > 0) {
+			vy_log_record_init(&record);
+			record.type = VY_LOG_PREPARE_RUN;
+			record.lsm_id = lsm->id;
+			record.run_id = run->id;
+			record.dict_id = run->dict_id;
+			if (vy_log_append_record(xlog, &record) != 0)
+				return -1;
+		}
+		if (!run->is_incomplete) {
+			vy_log_record_init(&record);
+			record.type = VY_LOG_CREATE_RUN;
+			record.lsm_id = lsm->id;
+			record.run_id = run->id;
+			record.dump_lsn = run->dump_lsn;
+			record.dump_count = run->dump_count;
+			if (vy_log_append_record(xlog, &record) != 0)
+				return -1;
+		}
 
 		if (!run->is_dropped)
 			continue;

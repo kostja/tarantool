@@ -43,6 +43,7 @@
 #include "salad/heap.h"
 #include "vy_entry.h"
 #include "vy_cache.h"
+#include "vy_dict.h"
 #include "vy_range.h"
 #include "vy_stat.h"
 #include "vy_read_set.h"
@@ -61,6 +62,7 @@ struct vy_recovery;
 struct vy_run;
 struct vy_run_env;
 struct vy_scheduler_stat;
+struct mh_i64ptr_t;
 typedef void
 (*vy_upsert_thresh_cb)(struct vy_lsm *lsm, struct vy_entry entry, void *arg);
 
@@ -134,6 +136,8 @@ struct vy_lsm_env {
 	 * in bytes, without taking into account disk compression.
 	 */
 	int64_t compaction_queue_size;
+	/** Dictionary compression statistics. */
+	struct vy_dict_stat dict_stat;
 	/** Memory pool for vy_history_node allocations. */
 	struct mempool history_node_pool;
 	/**
@@ -144,6 +148,36 @@ struct vy_lsm_env {
 	/** Argument passed to compaction_trigger_cb. */
 	void *compaction_trigger_arg;
 };
+
+/** Look up a dictionary by id in the LSM tree's dict hash. */
+struct vy_dict *
+vy_lsm_lookup_dict(struct vy_lsm *lsm, int64_t id);
+
+/**
+ * Register @a dict in the LSM tree's dict hash and set up the
+ * on_drop callback so the dict auto-cleans when the last ref
+ * is dropped.
+ */
+void
+vy_lsm_add_dict(struct vy_lsm *lsm, struct vy_dict *dict);
+
+/**
+ * Apply the current compression_dict configuration to the LSM
+ * tree.  If compression is disabled, clears the active dict and
+ * stops training.  If just enabled, starts training.
+ */
+void
+vy_lsm_apply_dict_cfg(struct vy_lsm *lsm);
+
+/**
+ * Accept a trained dictionary from a completed dump/compaction
+ * task.  If the sample produced a result and there is no
+ * uncommitted dict waiting in last->dict, create a vy_dict
+ * immediately and install it as the new active dictionary.
+ * Also adjusts the adaptive training period.
+ */
+void
+vy_lsm_accept_dict_sample(struct vy_lsm *lsm, struct vy_dict_sample *sample);
 
 /** Create a common LSM tree environment. */
 int
@@ -276,6 +310,59 @@ struct vy_lsm {
 	 * linked by vy_run->in_lsm.
 	 */
 	struct rlist runs;
+	/** Per-LSM dictionary state (training policy + last result). */
+	struct vy_dict_last dict_last;
+	/**
+	 * Dictionary id -> vy_dict hash map.
+	 *
+	 * Lifecycle (RAM):
+	 *
+	 * A vy_dict is created in two situations:
+	 *
+	 *  - Training: vy_lsm_accept_dict_sample() creates a dict
+	 *    with id = 0 (uncommitted) from the worker's training
+	 *    output and installs it as the active dict in dict_last.
+	 *
+	 *  - Recovery: vy_lsm_recover() creates dicts from raw data
+	 *    stored in vylog, with their permanent id already set.
+	 *
+	 * A dict with id = 0 is committed on the next dump or
+	 * compaction by vy_run_prepare(), which assigns
+	 * dict->id = run->id (the id of the first run that uses it)
+	 * and inserts it into this hash via vy_lsm_add_dict().
+	 *
+	 * The dict is reference-counted. References are held by
+	 * dict_last (the active dict for the LSM tree) and by each
+	 * vy_run compressed with it. When vy_lsm_add_dict()
+	 * registers a dict, it sets an on_drop callback
+	 * (vy_dict_on_drop) with vy_lsm as context. When the last
+	 * reference is dropped via vy_dict_unref(), the callback
+	 * removes the dict from this hash, updates stats, and frees
+	 * the dict. Dicts never registered (id = 0) have no callback
+	 * and are freed directly by vy_dict_delete().
+	 *
+	 * Lifecycle (vylog):
+	 *
+	 * Each run records the dict_id it was compressed with
+	 * (0 if none). The originating run (whose id == dict_id)
+	 * carries the raw dictionary bytes in its PREPARE_RUN
+	 * record. Other runs sharing the same dict only store the
+	 * dict_id reference.
+	 *
+	 * Dictionaries are first-class objects in the vylog,
+	 * stored via VY_LOG_CREATE_DICT records. During vylog
+	 * rotation, dicts are emitted before runs so that the
+	 * dictionary bytes appear in the log before any
+	 * referencing run.
+	 *
+	 * During recovery, dict data and a reference count
+	 * (dict_refs) are tracked in vy_dict_recovery_info,
+	 * stored per-LSM in an rb-tree keyed by dict id.
+	 * When a run is forgotten (FORGET_RUN), dict_refs on
+	 * the corresponding dict are decremented. A dict with
+	 * zero refs is freed immediately.
+	 */
+	struct mh_i64ptr_t *dict_hash;
 	/** Number of entries in all ranges. */
 	int run_count;
 	/**

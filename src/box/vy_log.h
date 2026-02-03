@@ -34,6 +34,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#define RB_COMPACT 1
+#include <small/rb.h>
 #include <small/rlist.h>
 
 #include "salad/stailq.h"
@@ -217,6 +219,17 @@ enum vy_log_record_type {
 	 * See also VY_LOG_REBOOTSTRAP.
 	 */
 	VY_LOG_ABORT_REBOOTSTRAP	= 17,
+	/**
+	 * Create a compression dictionary.
+	 * Requires vy_log_record::lsm_id, dict_id, dict_data.
+	 *
+	 * Written together with VY_LOG_PREPARE_RUN when a run
+	 * introduces a new dictionary.  dict_id equals the
+	 * originating run's id.  During rotation, only dicts
+	 * with references are written; unreferenced dicts are
+	 * silently dropped.
+	 */
+	VY_LOG_CREATE_DICT		= 18,
 
 	vy_log_record_type_MAX
 };
@@ -243,6 +256,12 @@ struct vy_log_record {
 	int64_t run_id;
 	/** Unique ID of the run slice. */
 	int64_t slice_id;
+	/** Unique ID of the dictionary. */
+	int64_t dict_id;
+	/** Dictionary data (MsgPack bin). */
+	const char *dict_data;
+	/** Dictionary data size. */
+	size_t dict_size;
 	/**
 	 * Msgpack key for start of the range/slice.
 	 * NULL if the range/slice starts from -inf.
@@ -322,6 +341,42 @@ struct vy_recovery {
 	bool has_errors;
 };
 
+/** Dictionary info stored in a recovery context. */
+struct vy_dict_recovery_info {
+	/** Link in vy_lsm_recovery_info::dicts. */
+	rb_node(struct vy_dict_recovery_info) in_lsm;
+	/** Dictionary id (equals the originating run's id). */
+	int64_t id;
+	/** Raw dictionary data (owned). */
+	char *dict_data;
+	/** Size of dict_data in bytes. */
+	size_t dict_size;
+	/** Number of runs that reference this dictionary. */
+	uint32_t dict_refs;
+};
+
+/** Tree of vy_dict_recovery_info objects, keyed by id. */
+typedef rb_tree(struct vy_dict_recovery_info) vy_dict_recovery_tree_t;
+
+static inline int
+vy_recovery_dict_tree_cmp(const struct vy_dict_recovery_info *a,
+			  const struct vy_dict_recovery_info *b)
+{
+	return (a->id > b->id) - (a->id < b->id);
+}
+
+static inline int
+vy_recovery_dict_tree_key_cmp(int64_t key,
+			      const struct vy_dict_recovery_info *b)
+{
+	return (key > b->id) - (key < b->id);
+}
+
+rb_gen_ext_key(MAYBE_UNUSED static inline, vy_recovery_dict_tree_,
+	       vy_dict_recovery_tree_t, struct vy_dict_recovery_info,
+	       in_lsm, vy_recovery_dict_tree_cmp,
+	       int64_t, vy_recovery_dict_tree_key_cmp);
+
 /** LSM tree info stored in a recovery context. */
 struct vy_lsm_recovery_info {
 	/** Link in vy_recovery::lsms. */
@@ -366,6 +421,11 @@ struct vy_lsm_recovery_info {
 	 */
 	struct rlist runs;
 	/**
+	 * Tree of compression dictionaries belonging to this
+	 * LSM tree, indexed by vy_dict_recovery_info::id.
+	 */
+	vy_dict_recovery_tree_t dicts;
+	/**
 	 * Pointer to an LSM tree that is going to replace
 	 * this one after successful ALTER.
 	 */
@@ -408,6 +468,10 @@ struct vy_run_recovery_info {
 	int64_t gc_lsn;
 	/** Number of dumps it took to create the run. */
 	uint32_t dump_count;
+	/** Dictionary id used by this run (0 if none). */
+	int64_t dict_id;
+	/** Back-pointer to the owning LSM tree. */
+	struct vy_lsm_recovery_info *lsm;
 	/**
 	 * True if the run was not committed (there's
 	 * VY_LOG_PREPARE_RUN, but no VY_LOG_CREATE_RUN).
@@ -730,15 +794,31 @@ vy_log_delete_range(int64_t range_id)
 	vy_log_write(&record);
 }
 
+/** Helper to log creation of a compression dictionary. */
+static inline void
+vy_log_create_dict(int64_t lsm_id, int64_t dict_id,
+		   const char *dict_data, size_t dict_size)
+{
+	struct vy_log_record record;
+	vy_log_record_init(&record);
+	record.type = VY_LOG_CREATE_DICT;
+	record.lsm_id = lsm_id;
+	record.dict_id = dict_id;
+	record.dict_data = dict_data;
+	record.dict_size = dict_size;
+	vy_log_write(&record);
+}
+
 /** Helper to log a vinyl run file creation. */
 static inline void
-vy_log_prepare_run(int64_t lsm_id, int64_t run_id)
+vy_log_prepare_run(int64_t lsm_id, int64_t run_id, int64_t dict_id)
 {
 	struct vy_log_record record;
 	vy_log_record_init(&record);
 	record.type = VY_LOG_PREPARE_RUN;
 	record.lsm_id = lsm_id;
 	record.run_id = run_id;
+	record.dict_id = dict_id;
 	vy_log_write(&record);
 }
 

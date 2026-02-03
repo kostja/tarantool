@@ -580,6 +580,7 @@ box.space.test.index.pk
     run_size_ratio: 3.5
     bloom_fpr: 0.05
     compression_level: 3
+    compression_dict: false
   id: 0
   space_id: 512
   type: TREE

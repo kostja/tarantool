@@ -191,6 +191,8 @@ struct vy_task {
 	struct vy_range *range;
 	/** Run written by this task. */
 	struct vy_run *new_run;
+	/** Dictionary training context (sample collection + output). */
+	struct vy_dict_sample dict_sample;
 	/** Write iterator producing statements for the new run. */
 	struct vy_stmt_stream *wi;
 	/**
@@ -265,6 +267,7 @@ vy_task_delete(struct vy_task *task)
 	assert(task->deferred_delete_batch == NULL);
 	assert(task->deferred_delete_in_progress == 0);
 	vy_compaction_plan_destroy(&task->compaction_plan);
+	vy_dict_sample_destroy(&task->dict_sample);
 	key_def_delete(task->cmp_def);
 	key_def_delete(task->key_def);
 	vy_lsm_unref(task->lsm);
@@ -791,14 +794,51 @@ vy_scheduler_end_checkpoint(struct vy_scheduler *scheduler)
 static struct vy_run *
 vy_run_prepare(struct vy_run_env *run_env, struct vy_lsm *lsm)
 {
-	struct vy_run *run = vy_run_new(run_env, vy_log_next_id());
+	struct vy_dict *dict = lsm->dict_last.dict;
+	bool is_new_dict = dict != NULL && dict->id == 0;
+
+	struct vy_run *run = vy_run_new(run_env, vy_log_next_id(), dict);
 	if (run == NULL)
 		return NULL;
+
 	vy_log_tx_begin();
-	vy_log_prepare_run(lsm->id, run->id);
+	if (is_new_dict) {
+		vy_log_create_dict(lsm->id, run->id,
+				   dict->data, dict->size);
+	}
+	vy_log_prepare_run(lsm->id, run->id,
+			   is_new_dict ? run->id :
+			   dict != NULL ? dict->id : 0);
 	if (vy_log_tx_commit() < 0) {
 		vy_run_unref(run);
 		return NULL;
+	}
+
+	/*
+	 * Assign the dictionary id after a successful vylog commit.
+	 * The dict id equals the id of the first run that logs it.
+	 *
+	 * A newly trained dictionary starts with id == 0 (uncommitted)
+	 * when vy_lsm_accept_dict_sample() installs it in dict_last. On the
+	 * very next dump or compaction, vy_run_prepare() logs it to
+	 * vylog and assigns a permanent id here. Because this always
+	 * happens before vy_dict_sample_init() (which decides whether
+	 * to train), the dict is guaranteed to have a real id by the
+	 * time any subsequent task checks it. The guard in
+	 * vy_lsm_accept_dict_sample() (skip when old != NULL &&
+	 * old->id == 0) is therefore a pure safety net that should
+	 * never fire in practice.
+	 *
+	 * This is safe without extra synchronization because all
+	 * vy_run_prepare calls happen in the scheduler fiber, which
+	 * is the sole creator of dump/compaction tasks. Even though
+	 * vy_log_tx_commit may yield at the vylog latch, no other
+	 * fiber can call vy_run_prepare for any LSM tree
+	 * concurrently.
+	 */
+	if (is_new_dict) {
+		dict->id = run->id;
+		vy_lsm_add_dict(lsm, dict);
 	}
 	return run;
 }
@@ -1093,8 +1133,10 @@ vy_task_write_run(struct vy_task *task)
 	if (vy_run_writer_create(&writer, task->new_run, lsm->env->path,
 				 lsm->space_id, lsm->index_id,
 				 task->cmp_def, task->key_def,
-				 &task->index_opts) != 0)
+				 &task->index_opts,
+				 &task->dict_sample) != 0) {
 		goto fail;
+	}
 
 	if (wi->iface->start(wi) != 0)
 		goto fail_abort_writer;
@@ -1156,6 +1198,8 @@ vy_task_dump_complete(struct vy_task *task)
 
 	assert(lsm->is_dumping);
 
+	vy_dict_stat_add(&lsm->env->dict_stat,
+			 &task->dict_sample.stat_delta);
 	/*
 	 * The LSM tree could have been dropped while we were writing the new
 	 * run. In this case all the information about the LSM tree ranges
@@ -1215,7 +1259,8 @@ vy_task_dump_complete(struct vy_task *task)
 	 * Log change in metadata.
 	 */
 	vy_log_tx_begin();
-	vy_log_create_run(lsm->id, new_run->id, dump_lsn, new_run->dump_count);
+	vy_log_create_run(lsm->id, new_run->id, dump_lsn,
+			  new_run->dump_count);
 	for (range = begin_range, i = 0; range != end_range;
 	     range = vy_range_tree_next(&lsm->range_tree, range), i++) {
 		assert(i < lsm->range_count);
@@ -1227,6 +1272,8 @@ vy_task_dump_complete(struct vy_task *task)
 	vy_log_dump_lsm(lsm->id, dump_lsn);
 	if (vy_log_tx_commit() < 0)
 		goto fail_free_slices;
+
+	vy_lsm_accept_dict_sample(lsm, &task->dict_sample);
 
 	/* Account the new run. */
 	vy_lsm_add_run(lsm, new_run);
@@ -1415,6 +1462,10 @@ vy_task_dump_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 
 	task->new_run = new_run;
 	task->wi = wi;
+	vy_dict_sample_init(&task->dict_sample,
+			    lsm->stat.disk.dump.count,
+			    lsm->dict_last.train_period,
+			    new_run->dict);
 
 	lsm->is_dumping = true;
 	vy_scheduler_update_lsm(scheduler, lsm);
@@ -1468,8 +1519,10 @@ vy_task_compaction_complete(struct vy_task *task)
 	struct vy_disk_stmt_counter compaction_input;
 	struct vy_compaction_plan *plan = &task->compaction_plan;
 	struct vy_slice *new_slice = NULL;
-	struct vy_run *run;
+	struct vy_run *run, *next_run;
 
+	vy_dict_stat_add(&lsm->env->dict_stat,
+			 &task->dict_sample.stat_delta);
 	/* Put the range back into the compaction queue. */
 	assert(heap_node_is_stray(&range->heap_node));
 	vy_range_heap_insert(&lsm->range_heap, range);
@@ -1541,6 +1594,7 @@ vy_task_compaction_complete(struct vy_task *task)
 			vy_slice_delete(new_slice);
 		return -1;
 	}
+	vy_lsm_accept_dict_sample(lsm, &task->dict_sample);
 
 	/*
 	 * Remove compacted run files that were created after
@@ -1610,15 +1664,23 @@ vy_task_compaction_complete(struct vy_task *task)
 	}
 	vy_disk_stmt_counter_reset(&compaction_input);
 	/*
-	 * Unaccount unused runs and delete compacted slices.
+	 * Wait for pinned slices and delete them before removing
+	 * unused runs.
+	 *
+	 * We must add extra refs to unused runs to prevent them from
+	 * being freed by vy_slice_delete() (which unrefs the run).
 	 */
 	rlist_foreach_entry(run, &unused_runs, in_unused)
-		vy_lsm_remove_run(lsm, run);
+		vy_run_ref(run);
 	for (int i = 0; i < plan->count; i++) {
 		struct vy_slice *slice = plan->slices[i];
 		vy_disk_stmt_counter_add(&compaction_input, &slice->count);
 		vy_slice_wait_pinned(slice);
 		vy_slice_delete(slice);
+	}
+	rlist_foreach_entry_safe(run, &unused_runs, in_unused, next_run) {
+		vy_lsm_remove_run(lsm, run);
+		vy_run_unref(run);
 	}
 	vy_lsm_acct_compaction(lsm, compaction_time,
 			       &compaction_input, &compaction_output);
@@ -1723,6 +1785,9 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	task->range = range;
 	task->new_run = new_run;
 	task->wi = wi;
+	vy_dict_sample_init(&task->dict_sample, dump_count,
+			    lsm->dict_last.train_period,
+			    new_run->dict);
 
 	/*
 	 * Remove the range we are going to compact from the heap

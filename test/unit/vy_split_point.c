@@ -98,7 +98,7 @@ const struct vy_slice_i64 VY_SLICE_LAST =
 static struct vy_run *
 vy_run_new_i64(int64_t min_key, int64_t max_key)
 {
-	struct vy_run *run = vy_run_new(&run_env, 1);
+	struct vy_run *run = vy_run_new(&run_env, 1, NULL);
 	fail_if(run == NULL);
 	run->info.min_key = xmalloc(MSGPACK_KEY_MAX);
 	run->info.max_key = xmalloc(MSGPACK_KEY_MAX);

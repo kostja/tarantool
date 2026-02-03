@@ -99,6 +99,8 @@ const struct xlog_opts xlog_opts_default = {
 	.sync_is_async = false,
 	.no_compression = false,
 	.compression_level = 3,
+	.dict = NULL,
+	.dict_size = 0,
 };
 
 /* {{{ struct xlog_meta */
@@ -1159,8 +1161,22 @@ xlog_tx_write_zstd(struct xlog *log)
 	struct iovec *iov;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-	ZSTD_compressBegin(log->zctx, log->opts.compression_level);
+	size_t zrc;
+	if (log->opts.dict != NULL && log->opts.dict_size > 0) {
+		zrc = ZSTD_compressBegin_usingDict(
+			log->zctx, log->opts.dict,
+			log->opts.dict_size,
+			log->opts.compression_level);
+	} else {
+		zrc = ZSTD_compressBegin(log->zctx,
+					 log->opts.compression_level);
+	}
 #pragma GCC diagnostic pop
+	if (ZSTD_isError(zrc)) {
+		diag_set(ClientError, ER_COMPRESSION,
+			 ZSTD_getErrorName(zrc));
+		goto error;
+	}
 	size_t offset = XLOG_FIXHEADER_SIZE;
 	for (iov = log->obuf.iov; iov->iov_len; ++iov) {
 		/* Estimate max output buffer size. */
@@ -1779,7 +1795,6 @@ xlog_tx_decode(const char *data, const char *data_end,
 
 	/* Decompress zstd rows */
 	assert(fixheader.magic == zrow_marker);
-	ZSTD_initDStream(zdctx);
 	int rc = xlog_cursor_decompress(&rows, rows_end, &data, data_end,
 					zdctx);
 	if (rc < 0) {
@@ -1801,10 +1816,14 @@ xlog_tx_decode(const char *data, const char *data_end,
  * @retval >0 how many bytes we will have for continue
  */
 ssize_t
-xlog_tx_cursor_create(struct xlog_tx_cursor *tx_cursor,
-		      const char **data, const char *data_end,
-		      ZSTD_DStream *zdctx)
+xlog_tx_cursor_create(struct xlog_cursor *cursor)
 {
+	struct xlog_tx_cursor *tx_cursor = &cursor->tx_cursor;
+	const char **data = (const char **)&cursor->rbuf.rpos;
+	const char *data_end = cursor->rbuf.wpos;
+	ZSTD_DStream *zdctx = cursor->zdctx;
+	const void *dict = cursor->dict;
+	size_t dict_size = cursor->dict_size;
 	const char *rpos = *data;
 	struct xlog_fixheader fixheader;
 	ssize_t to_load;
@@ -1845,7 +1864,7 @@ xlog_tx_cursor_create(struct xlog_tx_cursor *tx_cursor,
 	};
 
 	assert(fixheader.magic == zrow_marker);
-	ZSTD_initDStream(zdctx);
+	xlog_zdstream_reset(zdctx, dict, dict_size);
 	int rc;
 	do {
 		if (ibuf_reserve(&tx_cursor->rows,
@@ -1954,9 +1973,7 @@ xlog_cursor_next_tx(struct xlog_cursor *i)
 	}
 
 	ssize_t to_load;
-	while ((to_load = xlog_tx_cursor_create(&i->tx_cursor,
-						(const char **)&i->rbuf.rpos,
-						i->rbuf.wpos, i->zdctx)) > 0) {
+	while ((to_load = xlog_tx_cursor_create(i)) > 0) {
 		/* not enough data in read buffer */
 		int rc = xlog_cursor_ensure(i, ibuf_used(&i->rbuf) + to_load);
 		if (rc < 0)

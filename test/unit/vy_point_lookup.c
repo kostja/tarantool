@@ -24,10 +24,12 @@ write_run(struct vy_run *run, const char *dir_name,
 	struct index_opts index_opts = index_opts_default;
 	index_opts.page_size = 4096;
 	index_opts.bloom_fpr = 0.1;
+	struct vy_dict_sample dict_sample;
+	memset(&dict_sample, 0, sizeof(dict_sample));
 	if (vy_run_writer_create(&writer, run, dir_name,
 				 lsm->space_id, lsm->index_id,
 				 lsm->cmp_def, lsm->key_def,
-				 &index_opts) != 0)
+				 &index_opts, &dict_sample) != 0)
 		goto fail;
 
 	if (wi->iface->start(wi) != 0)
@@ -199,7 +201,7 @@ test_basic()
 	write_stream = vy_write_iterator_new(pk->cmp_def, true, true,
 					     &read_views, NULL);
 	vy_write_iterator_new_mem(write_stream, run_mem);
-	struct vy_run *run = vy_run_new(&run_env, 1);
+	struct vy_run *run = vy_run_new(&run_env, 1, NULL);
 	isnt(run, NULL, "vy_run_new");
 
 	rc = write_run(run, dir_name, pk, write_stream);
@@ -229,7 +231,7 @@ test_basic()
 	write_stream = vy_write_iterator_new(pk->cmp_def, true, true,
 					     &read_views, NULL);
 	vy_write_iterator_new_mem(write_stream, run_mem);
-	run = vy_run_new(&run_env, 2);
+	run = vy_run_new(&run_env, 2, NULL);
 	isnt(run, NULL, "vy_run_new");
 
 	rc = write_run(run, dir_name, pk, write_stream);

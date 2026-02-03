@@ -43,6 +43,9 @@
 #include "index_def.h"
 #include "xlog.h"
 
+struct vy_dict;
+struct vy_dict_sample;
+
 #include "small/mempool.h"
 
 #if defined(__cplusplus)
@@ -137,6 +140,8 @@ struct vy_run {
 	int fd;
 	/** Unique ID of this run. */
 	int64_t id;
+	/** Dictionary used for compression/decompression (NULL if none). */
+	struct vy_dict *dict;
 	/** Number of statements in this run. */
 	struct vy_disk_stmt_counter count;
 	/** Size of memory used for storing page index. */
@@ -406,7 +411,7 @@ vy_run_is_empty(struct vy_run *run)
 }
 
 struct vy_run *
-vy_run_new(struct vy_run_env *env, int64_t id);
+vy_run_new(struct vy_run_env *env, int64_t id, struct vy_dict *dict);
 
 void
 vy_run_delete(struct vy_run *run);
@@ -680,6 +685,8 @@ struct vy_run_writer {
 	struct tuple_bloom_builder *bloom;
 	/** Buffer of a current page row offsets. */
 	struct ibuf row_index_buf;
+	/** Dictionary training context (sample collection + output). */
+	struct vy_dict_sample *dict_sample;
 	/**
 	 * Remember a last written statement to use it as a source
 	 * of max key of a finished run.
@@ -692,7 +699,8 @@ int
 vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 		     const char *dirpath, uint32_t space_id, uint32_t iid,
 		     struct key_def *cmp_def, struct key_def *key_def,
-		     struct index_opts *index_opts);
+		     struct index_opts *index_opts,
+		     struct vy_dict_sample *dict_sample);
 
 /**
  * Write a specified statement into a run.

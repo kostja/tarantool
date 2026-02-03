@@ -517,6 +517,9 @@ lbox_fillspace(struct lua_State *L, struct space *space, int i)
 
 			lua_pushnumber(L, index_opts->compression_level);
 			lua_setfield(L, -2, "compression_level");
+
+			lua_pushboolean(L, index_opts->compression_dict);
+			lua_setfield(L, -2, "compression_dict");
 			lua_settable(L, -3);
 		}
 		lua_setfield(L, -2, index_def->name);

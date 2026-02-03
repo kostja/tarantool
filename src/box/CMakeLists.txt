@@ -170,6 +170,7 @@ set(box_sources
     vy_stmt.c
     vy_mem.c
     vy_run.c
+    vy_dict.c
     vy_range.c
     vy_lsm.c
     vy_tx.c

@@ -33,6 +33,7 @@
 #include <zstd.h>
 
 #include "fiber.h"
+#include "vy_dict.h"
 #include "fiber_cond.h"
 #include "fio.h"
 #include "cbus.h"
@@ -274,7 +275,7 @@ vy_page_info_destroy(struct vy_page_info *page_info)
 }
 
 struct vy_run *
-vy_run_new(struct vy_run_env *env, int64_t id)
+vy_run_new(struct vy_run_env *env, int64_t id, struct vy_dict *dict)
 {
 	struct vy_run *run = calloc(1, sizeof(struct vy_run));
 	if (unlikely(run == NULL)) {
@@ -287,6 +288,10 @@ vy_run_new(struct vy_run_env *env, int64_t id)
 	run->dump_lsn = -1;
 	run->fd = -1;
 	run->refs = 1;
+	if (dict != NULL) {
+		run->dict = dict;
+		vy_dict_ref(dict);
+	}
 	rlist_create(&run->in_lsm);
 	rlist_create(&run->in_unused);
 	return run;
@@ -320,6 +325,10 @@ vy_run_delete(struct vy_run *run)
 	assert(run->refs == 0);
 	if (run->fd >= 0 && close(run->fd) < 0)
 		say_syserror("close failed");
+	if (run->dict != NULL) {
+		vy_dict_unref(run->dict);
+		run->dict = NULL;
+	}
 	vy_run_clear(run);
 	TRASH(run);
 	free(run);
@@ -879,6 +888,10 @@ vy_page_read(struct vy_page *page, const struct vy_page_info *page_info,
 	const char *data_end = data + readen;
 	char *rows = page->data;
 	char *rows_end = rows + page_info->unpacked_size;
+	if (run->dict != NULL)
+		xlog_zdstream_reset(zdctx, run->dict->data, run->dict->size);
+	else
+		xlog_zdstream_reset(zdctx, NULL, 0);
 	if (xlog_tx_decode(data, data_end, rows, rows_end, zdctx) != 0)
 		goto error;
 
@@ -936,6 +949,19 @@ static int
 vy_page_read_cb(struct cbus_call_msg *base)
 {
 	struct vy_page_read_task *task = (struct vy_page_read_task *)base;
+	/*
+	 * Yield before reading the page to race against a
+	 * concurrent compaction that removes the run from the
+	 * range's slice list. The run itself stays alive (the
+	 * reader holds a ref), so run->dict remains valid.
+	 * Unlike ERRINJ_VY_READ_PAGE_TIMEOUT, this injection
+	 * only affects cbus page reads, not the compaction worker.
+	 * We use ERROR_INJECT_YIELD (fiber_sleep) rather than
+	 * ERROR_INJECT_SLEEP (usleep) to avoid blocking the
+	 * reader thread, which would prevent cpipe flush and
+	 * stall cbus message delivery to the TX thread.
+	 */
+	ERROR_INJECT_YIELD(ERRINJ_VY_READ_PAGE_CB_SLEEP);
 	ZSTD_DStream *zdctx = vy_env_get_zdctx(task->run->env);
 	if (zdctx == NULL)
 		return -1;
@@ -2062,7 +2088,8 @@ int
 vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 		     const char *dirpath, uint32_t space_id, uint32_t iid,
 		     struct key_def *cmp_def, struct key_def *key_def,
-		     struct index_opts *index_opts)
+		     struct index_opts *index_opts,
+		     struct vy_dict_sample *dict_sample)
 {
 	memset(writer, 0, sizeof(*writer));
 	writer->run = run;
@@ -2072,6 +2099,7 @@ vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 	writer->cmp_def = cmp_def;
 	writer->key_def = key_def;
 	writer->index_opts = *index_opts;
+	writer->dict_sample = dict_sample;
 	if (writer->index_opts.bloom_fpr < 1) {
 		writer->bloom = tuple_bloom_builder_new(key_def->part_count);
 		if (writer->bloom == NULL)
@@ -2108,6 +2136,10 @@ vy_run_writer_create_xlog(struct vy_run_writer *writer)
 	opts.rate_limit = writer->run->env->snap_io_rate_limit;
 	opts.sync_interval = VY_RUN_SYNC_INTERVAL;
 	opts.compression_level = writer->index_opts.compression_level;
+	if (writer->run->dict != NULL) {
+		opts.dict = writer->run->dict->data;
+		opts.dict_size = writer->run->dict->size;
+	}
 	if (xlog_create(&writer->data_xlog, path, 0, &meta, &opts) != 0)
 		return -1;
 	return 0;
@@ -2176,6 +2208,8 @@ vy_run_writer_write_to_page(struct vy_run_writer *writer, struct vy_entry entry)
 		return -1;
 	}
 	*offset = page->unpacked_size;
+	vy_dict_sample_add(writer->dict_sample, tuple_data(entry.stmt),
+			   tuple_bsize(entry.stmt));
 	if (vy_run_dump_stmt(entry, &writer->data_xlog, page,
 			     writer->cmp_def, writer->iid == 0) != 0)
 		return -1;
@@ -2309,6 +2343,9 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 		run->info.bloom = tuple_bloom_new(writer->bloom,
 						  writer->index_opts.bloom_fpr);
 
+	vy_dict_sample_finish(writer->dict_sample,
+			      writer->index_opts.compression_level);
+
 	/* Shrink to fit actual size. */
 	uint32_t page_count = run->info.page_count;
 	struct vy_page_info *new_pi = realloc(run->page_info,
@@ -2355,6 +2392,8 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	say_info("rebuilding index for `%s'", path);
 	if (xlog_cursor_open(&cursor, path))
 		return -1;
+	if (run->dict != NULL)
+		xlog_cursor_set_dict(&cursor, run->dict->data, run->dict->size);
 
 	int rc = 0;
 	uint32_t page_info_capacity = 0;

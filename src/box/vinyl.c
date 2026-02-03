@@ -314,6 +314,26 @@ vy_info_append_disk(struct vy_env *env, struct info_handler *h)
 	info_table_end(h); /* disk */
 }
 
+/** Append dictionary compression statistics to the info handler. */
+static void
+vy_info_append_dict(struct vy_env *env, struct info_handler *h)
+{
+	struct vy_dict_stat *stat = &env->lsm_env.dict_stat;
+
+	info_table_begin(h, "dict");
+	info_append_int(h, "train_attempted", stat->train_attempted);
+	info_append_int(h, "train_throttled", stat->train_throttled);
+	info_append_int(h, "train_failed", stat->train_failed);
+	info_append_int(h, "train_rejected", stat->train_rejected);
+	info_append_int(h, "train_accepted", stat->train_accepted);
+	info_append_int(h, "dicts_created", stat->dicts_created);
+	info_append_int(h, "dicts_dropped", stat->dicts_dropped);
+	info_append_int(h, "dicts_active", stat->dicts_active);
+	info_append_int(h, "dicts_bytes", stat->dicts_bytes);
+	info_append_int(h, "dicts_bytes_peak", stat->dicts_bytes_peak);
+	info_table_end(h); /* dict */
+}
+
 void
 vinyl_engine_stat(struct engine *engine, struct info_handler *h)
 {
@@ -323,6 +343,7 @@ vinyl_engine_stat(struct engine *engine, struct info_handler *h)
 	vy_info_append_tx(env, h);
 	vy_info_append_memory(env, h);
 	vy_info_append_disk(env, h);
+	vy_info_append_dict(env, h);
 	vy_info_append_scheduler(env, h);
 	vy_info_append_regulator(env, h);
 	info_end(h);
@@ -450,6 +471,21 @@ vinyl_index_stat(struct index *index, struct info_handler *h)
 	info_table_end(h); /* iterator */
 	info_table_end(h); /* txw */
 
+	info_table_begin(h, "dict");
+	info_append_int(h, "sample_size",
+			stat->dict.sample_size);
+	info_append_double(h, "dict_gain",
+			   stat->dict.dict_gain);
+	info_append_double(h, "dict_rate",
+			   stat->dict.dict_rate);
+	info_append_int(h, "dict_cpu_ns",
+			stat->dict.dict_cpu_ns);
+	info_append_double(h, "no_dict_rate",
+			   stat->dict.no_dict_rate);
+	info_append_int(h, "no_dict_cpu_ns",
+			stat->dict.no_dict_cpu_ns);
+	info_table_end(h); /* dict */
+
 	info_append_int(h, "range_size", vy_lsm_range_size(lsm));
 	info_append_int(h, "range_count", lsm->range_count);
 	info_append_int(h, "run_count", lsm->run_count);
@@ -500,6 +536,10 @@ vinyl_index_reset_stat(struct index *index)
 	vy_stmt_counter_reset(&cache_stat->put);
 	vy_stmt_counter_reset(&cache_stat->invalidate);
 	vy_stmt_counter_reset(&cache_stat->evict);
+
+	/* Dictionary evaluation */
+	memset(&stat->dict, 0, sizeof(stat->dict));
+	vy_dict_last_reset_period(&lsm->dict_last);
 }
 
 static void
@@ -932,6 +972,7 @@ vinyl_index_update_def(struct index *index)
 {
 	struct vy_lsm *lsm = vy_lsm(index);
 	lsm->opts = index->def->opts;
+	vy_lsm_apply_dict_cfg(lsm);
 	/*
 	 * Sic: We copy key definitions in-place instead of reallocating them
 	 * because they may be used by read iterators by pointer, for example,

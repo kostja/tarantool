@@ -37,6 +37,7 @@
 #include <sys/types.h>
 #include <small/mempool.h>
 
+#include "assoc.h"
 #include "diag.h"
 #include "fiber.h"
 #include "errcode.h"
@@ -93,6 +94,7 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 	env->compaction_trigger_arg = compaction_trigger_arg;
 	env->too_long_threshold = TIMEOUT_INFINITY;
 	env->lsm_count = 0;
+	memset(&env->dict_stat, 0, sizeof(env->dict_stat));
 	mempool_create(&env->history_node_pool, cord_slab_cache(),
 		       sizeof(struct vy_history_node));
 	return 0;
@@ -104,6 +106,119 @@ vy_lsm_env_destroy(struct vy_lsm_env *env)
 	tuple_unref(env->empty_key.stmt);
 	tuple_format_unref(env->key_format);
 	mempool_destroy(&env->history_node_pool);
+}
+
+struct vy_dict *
+vy_lsm_lookup_dict(struct vy_lsm *lsm, int64_t id)
+{
+	struct mh_i64ptr_t *h = lsm->dict_hash;
+	mh_int_t k = mh_i64ptr_find(h, id, NULL);
+	if (k == mh_end(h))
+		return NULL;
+	return mh_i64ptr_node(h, k)->val;
+}
+
+/**
+ * Callback invoked by vy_dict_unref() just before the last
+ * reference is dropped. Removes the dict from the LSM tree's
+ * hash and updates stats. The dict itself is freed by
+ * vy_dict_unref().
+ */
+static void
+vy_dict_on_drop(struct vy_dict *dict, void *ctx)
+{
+	struct vy_lsm *lsm = ctx;
+	assert(dict->id != 0);
+	struct mh_i64ptr_t *h = lsm->dict_hash;
+	mh_int_t k = mh_i64ptr_find(h, dict->id, NULL);
+	if (k != mh_end(h))
+		mh_i64ptr_del(h, k, NULL);
+	vy_dict_stat_on_drop(&lsm->env->dict_stat, dict->size);
+}
+
+void
+vy_lsm_add_dict(struct vy_lsm *lsm, struct vy_dict *dict)
+{
+	struct mh_i64ptr_t *h = lsm->dict_hash;
+	struct mh_i64ptr_node_t node = { dict->id, dict };
+	struct mh_i64ptr_node_t *old_node = NULL;
+	mh_i64ptr_put(h, &node, &old_node, NULL);
+	assert(old_node == NULL);
+	dict->on_drop = vy_dict_on_drop;
+	dict->on_drop_ctx = lsm;
+	vy_dict_stat_on_create(&lsm->env->dict_stat, dict->size);
+}
+
+void
+vy_lsm_apply_dict_cfg(struct vy_lsm *lsm)
+{
+	struct vy_dict_last *last = &lsm->dict_last;
+	if (!lsm->opts.compression_dict) {
+		/* Compression disabled: forget dict. */
+		last->train_period = 0;
+		if (last->dict != NULL) {
+			vy_dict_unref(last->dict);
+			last->dict = NULL;
+		}
+	} else if (last->train_period <= 0) {
+		/* Compression just enabled: start training. */
+		last->train_period = VY_DICT_TRAIN_PERIOD_DEFAULT;
+	}
+}
+
+void
+vy_lsm_accept_dict_sample(struct vy_lsm *lsm, struct vy_dict_sample *sample)
+{
+	vy_dict_last_adjust_period(&lsm->dict_last, sample);
+	/*
+	 * Dict compression may have been disabled via alter()
+	 * while the task was in flight. Don't install a new dict.
+	 */
+	if (!lsm->opts.compression_dict)
+		return;
+	struct vy_dict *old = lsm->dict_last.dict;
+	/*
+	 * Safety net: if the active dict hasn't been committed to
+	 * vylog yet (id == 0), a previous training result is still
+	 * pending.  Don't touch it.  In practice this cannot happen
+	 * because vy_run_prepare() always commits the pending dict
+	 * before the next task runs (see comment there).
+	 */
+	if ((old == NULL || old->id != 0) &&
+	    /* sample->size is set if we have an improved new dict */
+	    (sample->size > 0 ||
+	     /*
+	      * The old dictionary should sometimes be dropped
+	      * even if no new dictionary has been trained.
+	      * It's when the new dictionary (trained on the
+	      * current data) cannot beat plain ZSTD by at least
+	      * VY_DICT_MIN_GAIN_PCT. Then the old dictionary
+	      * -- trained on older data -- is certainly not helping
+	      * either.
+	      */
+	     (sample->stat_delta.train_rejected > 0 &&
+	      sample->base_dict != NULL &&
+	      sample->index_stat.dict_gain * 100 <
+	      VY_DICT_MIN_GAIN_PCT))) {
+		lsm->stat.dict = sample->index_stat;
+
+		if (old) {
+			vy_dict_unref(old);
+			lsm->dict_last.dict = NULL;
+			vy_dict_last_reset_period(&lsm->dict_last);
+		}
+
+		if (sample->size > 0) {
+			/* The training was successful. */
+			struct vy_dict *new_dict;
+			new_dict = vy_dict_new(0, sample->data, sample->size,
+					       lsm->opts.compression_level);
+			if (new_dict == NULL)
+				return; /* no memory - no dict */
+			vy_dict_ref(new_dict);
+			lsm->dict_last.dict = new_dict;
+		}
+	}
 }
 
 const char *
@@ -221,6 +336,12 @@ vy_lsm_new(struct vy_lsm_env *lsm_env, struct vy_cache_env *cache_env,
 	vy_range_tree_new(&lsm->range_tree);
 	vy_range_heap_create(&lsm->range_heap);
 	rlist_create(&lsm->runs);
+	vy_dict_last_create(&lsm->dict_last, index_def->opts.compression_dict);
+	lsm->dict_hash = mh_i64ptr_new();
+	if (lsm->dict_hash == NULL) {
+		diag_set(OutOfMemory, 0, "mh_i64ptr_new", "dict_hash");
+		goto fail_dict_hash;
+	}
 	lsm->pk = pk;
 	if (pk != NULL)
 		vy_lsm_ref(pk);
@@ -238,6 +359,8 @@ vy_lsm_new(struct vy_lsm_env *lsm_env, struct vy_cache_env *cache_env,
 	lsm_env->lsm_count++;
 	return lsm;
 
+fail_dict_hash:
+	vy_mem_delete(lsm->mem);
 fail_mem:
 	histogram_delete(lsm->run_hist);
 fail_run_hist:
@@ -290,11 +413,33 @@ vy_lsm_delete(struct vy_lsm *lsm)
 		vy_mem_delete(mem);
 	vy_mem_delete(lsm->mem);
 
+	vy_dict_last_destroy(&lsm->dict_last);
+
 	struct vy_run *run, *next_run;
 	rlist_foreach_entry_safe(run, &lsm->runs, in_lsm, next_run)
 		vy_lsm_remove_run(lsm, run);
 
 	vy_range_tree_iter(&lsm->range_tree, NULL, vy_range_tree_free_cb, NULL);
+	/*
+	 * Clean up any dicts still in the hash. Normally the hash
+	 * is empty at this point because all runs have been unrefed
+	 * (which unrefs their dicts). Orphaned dicts can remain
+	 * after a failed recovery, when dicts were loaded from the
+	 * log but no runs ended up referencing them.
+	 *
+	 * The hash does not hold a reference (that would create a
+	 * ref cycle), so orphaned dicts have refs == 0. Remove
+	 * them from the hash and free directly.
+	 */
+	mh_int_t k;
+	while ((k = mh_first(lsm->dict_hash)) != mh_end(lsm->dict_hash)) {
+		struct vy_dict *dict = mh_i64ptr_node(lsm->dict_hash, k)->val;
+		assert(dict->refs == 0);
+		mh_i64ptr_del(lsm->dict_hash, k, NULL);
+		vy_dict_stat_on_drop(&lsm->env->dict_stat, dict->size);
+		vy_dict_delete(dict);
+	}
+	mh_i64ptr_delete(lsm->dict_hash);
 	vy_range_heap_destroy(&lsm->range_heap);
 	tuple_format_unref(lsm->disk_format);
 	key_def_delete(lsm->cmp_def);
@@ -353,7 +498,19 @@ vy_lsm_recover_run(struct vy_lsm *lsm, struct vy_run_recovery_info *run_info,
 		return run_info->data;
 	}
 
-	struct vy_run *run = vy_run_new(run_env, run_info->id);
+	struct vy_dict *dict = NULL;
+	if (run_info->dict_id > 0) {
+		dict = vy_lsm_lookup_dict(lsm, run_info->dict_id);
+		if (dict == NULL) {
+			diag_set(ClientError, ER_INVALID_VYLOG_FILE,
+				 tt_sprintf("dictionary %lld not found "
+					    "for run %lld",
+					    (long long)run_info->dict_id,
+					    (long long)run_info->id));
+			return NULL;
+		}
+	}
+	struct vy_run *run = vy_run_new(run_env, run_info->id, dict);
 	if (run == NULL)
 		return NULL;
 
@@ -598,6 +755,26 @@ vy_lsm_recover(struct vy_lsm *lsm, struct vy_recovery *recovery,
 	 */
 	lsm->dump_lsn = lsm_info->dump_lsn;
 
+	/*
+	 * Recover dictionaries from the LSM tree's dict list.
+	 * Only dicts with dict_refs > 0 are present (zero-ref
+	 * dicts are freed in vy_recovery_forget_run).
+	 */
+	struct vy_dict_recovery_info *dict_info;
+	for (dict_info = vy_recovery_dict_tree_first(&lsm_info->dicts);
+	     dict_info != NULL;
+	     dict_info = vy_recovery_dict_tree_next(&lsm_info->dicts,
+						    dict_info)) {
+		assert(dict_info->dict_refs > 0);
+		struct vy_dict *dict;
+		dict = vy_dict_new(dict_info->id, dict_info->dict_data,
+				   dict_info->dict_size,
+				   lsm->opts.compression_level);
+		if (dict == NULL)
+			return -1;
+		vy_lsm_add_dict(lsm, dict);
+	}
+
 	int rc = 0;
 	struct vy_range_recovery_info *range_info;
 	rlist_foreach_entry(range_info, &lsm_info->ranges, in_lsm) {
@@ -630,6 +807,30 @@ vy_lsm_recover(struct vy_lsm *lsm, struct vy_recovery *recovery,
 
 	if (rc != 0)
 		return -1;
+
+	/*
+	 * Set the active dictionary from the most recent run so
+	 * that new runs reuse it when no freshly trained dictionary
+	 * is available. If the newest run has no dict, we do not
+	 * fall back to an older run's dict: the data distribution
+	 * may have shifted enough that the old dict would compress
+	 * poorly, and the next dump will train a fresh one anyway.
+	 *
+	 * We cannot simply take the first entry of lsm->runs
+	 * because recovery order depends on the range/slice
+	 * iteration order, not on run ids. Find the run with the
+	 * greatest id explicitly.
+	 */
+	struct vy_run *newest_run = NULL;
+	rlist_foreach_entry(run, &lsm->runs, in_lsm) {
+		if (newest_run == NULL || run->id > newest_run->id)
+			newest_run = run;
+	}
+	if (newest_run != NULL && newest_run->dict != NULL) {
+		assert(lsm->dict_last.dict == NULL);
+		lsm->dict_last.dict = newest_run->dict;
+		vy_dict_ref(newest_run->dict);
+	}
 
 	/* Check that the range tree does not have holes or overlaps. */
 	struct vy_range *range, *prev = NULL;

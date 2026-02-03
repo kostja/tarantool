@@ -168,6 +168,8 @@ struct index_opts {
 	 * turn off the compression, it's applied automatically
 	 */
 	int64_t compression_level;
+	/** Enable dictionary-based compression for this index. */
+	bool compression_dict;
 	/**
 	 * LSN from the time of index creation.
 	 */
@@ -228,6 +230,8 @@ index_opts_cmp(const struct index_opts *o1, const struct index_opts *o2)
 		return o1->run_size_ratio < o2->run_size_ratio ? -1 : 1;
 	if (o1->bloom_fpr != o2->bloom_fpr)
 		return o1->bloom_fpr < o2->bloom_fpr ? -1 : 1;
+	if (o1->compression_dict != o2->compression_dict)
+		return o1->compression_dict < o2->compression_dict ? -1 : 1;
 	if (o1->func_id != o2->func_id)
 		return o1->func_id - o2->func_id;
 	if (o1->hint != o2->hint)
