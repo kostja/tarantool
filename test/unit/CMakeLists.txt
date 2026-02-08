@@ -418,6 +418,22 @@ create_unit_test(PREFIX vy_point_lookup
                  LIBRARIES core tuple xrow xlog unit ${LIB_DL}
 )
 
+create_unit_test(PREFIX vy_split_point
+                 SOURCES vy_split_point.c
+                         vy_iterators_helper.c
+                         vy_log_stub.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_range.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_run.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_stmt.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_mem.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_upsert.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_history.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_cache.c
+                         ${PROJECT_SOURCE_DIR}/src/box/key_def.c
+                         core_test_utils.c
+                 LIBRARIES core tuple xrow xlog unit ${LIB_DL}
+)
+
 create_unit_test(PREFIX column_mask
                  SOURCES column_mask.c core_test_utils.c
                  LIBRARIES tuple unit
