@@ -37,7 +37,7 @@ function do_backup(files)
             dir = box.cfg.wal_dir
         elseif suffix == 'snap' then
             dir = box.cfg.memtx_dir
-        elseif suffix == 'vylog' or suffix == 'run' or suffix == 'index' then
+        elseif suffix == 'vylog' or suffix == 'run' or suffix == 'index' or suffix == 'index2' then
             dir = box.cfg.vinyl_dir
         end
         assert(dir ~= nil)

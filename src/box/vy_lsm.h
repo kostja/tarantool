@@ -97,8 +97,6 @@ struct vy_lsm_env {
 	void *upsert_thresh_arg;
 	/** Number of LSM trees in this environment. */
 	int lsm_count;
-	/** Size of memory used for bloom filters. */
-	size_t bloom_size;
 	/** Size of memory used for page index. */
 	size_t page_index_size;
 	/**
@@ -111,10 +109,10 @@ struct vy_lsm_env {
 	/**
 	 * Size of disk space used for indexing data in all spaces,
 	 * in bytes, without taking into account disk compression.
-	 * This consists of page indexes and bloom filters, which
-	 * are stored in .index files, as well as the total size of
-	 * statements stored in secondary index .run files, which
-	 * is consistent with index.bsize().
+	 * This consists of page indexes, which are stored in .index
+	 * files, as well as the total size of statements stored in
+	 * secondary index .run files, which is consistent with
+	 * index.bsize().
 	 */
 	int64_t disk_index_size;
 	/**
@@ -282,8 +280,6 @@ struct vy_lsm {
 	 * have a particular number of runs.
 	 */
 	struct histogram *run_hist;
-	/** Size of memory used for bloom filters. */
-	size_t bloom_size;
 	/** Size of memory used for page index. */
 	size_t page_index_size;
 	/**

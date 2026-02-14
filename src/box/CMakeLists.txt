@@ -177,6 +177,7 @@ set(box_sources
     vy_read_iterator.c
     vy_point_lookup.c
     vy_cache.c
+    vy_index_cache.c
     vy_log.c
     vy_upsert.c
     vy_history.c

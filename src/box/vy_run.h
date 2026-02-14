@@ -45,12 +45,19 @@
 
 #include "small/mempool.h"
 
+#include "vy_index_cache.h"
+
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
 
 struct vy_history;
 struct vy_run_reader;
+
+/**
+ * Default memory quota for the page index cache (128 MB).
+ */
+enum { VY_INDEX_CACHE_DEFAULT_SIZE = 128 * 1024 * 1024 };
 
 /** Part of vinyl environment for run read/write */
 struct vy_run_env {
@@ -81,6 +88,12 @@ struct vy_run_env {
 	 * unconditionally remove unused runs' files in-place.
 	 */
 	bool initial_join;
+	/**
+	 * 2Q cache for .index2 index blocks.
+	 * Entries are decoded vy_page_info arrays keyed by
+	 * (run_id, block_no).
+	 */
+	struct vy_index_cache index_cache;
 };
 
 /**
@@ -97,10 +110,16 @@ struct vy_run_info {
 	int64_t max_lsn;
 	/** Number of pages in the run. */
 	uint32_t page_count;
-	/** Bloom filter of all tuples in run */
-	struct tuple_bloom *bloom;
 	/** Statement statistics. */
 	struct vy_stmt_stat stmt_stat;
+	/**
+	 * MinHash sketch for the entire run.
+	 * Computed as the merge of all per-block sketches.
+	 * Used for overlap estimation in compaction planning.
+	 */
+	struct minhash sketch;
+	/** True if the run-level sketch is available. */
+	bool has_sketch;
 };
 
 /**
@@ -121,6 +140,57 @@ struct vy_page_info {
 	uint32_t row_count;
 	/** Offset of the row index in the page. */
 	uint32_t row_index_offset;
+};
+
+/**
+ * Number of data pages described by a single index block
+ * in the .index2 file.  Chosen so that an index block is
+ * typically a few KB, which is a good unit for caching and
+ * I/O.  Must be a power of two for fast division.
+ */
+enum { VY_INDEX_BLOCK_SIZE = 64 };
+
+/**
+ * Block directory entry for the .index2 format.
+ *
+ * The block directory is stored in the run_info header row
+ * of the .index2 file and is always kept in RAM.  Each entry
+ * describes one index block — a group of VY_INDEX_BLOCK_SIZE
+ * page_info entries.
+ */
+struct vy_index_block_dir {
+	/**
+	 * Min key of the first page in this block.
+	 * Used for binary search when looking up a page.
+	 */
+	char *boundary_key;
+	hint_t boundary_key_hint;
+	/**
+	 * Byte offset of this block's xlog transaction in the
+	 * .index2 file.  Filled in at recovery time by scanning
+	 * the file sequentially and recording xlog_cursor_pos()
+	 * for each block row.
+	 */
+	uint64_t file_offset;
+	/**
+	 * Size in bytes of the xlog transaction for this block,
+	 * including the fixheader.  Used by demand-loading to
+	 * know how many bytes to pread from index_fd.
+	 * Filled in at recovery time.
+	 */
+	uint32_t data_size;
+	/** Number of page_info entries in this block. */
+	uint32_t page_count;
+	/** Global page number of the first page in this block. */
+	uint32_t first_page_no;
+	/**
+	 * In-memory copy of this block's fuse8 filter (if any).
+	 * Kept in RAM so that bloom checks can be performed
+	 * without yielding to load the index block from disk.
+	 */
+	binary_fuse8_t filter;
+	/** True if @a filter was successfully loaded. */
+	bool has_filter;
 };
 
 /**
@@ -188,6 +258,26 @@ struct vy_run {
 	struct rlist in_unused;
 	/** Link in vy_lsm::runs list. */
 	struct rlist in_lsm;
+	/**
+	 * v2 index format (.index2): block directory.
+	 *
+	 * When the run has been recovered from a .index2 file,
+	 * page_info is NULL and the block directory is used
+	 * instead.  Individual page_info blocks are loaded on
+	 * demand through the index cache.
+	 *
+	 * When block_dir is NULL, the run uses the v1 format
+	 * with page_info loaded entirely in memory.
+	 */
+	struct vy_index_block_dir *block_dir;
+	/** Number of entries in block_dir. */
+	uint32_t block_count;
+	/**
+	 * File descriptor for the .index2 file, kept open for
+	 * demand-loading index blocks via pread.  Set to -1 if
+	 * not available (v1 runs).
+	 */
+	int index_fd;
 };
 
 /**
@@ -327,6 +417,57 @@ struct vy_page {
 };
 
 /**
+ * Level-1 binary search in the block directory.
+ * Returns the index of the block whose boundary key best matches
+ * @a key for the given @a itype.  Cannot fail (block_dir is always
+ * in memory).
+ *
+ * For forward iterators (GE/GT): returns the last block whose
+ * boundary_key < key (lower_bound) or boundary_key <= key
+ * (upper_bound), or 0 if key precedes all blocks.
+ *
+ * For reverse iterators (LE/LT): returns the last block whose
+ * boundary_key <= key (upper_bound) or boundary_key < key
+ * (lower_bound), or 0 if key precedes all blocks.
+ */
+uint32_t
+vy_block_dir_find_block(struct vy_run *run, struct vy_entry key,
+			struct key_def *cmp_def, enum iterator_type itype);
+
+/**
+ * Decode block directory from msgpack.
+ *
+ * Unknown fields in each directory entry are silently skipped
+ * for forward compatibility.
+ */
+int
+vy_block_dir_decode(struct vy_run *run, const char **data,
+		    struct key_def *cmp_def, const char *filename);
+
+/**
+ * Decode a page_info entry from an xrow.
+ *
+ * Unknown keys in the map are silently skipped for forward
+ * compatibility.
+ */
+int
+vy_page_info_decode(struct vy_page_info *page, const struct xrow_header *xrow,
+		    struct key_def *cmp_def, const char *filename);
+
+/**
+ * Decode pages from a msgpack array of page_info maps.
+ *
+ * The returned @a pages array is heap-allocated; the caller must
+ * free it and each page's min_key.
+ *
+ * @param[out] mem_out  If non-NULL, total memory consumed.
+ */
+int
+vy_index_block_decode_pages(const char *data, struct key_def *cmp_def,
+			     struct vy_page_info **pages_out,
+			     uint32_t *count_out, size_t *mem_out);
+
+/**
  * Find a page from which the iteration of a given key must be started.
  * LE and LT: the found page definitely contains the position
  *  for iteration start.
@@ -341,13 +482,15 @@ struct vy_page {
  * @param itype - iterator type (see above)
  * @param equal_key: *equal_key is set to true if there is a page
  *  with min_key equal to the given key.
- * @return offset of the page in page index OR run->info.page_count if
- *  there no pages fulfilling the conditions.
+ * @param[out] result - page number, or run->info.page_count if
+ *  there are no pages fulfilling the conditions.
+ * @retval  0 success
+ * @retval -1 error (diag is set)
  */
-uint32_t
+int
 vy_page_index_find_page(struct vy_run *run, struct vy_entry key,
 			struct key_def *cmp_def, enum iterator_type itype,
-			bool *equal_key);
+			bool *equal_key, uint32_t *result);
 /**
  * Initialize vinyl run environment
  *
@@ -381,18 +524,32 @@ vy_run_env_destroy(struct vy_run_env *env);
 void
 vy_run_env_enable_coio(struct vy_run_env *env);
 
-/**
- * Return the size of a run bloom filter.
- */
-size_t
-vy_run_bloom_size(struct vy_run *run);
-
 static inline struct vy_page_info *
 vy_run_page_info(struct vy_run *run, uint32_t pos)
 {
 	assert(pos < run->info.page_count);
+	assert(run->page_info != NULL);
 	return &run->page_info[pos];
 }
+
+/**
+ * Get page_info for a v2 run via the index block cache.
+ *
+ * For v2 runs where page_info is not eagerly loaded (page_info == NULL),
+ * this function demand-loads the appropriate index block through the
+ * 2Q cache and returns a pointer to the requested page_info entry.
+ *
+ * The returned pointer is valid until the cache entry is evicted.
+ * Must be called from TX thread (may yield for coio).
+ *
+ * @param run     The run.
+ * @param pos     Global page number.
+ * @param cmp_def Key definition for decoding.
+ * @return Pointer to page_info, or NULL on error.
+ */
+struct vy_page_info *
+vy_run_page_info_v2(struct vy_run *run, uint32_t pos,
+		    struct key_def *cmp_def);
 
 static inline bool
 vy_run_is_empty(struct vy_run *run)
@@ -422,17 +579,24 @@ vy_run_unref(struct vy_run *run)
 }
 
 /**
- * Load run from disk
- * @param run - run to laod
+ * Load run from disk.
+ *
+ * First tries to load the .index2 (v2 format).  If the file
+ * does not exist, rebuilds the index by scanning the .run data
+ * file and writes a new .index2.
+ *
+ * @param run - run to load
  * @param dir - path to the vinyl directory
  * @param space_id - space id
  * @param iid - index id
  * @param cmp_def - definition of keys stored in the run
- * @return - 0 on sucess, -1 on fail
+ * @param format - format for decoding tuples (needed for rebuild)
+ * @return - 0 on success, -1 on fail
  */
 int
 vy_run_recover(struct vy_run *run, const char *dir,
-	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def);
+	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def,
+	       struct tuple_format *format);
 
 /**
  * Rebuild run index
@@ -454,8 +618,15 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		     const struct index_opts *opts);
 
 enum vy_file_type {
+	/**
+	 * Legacy v1 index files.  No longer created or read,
+	 * but kept so that vy_run_remove_files() can clean up
+	 * old files from upgraded installations.
+	 */
 	VY_FILE_INDEX,
 	VY_FILE_INDEX_INPROGRESS,
+	VY_FILE_INDEX2,
+	VY_FILE_INDEX2_INPROGRESS,
 	VY_FILE_RUN,
 	VY_FILE_RUN_INPROGRESS,
 	vy_file_MAX,
@@ -609,43 +780,67 @@ void
 vy_run_iterator_close(struct vy_run_iterator *itr);
 
 /**
- * Simple stream over a slice. @see vy_stmt_stream.
+ * Stream for reading tuples from a run slice during compaction.
+ *
+ * Reads pages sequentially from a slice, loading index blocks
+ * from the .index2 file via blocking pread.  Designed to run
+ * entirely on a compaction worker thread with no dependency on
+ * the TX thread or the index cache.
  */
-struct vy_slice_stream {
-	/** Parent class, must be the first member */
+struct vy_compaction_stream {
+	/** Parent class, must be the first member. */
 	struct vy_stmt_stream base;
-
-	/** Current position */
+	/** Current global page number. */
 	uint32_t page_no;
+	/** Current position in the page. */
 	uint32_t pos_in_page;
-	/** Last page read */
+	/** Last page read from disk. */
 	struct vy_page *page;
-	/** The last tuple returned to user */
+	/** The last tuple returned to user. */
 	struct vy_entry entry;
-
-	/** Members needed for memory allocation and disk access */
-	/** Slice to stream */
+	/** Slice to stream. */
 	struct vy_slice *slice;
-	/**
-	 * Key def for comparing with slice boundaries,
-	 * includes secondary key parts.
-	 */
+	/** Key def for comparisons. */
 	struct key_def *cmp_def;
-	/** Format for allocating REPLACE and DELETE tuples read from pages. */
+	/** Format for allocating tuples. */
 	struct tuple_format *format;
+	/**
+	 * Locally cached decoded index block, loaded from
+	 * .index2 via blocking pread.
+	 */
+	struct vy_page_info *block_pages;
+	/** Number of pages in the cached block. */
+	uint32_t block_page_count;
+	/** First global page number of the cached block. */
+	uint32_t block_first_page_no;
 };
 
 /**
- * Open a run stream. Use vy_stmt_stream api for further work.
+ * Open a compaction stream for a v2 run.
+ * Use vy_stmt_stream api for further work.
  */
 void
-vy_slice_stream_open(struct vy_slice_stream *stream, struct vy_slice *slice,
-		     struct key_def *cmp_def, struct tuple_format *format);
+vy_compaction_stream_open(struct vy_compaction_stream *stream,
+			  struct vy_slice *slice, struct key_def *cmp_def,
+			  struct tuple_format *format);
 
 /**
  * Run_writer fills a created run with statements one by one,
  * splitting them into pages.
  */
+/**
+ * Probabilistic data structures (PDS) for one completed
+ * index block, built during the run write.
+ */
+struct vy_block_pds {
+	/** Binary fuse8 membership filter. */
+	binary_fuse8_t filter;
+	/** True if the filter was successfully built. */
+	bool has_filter;
+	/** MinHash overlap sketch. */
+	struct minhash sketch;
+};
+
 struct vy_run_writer {
 	/** Run to fill. */
 	struct vy_run *run;
@@ -661,7 +856,7 @@ struct vy_run_writer {
 	 * statements.
 	 */
 	struct key_def *cmp_def;
-	/** Key definition to calculate bloom. */
+	/** Key definition for hashing (used for fuse filters). */
 	struct key_def *key_def;
 	/** Various options, e.g. minimal page size. */
 	struct index_opts index_opts;
@@ -671,8 +866,6 @@ struct vy_run_writer {
 	uint32_t page_info_capacity;
 	/** Xlog to write data. */
 	struct xlog data_xlog;
-	/** Bloom filter. */
-	struct tuple_bloom_builder *bloom;
 	/** Buffer of a current page row offsets. */
 	struct ibuf row_index_buf;
 	/**
@@ -680,6 +873,32 @@ struct vy_run_writer {
 	 * of max key of a finished run.
 	 */
 	struct vy_entry last;
+
+	/*
+	 * Per-block probabilistic data structures.
+	 *
+	 * As pages are written, we accumulate 64-bit key hashes
+	 * and update the MinHash sketch for the current block.
+	 * When a block boundary is crossed (every VY_INDEX_BLOCK_SIZE
+	 * pages), the fuse filter is built from the accumulated
+	 * hashes, and the block PDS is finalized.
+	 */
+
+	/** Accumulator of 64-bit key hashes for the current block. */
+	uint64_t *block_hashes;
+	/** Number of hashes accumulated. */
+	uint32_t block_hash_count;
+	/** Capacity of the block_hashes array. */
+	uint32_t block_hash_cap;
+	/** MinHash sketch for the current block. */
+	struct minhash block_sketch;
+
+	/** Array of finalized PDS for completed blocks. */
+	struct vy_block_pds *block_pds;
+	/** Number of finalized blocks. */
+	uint32_t block_pds_count;
+	/** Capacity of the block_pds array. */
+	uint32_t block_pds_cap;
 };
 
 /** Create a run writer to fill a run with statements. */

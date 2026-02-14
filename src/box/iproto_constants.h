@@ -416,6 +416,8 @@ enum iproto_type {
 	VY_INDEX_PAGE_INFO = 101,
 	/** Vinyl row index stored in .run file */
 	VY_RUN_ROW_INDEX = 102,
+	/** Vinyl index block stored in .index2 file */
+	VY_INDEX_BLOCK = 103,
 };
 
 /** IPROTO type name by code */
@@ -456,6 +458,8 @@ iproto_type_name(uint16_t type)
 		return "PAGEINFO";
 	case VY_RUN_ROW_INDEX:
 		return "ROWINDEX";
+	case VY_INDEX_BLOCK:
+		return "INDEX2BLOCK";
 	default:
 		return NULL;
 	}
@@ -585,6 +589,21 @@ request_replace_body_create(struct request_replace_body *body,
 	_(BLOOM_FILTER, 7)						\
 	/** Number of statements of each type (map). */			\
 	_(STMT_STAT, 8)							\
+	/** Block directory for .index2 (array of boundary keys). */	\
+	_(BLOCK_DIR, 9)							\
+	/**								\
+	 * Aggregate disk statement counter for the run, stored	\
+	 * as a map {rows, bytes, bytes_compressed, pages}.	\
+	 * Used by .index2 to avoid eagerly loading all pages	\
+	 * just to compute statistics.				\
+	 */								\
+	_(RUN_COUNT, 10)						\
+	/**								\
+	 * page_index_size for the run, stored in .index2.	\
+	 */								\
+	_(PAGE_INDEX_SIZE, 11)						\
+	/** MinHash sketch for the entire run (overlap estimation). */	\
+	_(SKETCH, 12)							\
 
 #define VY_RUN_INFO_KEY_MEMBER(s, v) VY_RUN_INFO_ ## s = v,
 
@@ -643,6 +662,26 @@ vy_page_info_key_name(enum vy_page_info_key key)
 	extern const char *vy_page_info_key_strs[];
 	return vy_page_info_key_strs[key];
 }
+
+/**
+ * Keys within a VY_INDEX_BLOCK xrow body.
+ *
+ * The block body is a msgpack map:
+ *   PAGES  → array of page_info maps
+ *   FILTER → binary fuse8 filter blob (msgpack bin)
+ *   SKETCH → MinHash sketch blob (msgpack bin)
+ *
+ * When reading, unknown keys are silently skipped for
+ * forward compatibility.
+ */
+enum vy_index_block_key {
+	/** Array of page_info entries. */
+	VY_INDEX_BLOCK_PAGE_INFO = 0,
+	/** Binary fuse8 membership filter. */
+	VY_INDEX_BLOCK_FILTER = 1,
+	/** MinHash overlap sketch. */
+	VY_INDEX_BLOCK_SKETCH = 2,
+};
 
 /**
  * Xrow keys for Vinyl row index.

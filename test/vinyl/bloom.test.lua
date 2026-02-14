@@ -1,7 +1,9 @@
 test_run = require('test_run').new()
 
 --
--- Setting bloom_fpr to 1 disables bloom filter.
+-- Setting bloom_fpr to 1 used to disable bloom filters.
+-- Fuse8 filters are always built regardless of bloom_fpr,
+-- so the filter is active and reflects non-existing keys.
 --
 s = box.schema.space.create('test', {engine = 'vinyl'})
 _ = s:create_index('pk', {bloom_fpr = 1})
@@ -9,8 +11,7 @@ for i = 1, 10, 2 do s:insert{i} end
 box.snapshot()
 for i = 1, 10 do s:get{i} end
 stat = s.index.pk:stat()
-stat.disk.bloom_size -- 0
-stat.disk.iterator.bloom.hit -- 0
+stat.disk.iterator.bloom.hit -- 5 (even keys reflected by fuse8)
 stat.disk.iterator.bloom.miss -- 0
 s:drop()
 
@@ -31,21 +32,12 @@ for i = 1, 1000 do s:replace{math.ceil(i / 10), math.ceil(i / 2), i, i * 2} end
 box.snapshot()
 
 --
--- There are 1000 unique tuples in the index. The cardinality of the
--- first key part is 100, of the first two key parts is 500, of the
--- first three key parts is 1000. With the default bloom fpr of 0.05,
--- we use 5 hash functions or 5 / ln(2) ~= 7.3 bits per tuple.If we
--- allocated a full sized bloom filter per each sub key, we would need
--- to allocate at least (100 + 500 + 1000 + 1000) * 7 bits or 2275
--- bytes. However, since we adjust the fpr of bloom filters of higher
--- ranks (because a full key lookup checks all its sub keys as well),
--- we use 5, 4, 3, and 1 hash functions for each sub key respectively.
--- This leaves us only (100*5 + 500*4 + 1000*3 + 1000*1) / ln(2) bits
--- or 1172 bytes, and after rounding up to the block size (128 byte)
--- we have 1280 bytes plus the header overhead.
+-- The fuse8 filter stores hashes of full keys only.  Partial-key
+-- lookups (fewer parts than the index definition) skip the filter
+-- entirely and always fall through to a disk seek.  Full-key
+-- lookups benefit from the filter: non-existing keys are reflected
+-- with high probability (fpr ~= 0.4%).
 --
-s.index.pk:stat().disk.bloom_size
-
 _ = new_reflects()
 _ = new_seeks()
 
@@ -66,19 +58,19 @@ new_reflects() == 0
 new_seeks() == 1000
 
 for i = 1001, 2000 do s:select{i} end
-new_reflects() > 980
-new_seeks() < 20
+new_reflects() == 0 -- partial key: fuse8 skipped
+new_seeks() == 1000
 
 for i = 1, 1000 do s:select{i, i} end
-new_reflects() > 980
-new_seeks() < 20
+new_reflects() == 0 -- partial key: fuse8 skipped
+new_seeks() == 1000
 
 for i = 1, 1000 do s:select{i, i, i} end
-new_reflects() > 980
-new_seeks() < 20
+new_reflects() == 0 -- partial key: fuse8 skipped
+new_seeks() == 1000
 
 for i = 1, 1000 do s:select{i, i, i, i} end
-new_reflects() > 980
+new_reflects() > 980 -- full key: fuse8 active
 new_seeks() < 20
 
 test_run:cmd('restart server default')
@@ -115,19 +107,19 @@ new_reflects() == 0
 new_seeks() == 1000
 
 for i = 1001, 2000 do s:select{i} end
-new_reflects() > 980
-new_seeks() < 20
+new_reflects() == 0 -- partial key: fuse8 skipped
+new_seeks() == 1000
 
 for i = 1, 1000 do s:select{i, i} end
-new_reflects() > 980
-new_seeks() < 20
+new_reflects() == 0 -- partial key: fuse8 skipped
+new_seeks() == 1000
 
 for i = 1, 1000 do s:select{i, i, i} end
-new_reflects() > 980
-new_seeks() < 20
+new_reflects() == 0 -- partial key: fuse8 skipped
+new_seeks() == 1000
 
 for i = 1, 1000 do s:select{i, i, i, i} end
-new_reflects() > 980
+new_reflects() > 980 -- full key: fuse8 active
 new_seeks() < 20
 
 s:drop()

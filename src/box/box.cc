@@ -3038,6 +3038,15 @@ box_set_vinyl_cache(void)
 }
 
 void
+box_set_vinyl_index_cache(void)
+{
+	struct engine *vinyl = engine_by_name("vinyl");
+	assert(vinyl != NULL);
+	vinyl_engine_set_index_cache(vinyl,
+				     cfg_geti64("vinyl_index_cache"));
+}
+
+void
 box_set_vinyl_timeout(void)
 {
 	struct engine *vinyl = engine_by_name("vinyl");
@@ -4655,6 +4664,7 @@ engine_init()
 	engine_register((struct engine *)vinyl);
 	box_set_vinyl_max_tuple_size();
 	box_set_vinyl_cache();
+	box_set_vinyl_index_cache();
 	box_set_vinyl_timeout();
 }
 
