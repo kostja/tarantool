@@ -32,6 +32,7 @@
 
 #include "vy_mem.h"
 #include "vy_run.h"
+#include "vy_index_cache.h"
 #include "vy_range.h"
 #include "vy_lsm.h"
 #include "vy_tx.h"
@@ -300,7 +301,6 @@ vy_info_append_memory(struct vy_env *env, struct info_handler *h)
 	info_append_int(h, "tuple", env->stmt_env.sum_tuple_size);
 	info_append_int(h, "tuple_cache", env->cache_env.mem_used);
 	info_append_int(h, "page_index", env->lsm_env.page_index_size);
-	info_append_int(h, "bloom_filter", env->lsm_env.bloom_size);
 	info_table_end(h); /* memory */
 }
 
@@ -325,6 +325,16 @@ vinyl_engine_stat(struct engine *engine, struct info_handler *h)
 	vy_info_append_disk(env, h);
 	vy_info_append_scheduler(env, h);
 	vy_info_append_regulator(env, h);
+
+	struct vy_index_cache *idx_cache = &env->run_env.index_cache;
+	info_table_begin(h, "index_cache");
+	info_append_int(h, "hit", idx_cache->stat.hit);
+	info_append_int(h, "miss", idx_cache->stat.miss);
+	info_append_int(h, "evict", idx_cache->stat.evict);
+	info_append_int(h, "mem_used",
+			vy_index_cache_mem_used(idx_cache));
+	info_table_end(h); /* index_cache */
+
 	info_end(h);
 }
 
@@ -412,7 +422,11 @@ vinyl_index_stat(struct index *index, struct info_handler *h)
 	info_table_begin(h, "bloom");
 	info_append_int(h, "hit", stat->disk.iterator.bloom_hit);
 	info_append_int(h, "miss", stat->disk.iterator.bloom_miss);
-	info_table_end(h); /* bloom */
+	info_table_end(h); /* bloom (now tracks per-block fuse filter) */
+	info_table_begin(h, "index_cache");
+	info_append_int(h, "hit", stat->disk.iterator.index_cache_hit);
+	info_append_int(h, "miss", stat->disk.iterator.index_cache_miss);
+	info_table_end(h); /* index_cache */
 	info_table_end(h); /* iterator */
 	info_table_begin(h, "dump");
 	info_append_int(h, "count", stat->disk.dump.count);
@@ -428,7 +442,6 @@ vinyl_index_stat(struct index *index, struct info_handler *h)
 	vy_info_append_disk_stmt_counter(h, "queue", &stat->disk.compaction.queue);
 	info_table_end(h); /* compaction */
 	info_append_int(h, "index_size", lsm->page_index_size);
-	info_append_int(h, "bloom_size", lsm->bloom_size);
 	info_table_end(h); /* disk */
 
 	info_table_begin(h, "cache");
@@ -510,8 +523,8 @@ vinyl_engine_memory_stat(struct engine *engine, struct engine_memory_stat *stat)
 	stat->data += lsregion_used(&env->mem_env.allocator) -
 				env->mem_env.tree_extent_size;
 	stat->index += env->mem_env.tree_extent_size;
-	stat->index += env->lsm_env.bloom_size;
 	stat->index += env->lsm_env.page_index_size;
+	stat->index += vy_index_cache_mem_used(&env->run_env.index_cache);
 	stat->cache += env->cache_env.mem_used;
 	stat->tx += vy_tx_manager_mem_used(env->xm);
 }
@@ -1236,14 +1249,14 @@ vinyl_index_bsize(struct index *index)
 	/*
 	 * Return the cost of indexing user data. For both
 	 * primary and secondary indexes, this includes the
-	 * size of page index, bloom filter, and memory tree
-	 * extents. For secondary indexes, we also add the
+	 * size of page index and memory tree extents.
+	 * For secondary indexes, we also add the
 	 * total size of statements stored on disk, because
 	 * they are only needed for building the index.
 	 */
 	struct vy_lsm *lsm = vy_lsm(index);
 	ssize_t bsize = vy_lsm_mem_tree_size(lsm) +
-		lsm->page_index_size + lsm->bloom_size;
+		lsm->page_index_size;
 	if (lsm->index_id > 0)
 		bsize += lsm->stat.disk.count.bytes;
 	return bsize;
@@ -2823,6 +2836,13 @@ vinyl_engine_set_cache(struct engine *engine, size_t quota)
 	vy_cache_env_set_quota(&env->cache_env, quota);
 }
 
+void
+vinyl_engine_set_index_cache(struct engine *engine, size_t quota)
+{
+	struct vy_env *env = vy_env(engine);
+	vy_index_cache_set_quota(&env->run_env.index_cache, quota);
+}
+
 int
 vinyl_engine_set_memory(struct engine *engine, size_t size)
 {
@@ -3419,13 +3439,28 @@ vinyl_engine_backup(struct engine *engine, const struct vclock *vclock,
 			char path[PATH_MAX];
 			for (int type = 0; type < vy_file_MAX; type++) {
 				if (type == VY_FILE_RUN_INPROGRESS ||
-				    type == VY_FILE_INDEX_INPROGRESS)
+				    type == VY_FILE_INDEX_INPROGRESS ||
+				    type == VY_FILE_INDEX2_INPROGRESS)
 					continue;
 				vy_run_snprint_path(path, sizeof(path),
 						    env->path,
 						    lsm_info->space_id,
 						    lsm_info->index_id,
 						    run_info->id, type);
+				/*
+				 * A run may have a v1 .index or
+				 * a v2 .index2, but not both.
+				 * Skip files that don't exist.
+				 */
+				if (access(path, F_OK) != 0) {
+					if (errno == ENOENT)
+						continue;
+					diag_set(SystemError,
+						 "can't access %s",
+						 path);
+					rc = -1;
+					goto out;
+				}
 				rc = cb(path, cb_arg);
 				if (rc != 0)
 					goto out;

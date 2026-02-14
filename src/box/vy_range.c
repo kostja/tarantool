@@ -38,6 +38,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "salad/minhash.h"
+
 #define RB_COMPACT 1
 #include <small/rb.h>
 #include <small/rlist.h>
@@ -384,12 +386,20 @@ vy_range_init_slice(struct vy_range *range, struct vy_slice *slice)
 			range->end, run->info.min_key,
 			HINT_NONE, range->cmp_def) > 0);
 
-	struct vy_page_info *page0 = vy_run_page_info(slice->run, 0);
+	/*
+	 * Get the min key of the first page from the block
+	 * directory (always in memory after recovery or write).
+	 */
+	assert(run->block_dir != NULL);
+	const char *page0_min_key;
+	hint_t page0_min_key_hint;
+	page0_min_key = run->block_dir[0].boundary_key;
+	page0_min_key_hint = run->block_dir[0].boundary_key_hint;
 
 	/* slice->begin = MAX(range::begin, run::min_key) */
 	if (range->begin.stmt != NULL &&
-	    vy_entry_compare_with_raw_key(range->begin, page0->min_key,
-					  page0->min_key_hint,
+	    vy_entry_compare_with_raw_key(range->begin, page0_min_key,
+					  page0_min_key_hint,
 					  range->cmp_def) >= 0) {
 		slice->begin = range->begin;
 		tuple_ref(range->begin.stmt);
@@ -404,7 +414,7 @@ vy_range_init_slice(struct vy_range *range, struct vy_slice *slice)
 		slice->begin =
 			vy_entry_key_from_msgpack(env->key_format,
 						  range->cmp_def,
-						  page0->min_key);
+						  page0_min_key);
 		if (slice->begin.stmt == NULL)
 			panic("failed to allocate slice begin");
 	}
@@ -435,20 +445,41 @@ vy_range_init_slice(struct vy_range *range, struct vy_slice *slice)
 		if (slice->end_bound.stmt == NULL)
 			panic("failed to allocate slice end_bound");
 	}
-	/** Lookup the first and the last pages spanned by the slice. */
+	/*
+	 * Compute the first and the last page spanned by the slice
+	 * using the two-level page index search.  This gives exact
+	 * page numbers via the block directory (level 1) and the
+	 * demand-loaded page info (level 2, usually a cache hit).
+	 *
+	 * If the search fails (e.g. disk I/O error loading the
+	 * index block), fall back to block-aligned bounds from the
+	 * block directory, which is always in memory.  The fallback
+	 * overestimates the slice size but preserves correctness.
+	 */
 	bool unused;
-	slice->first_page_no =
-		vy_page_index_find_page(run, slice->begin,
-					range->cmp_def, ITER_GE,
-					&unused);
+	if (vy_page_index_find_page(run, slice->begin,
+				    range->cmp_def, ITER_GE,
+				    &unused, &slice->first_page_no) != 0) {
+		diag_log();
+		uint32_t first_block = vy_block_dir_find_block(
+			run, slice->begin, range->cmp_def, ITER_GE);
+		slice->first_page_no =
+			run->block_dir[first_block].first_page_no;
+	}
 	assert(slice->first_page_no < run->info.page_count);
 	enum iterator_type itype =
 		vy_entry_is_exclusive(slice->end_bound) ?
 		ITER_LT : ITER_LE;
-	slice->last_page_no =
-		vy_page_index_find_page(run, slice->end_bound,
-					range->cmp_def, itype,
-					&unused);
+	if (vy_page_index_find_page(run, slice->end_bound,
+				    range->cmp_def, itype,
+				    &unused, &slice->last_page_no) != 0) {
+		diag_log();
+		uint32_t last_block = vy_block_dir_find_block(
+			run, slice->end_bound, range->cmp_def, itype);
+		slice->last_page_no =
+			run->block_dir[last_block].first_page_no +
+			run->block_dir[last_block].page_count - 1;
+	}
 	assert(slice->last_page_no < run->info.page_count);
 	assert(slice->last_page_no >= slice->first_page_no);
 	/** Estimate the number of statements in the slice. */
@@ -516,7 +547,13 @@ struct vy_trim_point {
 	int index;
 };
 
-/** Compare trim points by slice begin key. NULL (= -inf) first. */
+/**
+ * Compare trim points by slice begin key. NULL (= -inf) first.
+ * Break ties by original position to keep the sort stable: slices
+ * with the same begin key stay in newest-first order so that
+ * logically adjacent runs (e.g. several small top-level runs)
+ * remain in one cluster.
+ */
 static int
 vy_trim_point_cmp(const void *a, const void *b, void *arg)
 {
@@ -564,7 +601,8 @@ vy_trim_point_pos_cmp(const void *a, const void *b, void *arg)
  */
 static void
 vy_compaction_plan_trim(struct vy_range *range,
-			const struct index_opts *opts)
+			const struct index_opts *opts,
+			bool use_sketch)
 {
 	struct vy_compaction_plan *plan = &range->compaction_plan;
 	if (plan->count <= 1)
@@ -602,6 +640,7 @@ vy_compaction_plan_trim(struct vy_range *range,
 	int best_len = 1;
 	struct vy_trim_point *cur = trim;
 	const char *max_end_key = cur->slice->run->info.max_key;
+	struct vy_slice *max_end_slice = cur->slice;
 
 	for (point = cur + 1; point < end; point++) {
 		struct vy_slice *s = point->slice;
@@ -610,6 +649,35 @@ vy_compaction_plan_trim(struct vy_range *range,
 			vy_entry_compare_with_raw_key(
 				s->begin, max_end_key,
 				HINT_NONE, cmp_def) > 0;
+		/*
+		 * Even if key ranges overlap, the runs may contain
+		 * different keys (e.g. time-series data written to
+		 * the same key range but with different actual keys).
+		 * Use MinHash sketches to refine the overlap estimate.
+		 *
+		 * Only enabled for shape-based compaction; read-amp
+		 * compaction must not skip runs with low key overlap
+		 * because even a few shared keys (tombstones, updates)
+		 * can cause massive read amplification.
+		 *
+		 * Skip sketches when either run has been split across
+		 * multiple ranges (slice_count > 1).  The sketch
+		 * covers the full run key range, which may be much
+		 * wider than the slice in this range, deflating the
+		 * Jaccard estimate and falsely marking overlapping
+		 * slices as disjoint.
+		 */
+		if (!disjoint && use_sketch &&
+		    s->run->info.has_sketch &&
+		    max_end_slice->run->info.has_sketch &&
+		    s->run->slice_count == 1 &&
+		    max_end_slice->run->slice_count == 1) {
+			double j = minhash_jaccard(
+				&s->run->info.sketch,
+				&max_end_slice->run->info.sketch);
+			if (j < 0.05)
+				disjoint = true;
+		}
 		if (disjoint) {
 			if (point - cur > best_len) {
 				best = cur;
@@ -617,12 +685,15 @@ vy_compaction_plan_trim(struct vy_range *range,
 			}
 			cur = point;
 			max_end_key = s->run->info.max_key;
+			max_end_slice = s;
 		} else {
 			/* Extend the cluster. */
 			if (vy_key_compare(s->run->info.max_key,
 					   HINT_NONE, max_end_key,
-					   HINT_NONE, cmp_def) > 0)
+					   HINT_NONE, cmp_def) > 0) {
 				max_end_key = s->run->info.max_key;
+				max_end_slice = s;
+			}
 		}
 	}
 	/* Check the last cluster. */
@@ -635,9 +706,6 @@ vy_compaction_plan_trim(struct vy_range *range,
 		/* All slices overlap.  Nothing to trim. */
 		return;
 	}
-	say_verbose("compaction plan for range %s trimmed "
-		    "from %d to %d slices (largest overlap cluster)",
-		    vy_range_str(range), slice_count, best_len);
 
 	/* Restore newest-first order and rewrite plan->slices. */
 	qsort_arg(best, best_len, sizeof(*best), vy_trim_point_pos_cmp, NULL);
@@ -646,6 +714,64 @@ vy_compaction_plan_trim(struct vy_range *range,
 	struct vy_slice **dst = plan->slices;
 	for (point = best; point < best + best_len; point++)
 		*dst++ = point->slice;
+
+	/*
+	 * The plan must be contiguous in the linked list (which is
+	 * ordered by LSN, newest first).  The read and write
+	 * iterators rely on this ordering: after compaction, the
+	 * merged slice is placed at the newest position, and if a
+	 * non-plan slice with newer data sits in a "gap" between
+	 * plan slices, its versions become invisible.
+	 *
+	 * Key-range disjointness (begin > max_end_key) is safe:
+	 * excluded slices share no keys with the plan, so reordering
+	 * doesn't matter.  But Jaccard disjointness only means low
+	 * overlap — shared keys can still exist and get reordered.
+	 *
+	 * Fix: walk the linked list from the newest plan slice to
+	 * the oldest.  If any non-plan slice is found in between,
+	 * include it in the plan to close the gap.  This preserves
+	 * the time-series optimisation (where begin-key order
+	 * matches LSN order, so clusters are naturally contiguous)
+	 * while neutralising the non-contiguous case.
+	 */
+	struct vy_slice *newest = plan->slices[0];
+	struct vy_slice *oldest = plan->slices[plan->count - 1];
+	struct vy_slice *s;
+	bool found_newest = false;
+	dst = plan->slices;
+	rlist_foreach_entry(s, &range->slices, in_range) {
+		if (s == newest)
+			found_newest = true;
+		if (!found_newest)
+			continue;
+		*dst++ = s;
+		if (s == oldest)
+			break;
+	}
+	plan->count = dst - plan->slices;
+
+	if (plan->count == slice_count) {
+		/*
+		 * Gap-filling restored the original plan.
+		 * Nothing was trimmed; keep is_last_level as set
+		 * by the caller.
+		 */
+		return;
+	}
+	say_verbose("compaction plan for range %s trimmed "
+		    "from %d to %d slices (largest overlap cluster)",
+		    vy_range_str(range), slice_count, plan->count);
+
+	/*
+	 * The caller may have set is_last_level assuming all
+	 * slices are in the plan.  After trimming, excluded slices
+	 * remain in the range and may contain older versions of
+	 * keys in the plan.  Clear the flag; check_last_level will
+	 * re-evaluate using actual key ranges.
+	 */
+	plan->is_last_level = false;
+
 	/* A single slice has nothing to merge with. */
 	if (plan->count <= 1)
 		plan->count = 0;
@@ -909,23 +1035,29 @@ vy_compaction_plan_check_shape(struct vy_range *range,
 			break;
 	}
 	/*
-	 * Compute is_last_level before calling trim.  The flag is
-	 * true when no slice outside the plan has an older version
-	 * of any key inside it.  When all slices are initially
-	 * selected (count == slice_count) the oldest slice is in the
-	 * plan and there are no versions below it.  Trim can only
-	 * remove slices from the plan, never add new ones, so if it
-	 * removes the oldest slice the remaining cluster still has
-	 * no older versions outside: the flag correctly survives the
-	 * trim.
+	 * Set is_last_level tentatively; trim may clear it.
 	 *
-	 * When not all slices are selected, check_last_level may
-	 * upgrade the flag later if the plan's key range is
-	 * disjoint from all older slices.
+	 * When all slices are selected, there are no versions
+	 * below the plan, so the flag is correct.  But trim may
+	 * exclude slices (especially via sketch-based disjointness
+	 * which doesn't guarantee zero shared keys), so it clears
+	 * the flag unconditionally.  check_last_level then
+	 * re-evaluates using actual key ranges.
 	 */
 	range->compaction_plan.is_last_level =
 		range->compaction_plan.count == range->slice_count;
-	vy_compaction_plan_trim(range, opts);
+	/*
+	 * Disable sketch-based refinement for forced compaction
+	 * (needs_compaction).  Sketch Jaccard can produce false
+	 * disjointness when run sizes differ greatly (e.g. a
+	 * small tombstone-only run vs a large data run), causing
+	 * trim to incorrectly exclude overlapping slices.  For
+	 * auto compaction this is an acceptable trade-off (the
+	 * compaction will be retried), but forced compaction must
+	 * respect the user's compact() request.
+	 */
+	vy_compaction_plan_trim(range, opts,
+				/*use_sketch=*/!range->needs_compaction);
 }
 
 /**
@@ -970,12 +1102,10 @@ vy_compaction_plan_check_read_amp(struct vy_range *range,
 		vy_compaction_plan_add(&range->compaction_plan, slice);
 	/*
 	 * is_last_level is true because all slices are in the plan.
-	 * Trim can only remove slices whose key ranges are disjoint
-	 * from the selected cluster, so the flag survives the trim
-	 * (same reasoning as in vy_compaction_plan_check_shape).
+	 * Trim may clear it; check_last_level re-evaluates.
 	 */
 	range->compaction_plan.is_last_level = true;
-	vy_compaction_plan_trim(range, opts);
+	vy_compaction_plan_trim(range, opts, /*use_sketch=*/false);
 }
 
 /**
@@ -1039,8 +1169,8 @@ vy_compaction_plan_check_bloat(struct vy_range *range)
 
 /**
  * Check whether the plan covers a key range disjoint from all
- * older slices in the range.  If so, there are no older versions
- * of any key in the plan below it, and we can set is_last_level
+ * non-plan slices in the range.  If so, there are no older versions
+ * of any key in the plan outside it, and we can set is_last_level
  * to true so that tombstones are pruned during compaction.
  *
  * For each slice, the data range is
@@ -1050,8 +1180,12 @@ vy_compaction_plan_check_bloat(struct vy_range *range)
  * bound: INCLUSIVE(max_key) or EXCLUSIVE(range boundary).
  *
  * The plan cluster is the union of all plan slices' data ranges.
- * If no older slice's data range overlaps this cluster, we set
+ * If no non-plan slice's data range overlaps this cluster, we set
  * is_last_level to true.
+ *
+ * The plan is always contiguous in the linked list (trim ensures
+ * this via gap-filling), so we only need to check slices older
+ * than the oldest plan slice.
  */
 static void
 vy_compaction_plan_check_last_level(struct vy_range *range)
@@ -1100,7 +1234,8 @@ vy_compaction_plan_check_last_level(struct vy_range *range)
 
 	/* No older slice overlaps -- this is the last level. */
 	say_verbose("compaction plan for range %s: is_last_level "
-		    "upgraded (plan cluster disjoint from %d older slices)",
+		    "upgraded (plan cluster disjoint from %d "
+		    "older slices)",
 		    vy_range_str(range),
 		    range->slice_count - plan->count);
 	plan->is_last_level = true;
@@ -1477,50 +1612,100 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 	if (slice->count.bytes < range_size * 4 / 3)
 		return false;
 
-	/* Find the median key in the oldest run (approximately). */
-	struct vy_page_info *mid_page;
-	mid_page = vy_run_page_info(slice->run, slice->first_page_no +
-				    (slice->last_page_no -
-				     slice->first_page_no) / 2);
+	/*
+	 * Find the median key in the oldest run (approximately).
+	 *
+	 * We must not yield here: this function is called from
+	 * vy_range_update_compaction_priority, which runs between
+	 * vy_lsm_unacct_range and vy_lsm_acct_range.  A yield in
+	 * that window lets another fiber modify the range,
+	 * corrupting the histogram.
+	 *
+	 * First try block directory boundary keys (always in
+	 * memory).  Block boundaries are spaced VY_INDEX_BLOCK_SIZE
+	 * pages apart, so this only works when the first and
+	 * median pages fall in different blocks.
+	 *
+	 * When they fall in the same block (small runs, or a
+	 * narrow slice within a single block), we try the index
+	 * cache for page-level min_keys.  vy_index_cache_get is a
+	 * hash lookup that never yields.  If the block is not
+	 * cached, we give up — the next compaction will load it.
+	 */
+	struct vy_run *run = slice->run;
+	if (run->block_dir == NULL || run->block_count == 0)
+		return false;
 
-	struct vy_page_info *first_page = vy_run_page_info(slice->run,
-						slice->first_page_no);
+	const char *mid_key;
+	hint_t mid_key_hint;
+	const char *first_key;
+	hint_t first_key_hint;
+
+	uint32_t mid_page_no = slice->first_page_no +
+			       (slice->last_page_no -
+				slice->first_page_no) / 2;
+	uint32_t mid_block = mid_page_no / VY_INDEX_BLOCK_SIZE;
+	if (mid_block >= run->block_count)
+		mid_block = run->block_count - 1;
+	uint32_t first_block =
+		slice->first_page_no / VY_INDEX_BLOCK_SIZE;
+	if (first_block >= run->block_count)
+		first_block = run->block_count - 1;
+
+	if (mid_block != first_block) {
+		mid_key = run->block_dir[mid_block].boundary_key;
+		mid_key_hint = run->block_dir[mid_block].boundary_key_hint;
+		first_key = run->block_dir[first_block].boundary_key;
+		first_key_hint =
+			run->block_dir[first_block].boundary_key_hint;
+	} else {
+		/*
+		 * First and median pages are in the same block:
+		 * try the index cache for page-level precision.
+		 */
+		struct vy_index_cache *cache = &run->env->index_cache;
+		struct vy_index_cache_entry *entry =
+			vy_index_cache_get(cache, run->id, mid_block);
+		if (entry == NULL || entry->page_count < 2)
+			return false;
+		uint32_t local_mid = mid_page_no - entry->first_page_no;
+		if (local_mid >= entry->page_count)
+			local_mid = entry->page_count - 1;
+		uint32_t local_first =
+			slice->first_page_no - entry->first_page_no;
+		if (local_first >= entry->page_count)
+			local_first = entry->page_count - 1;
+		mid_key = entry->pages[local_mid].min_key;
+		mid_key_hint = entry->pages[local_mid].min_key_hint;
+		first_key = entry->pages[local_first].min_key;
+		first_key_hint = entry->pages[local_first].min_key_hint;
+	}
 
 	/* No point in splitting if a new range is going to be empty. */
-	if (vy_key_compare(first_page->min_key, first_page->min_key_hint,
-			   mid_page->min_key, mid_page->min_key_hint,
+	if (vy_key_compare(first_key, first_key_hint,
+			   mid_key, mid_key_hint,
 			   range->cmp_def) == 0)
 		return false;
 	/*
-	 * In extreme cases the median key can be < the beginning
-	 * of the slice, e.g.
-	 *
-	 * RUN:
-	 * ... |---- page N ----|-- page N + 1 --|-- page N + 2 --
-	 *     | min_key = [10] | min_key = [50] | min_key = [100]
-	 *
-	 * SLICE:
-	 * begin = [30], end = [70]
-	 * first_page_no = N, last_page_no = N + 1
-	 *
-	 * which makes mid_page_no = N and mid_page->min_key = [10].
-	 *
-	 * In such cases there's no point in splitting the range.
+	 * The boundary key may be less than the slice begin
+	 * (the block/page covers a wider range than the slice).
+	 * Skip the split in that case.
 	 */
 	if (slice->begin.stmt != NULL &&
-	    vy_entry_compare_with_raw_key(slice->begin, mid_page->min_key,
-					  mid_page->min_key_hint,
+	    vy_entry_compare_with_raw_key(slice->begin, mid_key,
+					  mid_key_hint,
 					  range->cmp_def) >= 0)
 		return false;
 	/*
-	 * The median key can't be >= the end of the slice as we
-	 * take the min key of a page for the median key.
+	 * Similarly, the boundary key should be less than
+	 * the slice end.  With block-level granularity this is
+	 * not guaranteed, so check instead of asserting.
 	 */
-	assert(vy_entry_compare_with_raw_key(slice->end_bound,
-					     mid_page->min_key,
-					     mid_page->min_key_hint,
-					     range->cmp_def) > 0);
-	*p_split_key = mid_page->min_key;
+	if (vy_entry_compare_with_raw_key(slice->end_bound,
+					  mid_key, mid_key_hint,
+					  range->cmp_def) <= 0)
+		return false;
+	*p_split_key = mid_key;
 
 	say_verbose("range %" PRId64 " exceeds %" PRIu64 " and needs split: "
 		    "has %d slices, %" PRIu64 " bytes, last slice has "

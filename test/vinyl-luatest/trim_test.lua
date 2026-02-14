@@ -377,8 +377,9 @@ g.test_empty_range_coalesced = function(cg)
         })
 
         -- Step 1: Create 2 dump runs spanning keys 1..40 and
-        -- compact them.  This sets n_compactions = 1, which is
-        -- required for the median split heuristic in Step 2.
+        -- compact them.  The compacted run (~8 KB) exceeds
+        -- 2 × range_size (4096), triggering a median-key split
+        -- into 2 ranges (split point is around key 20-22).
         for i = 1, 40 do s:replace{i, string.rep('x', 200)} end
         box.snapshot()
         for i = 1, 40 do s:replace{i, string.rep('y', 200)} end
@@ -388,7 +389,7 @@ g.test_empty_range_coalesced = function(cg)
             t.assert_equals(s.index.pk:stat().run_count, 1)
         end)
 
-        -- Step 2: Add a dump to trigger a split.
+        -- Step 2: Add a dump to both ranges.
         for i = 1, 40 do s:replace{i, string.rep('z', 200)} end
         box.snapshot()
         t.helpers.retrying({timeout = 10}, function()
@@ -396,9 +397,10 @@ g.test_empty_range_coalesced = function(cg)
         end)
         local range_count = s.index.pk:stat().range_count
 
-        -- Step 3: Delete half the key space.  After compaction
-        -- the affected range becomes empty and is coalesced.
-        for i = 1, 20 do s:delete{i} end
+        -- Step 3: Delete keys well past the split point so
+        -- that the first range becomes completely empty after
+        -- last-level compaction, and is then coalesced.
+        for i = 1, 30 do s:delete{i} end
         box.snapshot()
         s.index.pk:compact()
 
@@ -1568,5 +1570,195 @@ g.test_read_amp_no_garbage = function(cg)
 
         s:drop()
         box.cfg{vinyl_cache = old_cache}
+    end)
+end
+
+--
+-- Jaccard-based trim would create a non-contiguous compaction plan
+-- ({S_A, S_B} with S_X in between), but the contiguity fix detects
+-- the gap and includes S_X, restoring the full 3-slice plan.
+--
+-- This test verifies that:
+-- 1. The gap is detected and filled (all 3 slices compacted into 1 run).
+-- 2. DELETE{50} from S_A is preserved (is_last_level is correctly true
+--    when all slices are in the plan).
+--
+-- Data layout (3 slices in a single range):
+--   S_A (newest): DELETE{50}, REPLACE{1..49, 51..300}   (~300 entries)
+--   S_X (middle): REPLACE{50, 301..600}                 (~301 entries)
+--   S_B (oldest): REPLACE{1..300}                       (~300 entries)
+--
+-- Without the contiguity fix, trim would exclude S_X (Jaccard < 0.05)
+-- and create plan {S_A, S_B}.  Two bugs would follow:
+--   1. check_last_level walks only after S_B, misses S_X, sets
+--      is_last_level=true incorrectly, dropping DELETE{50}.
+--   2. Merged slice placed before S_X reorders LSN, hiding S_X's
+--      newer version of key 50.
+--
+g.test_jaccard_trim_check_last_level = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 1,
+            page_size = 512,
+            range_size = 1000000,
+        })
+
+        -- S_B (oldest): REPLACE keys 1..300.
+        for i = 1, 300 do s:replace{i, i} end
+        box.snapshot()
+
+        -- S_X (middle): REPLACE key 50 + keys 301..600.
+        -- Low Jaccard with S_A and S_B (~1/600 < 0.05).
+        s:replace{50, 5000}
+        for i = 301, 600 do s:replace{i, i} end
+        box.snapshot()
+
+        -- S_A (newest): DELETE key 50, REPLACE keys 1..49, 51..300.
+        s:delete{50}
+        for i = 1, 49 do s:replace{i, i + 10000} end
+        for i = 51, 300 do s:replace{i, i + 10000} end
+        box.snapshot()
+
+        -- After dump 3, shape selects all 3.  Trim initially picks
+        -- {S_A, S_B} cluster, but the contiguity fix detects S_X in
+        -- the gap and includes it.  All 3 slices are compacted into
+        -- 1 run.
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+            t.assert_equals(s.index.pk:stat().run_count, 1)
+        end)
+
+        -- Key 50 must stay deleted: all 3 slices are compacted
+        -- together with is_last_level=true.  DELETE{50} from S_A
+        -- (newest) cancels REPLACE{50} from both S_X and S_B.
+        t.assert_equals(s:get{50}, nil,
+                        'key 50 must stay deleted after compaction')
+        -- 599 = keys 1..49 + 51..300 + 301..600.
+        t.assert_equals(s:count(), 599)
+    end)
+end
+
+--
+-- Jaccard-based trim would create a non-contiguous plan that breaks
+-- the LSN ordering invariant, but the contiguity fix prevents it.
+--
+-- Data layout (3 slices in a single range):
+--   S_A (newest): REPLACE{1..100, val=3}               (~100 entries)
+--   S_X (middle): REPLACE{120, val=2}, REPLACE{301..600} (~301 entries)
+--   S_B (oldest): REPLACE{1..300, val=1}               (~300 entries)
+--
+-- Without the contiguity fix: trim picks {S_A, S_B}, excludes S_X.
+-- After compaction, merged M has key 120 with val=1 (from S_B,
+-- stale).  M is placed before S_X → reading key 120 returns val=1
+-- instead of val=2 (from the newer S_X).
+--
+-- With the contiguity fix: S_X is included in the plan.  All 3
+-- slices are compacted together.  Key 120 correctly gets val=2
+-- from S_X (newer than S_B's val=1).
+--
+g.test_jaccard_trim_lsn_reorder = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 1,
+            page_size = 512,
+            range_size = 1000000,
+        })
+
+        -- S_B (oldest): REPLACE keys 1..300, all with val=1.
+        for i = 1, 300 do s:replace{i, 1} end
+        box.snapshot()
+
+        -- S_X (middle): REPLACE key 120 with val=2, + keys 301..600.
+        -- Low Jaccard with S_B (~1/600).
+        s:replace{120, 2}
+        for i = 301, 600 do s:replace{i, i} end
+        box.snapshot()
+
+        -- S_A (newest): REPLACE keys 1..100 with val=3.
+        -- High Jaccard with S_B (~100/300 = 0.33 > 0.05).
+        -- Does NOT touch key 120.
+        for i = 1, 100 do s:replace{i, 3} end
+        box.snapshot()
+
+        -- Shape selects all 3.  Trim initially picks {S_A, S_B} but
+        -- contiguity fix includes S_X.  All 3 compacted into 1 run.
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+            t.assert_equals(s.index.pk:stat().run_count, 1)
+        end)
+
+        -- Key 120: S_X has val=2 (newer than S_B's val=1).
+        -- With all 3 slices in one compaction, S_X's version wins.
+        local tuple = s:get{120}
+        t.assert_equals(tuple[2], 2,
+                        'key 120 must have val=2 from newer S_X')
+    end)
+end
+
+--
+-- Time-series case: consecutive dumps with slightly overlapping
+-- key ranges.  Jaccard trim should cancel shape compaction because
+-- the runs are nearly disjoint — they should accumulate until a
+-- range split eventually divides them.
+--
+-- Data layout (3 slices in a single range):
+--   S_A (newest): keys 199..300    (~102 entries)
+--   S_B (middle): keys 99..200     (~102 entries)
+--   S_C (oldest): keys 1..100      (~100 entries)
+--
+-- Key-range overlap: S_C and S_B share keys 99-100, S_B and S_A
+-- share keys 199-200.  But Jaccard is ~2/200 = 0.01 < 0.05 for
+-- each pair → all 3 are in separate clusters of size 1.
+--
+-- Trim cancels the plan (best cluster size = 1).  Runs stay as 3.
+--
+-- In the linked list: S_A → S_B → S_C (newest first).
+-- The contiguity fix does not affect this case: each cluster has
+-- only 1 slice, so there are no gaps to fill.
+--
+g.test_jaccard_trim_time_series = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 1,
+            page_size = 512,
+            range_size = 1000000,
+        })
+
+        -- S_C (oldest): keys 1..100.
+        for i = 1, 100 do s:replace{i, 'c'} end
+        box.snapshot()
+
+        -- S_B (middle): keys 99..200.
+        -- Overlaps S_C at keys 99-100, but Jaccard ~ 2/200 < 0.05.
+        for i = 99, 200 do s:replace{i, 'b'} end
+        box.snapshot()
+
+        -- S_A (newest): keys 199..300.
+        -- Overlaps S_B at keys 199-200, but Jaccard ~ 2/200 < 0.05.
+        for i = 199, 300 do s:replace{i, 'a'} end
+        box.snapshot()
+
+        -- Shape selects all 3 (rcpl=1, 3 runs).  Trim: each pair
+        -- is Jaccard-disjoint → 3 clusters of size 1 → plan cancelled.
+        -- No compaction → run_count stays 3.
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+        end)
+        t.assert_equals(s.index.pk:stat().run_count, 3,
+                        'time-series runs must not be compacted')
+
+        -- Verify data is intact.
+        t.assert_equals(s:count(), 300)
+        -- Keys in the overlap zones have the latest values.
+        t.assert_equals(s:get{99}[2], 'b')
+        t.assert_equals(s:get{100}[2], 'b')
+        t.assert_equals(s:get{199}[2], 'a')
+        t.assert_equals(s:get{200}[2], 'a')
     end)
 end

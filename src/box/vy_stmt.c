@@ -31,6 +31,7 @@
 
 #include "vy_stmt.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/uio.h> /* struct iovec */
@@ -41,10 +42,12 @@
 #include <small/lsregion.h>
 
 #include "error.h"
-#include "tuple_bloom.h"
 #include "tuple_format.h"
 #include "xrow.h"
 #include "fiber.h"
+#include "key_def.h"
+#include "coll/coll.h"
+#include "PMurHash.h"
 
 /**
  * Statement metadata keys.
@@ -557,36 +560,113 @@ vy_stmt_extract_key_raw(const char *data, const char *data_end,
 	return key;
 }
 
-int
-vy_bloom_builder_add(struct tuple_bloom_builder *builder,
-		     struct vy_entry entry, struct key_def *key_def)
-{
-	struct tuple *stmt = entry.stmt;
-	if (vy_stmt_is_key(stmt)) {
-		const char *data = tuple_data(stmt);
-		uint32_t part_count = mp_decode_array(&data);
-		return tuple_bloom_builder_add_key(builder, data,
-						   part_count, key_def);
-	} else {
-		return tuple_bloom_builder_add(builder, stmt, key_def,
-				vy_entry_multikey_idx(entry, key_def));
-	}
-}
+/**
+ * Seed for the first 32-bit hash (same as tuple_bloom's HASH_SEED
+ * for backward compatibility in hash distribution).
+ */
+enum { VY_HASH_SEED_LO = 13U };
 
-bool
-vy_bloom_maybe_has(const struct tuple_bloom *bloom,
-		   struct vy_entry entry, struct key_def *key_def)
+/**
+ * Seed for the second 32-bit hash (different from the first to
+ * produce an independent hash value).
+ */
+enum { VY_HASH_SEED_HI = 1103515245U };
+
+uint64_t
+vy_stmt_hash64(struct vy_entry entry, struct key_def *key_def)
 {
 	struct tuple *stmt = entry.stmt;
+	int multikey_idx = vy_entry_multikey_idx(entry, key_def);
+	uint32_t h_lo = VY_HASH_SEED_LO;
+	uint32_t carry_lo = 0;
+	uint32_t total_lo = 0;
+	uint32_t h_hi = VY_HASH_SEED_HI;
+	uint32_t carry_hi = 0;
+	uint32_t total_hi = 0;
+
 	if (vy_stmt_is_key(stmt)) {
 		const char *data = tuple_data(stmt);
 		uint32_t part_count = mp_decode_array(&data);
-		return tuple_bloom_maybe_has_key(bloom, data,
-						 part_count, key_def);
+		uint32_t count = MIN(part_count, key_def->part_count);
+		for (uint32_t i = 0; i < count; i++) {
+			const char *f = data;
+			uint32_t size;
+			/*
+			 * Temporary buffer for re-encoding a field.
+			 * Declared here (not inside an if-branch) so
+			 * that it stays in scope when PMurHash32_Process
+			 * reads from f below.
+			 */
+			char buf[9];
+			/*
+			 * Must match tuple_hash_field() so that a
+			 * key and a tuple with the same field values
+			 * produce the same hash.  In particular,
+			 * MP_STR is hashed without the msgpack header
+			 * and MP_FLOAT/MP_DOUBLE are normalized.
+			 */
+			if (key_def->parts[i].type == FIELD_TYPE_DOUBLE) {
+				double value = 0;
+				mp_read_double_lossy(&data, &value);
+				char *end = mp_encode_double(buf, value);
+				f = buf;
+				size = end - buf;
+			} else if (mp_typeof(*data) == MP_STR) {
+				f = mp_decode_str(&data, &size);
+				if (key_def->parts[i].coll != NULL) {
+					struct coll *coll =
+						key_def->parts[i].coll;
+					total_lo += coll->hash(f, size,
+						&h_lo, &carry_lo, coll);
+					total_hi += coll->hash(f, size,
+						&h_hi, &carry_hi, coll);
+					continue;
+				}
+			} else if (mp_typeof(*data) == MP_FLOAT ||
+				   mp_typeof(*data) == MP_DOUBLE) {
+				double val = mp_typeof(*data) == MP_FLOAT ?
+					     mp_decode_float(&data) :
+					     mp_decode_double(&data);
+				double iptr;
+				if (!isfinite(val) || modf(val, &iptr) != 0 ||
+				    val < -exp2(63) || val >= exp2(64)) {
+					size = data - f;
+				} else {
+					char *end;
+					if (val >= 0)
+						end = mp_encode_uint(buf,
+							(uint64_t)val);
+					else
+						end = mp_encode_int(buf,
+							(int64_t)val);
+					f = buf;
+					size = end - buf;
+				}
+			} else {
+				mp_next(&data);
+				size = data - f;
+			}
+			PMurHash32_Process(&h_lo, &carry_lo, f, size);
+			total_lo += size;
+			PMurHash32_Process(&h_hi, &carry_hi, f, size);
+			total_hi += size;
+		}
 	} else {
-		return tuple_bloom_maybe_has(bloom, stmt, key_def,
-				vy_entry_multikey_idx(entry, key_def));
+		for (uint32_t i = 0; i < key_def->part_count; i++) {
+			total_lo += tuple_hash_key_part(&h_lo, &carry_lo,
+							stmt,
+							&key_def->parts[i],
+							multikey_idx);
+			total_hi += tuple_hash_key_part(&h_hi, &carry_hi,
+							stmt,
+							&key_def->parts[i],
+							multikey_idx);
+		}
 	}
+
+	uint32_t hash_lo = PMurHash32_Result(h_lo, carry_lo, total_lo);
+	uint32_t hash_hi = PMurHash32_Result(h_hi, carry_hi, total_hi);
+	return ((uint64_t)hash_hi << 32) | hash_lo;
 }
 
 /**

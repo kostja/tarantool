@@ -101,6 +101,16 @@ struct vy_run_iterator_stat {
 	 * of disk reads.
 	 */
 	struct vy_disk_stmt_counter read;
+	/**
+	 * Index block cache hit count — block found in the
+	 * 2Q cache without disk I/O.
+	 */
+	int64_t index_cache_hit;
+	/**
+	 * Index block cache miss count — block had to be
+	 * loaded from the .index2 file.
+	 */
+	int64_t index_cache_miss;
 };
 
 /** TX write set iterator statistics. */

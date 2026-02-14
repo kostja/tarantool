@@ -40,8 +40,10 @@
 #include "coio_task.h"
 #include "mp_util.h"
 #include "replication.h"
-#include "tuple_bloom.h"
 #include "xlog.h"
+#include "binaryfusefilter.h"
+#include "salad/minhash.h"
+#include "errinj.h"
 #include "xrow.h"
 #include "vy_history.h"
 
@@ -61,12 +63,14 @@ static const uint64_t vy_run_info_key_map = (1 << VY_RUN_INFO_MIN_KEY) |
 /** xlog meta type for .run files */
 #define XLOG_META_TYPE_RUN "RUN"
 
-/** xlog meta type for .index files */
-#define XLOG_META_TYPE_INDEX "INDEX"
+/** xlog meta type for .index2 files (partitioned page index) */
+#define XLOG_META_TYPE_INDEX2 "INDEX2"
 
 const char *vy_file_suffix[] = {
 	"index",			/* VY_FILE_INDEX */
 	"index" inprogress_suffix, 	/* VY_FILE_INDEX_INPROGRESS */
+	"index2",			/* VY_FILE_INDEX2 */
+	"index2" inprogress_suffix,	/* VY_FILE_INDEX2_INPROGRESS */
 	"run",				/* VY_FILE_RUN */
 	"run" inprogress_suffix, 	/* VY_FILE_RUN_INPROGRESS */
 };
@@ -91,8 +95,12 @@ struct vy_run_reader {
 struct vy_page_read_task {
 	/** parent */
 	struct cbus_call_msg base;
-	/** vinyl page metadata */
-	struct vy_page_info *page_info;
+	/**
+	 * Copy of vinyl page metadata.  Stored by value (not
+	 * pointer) because the source lives in the index cache
+	 * and can be evicted while the coio read is in progress.
+	 */
+	struct vy_page_info page_info;
 	/** vy_run with fd - ref. counted */
 	struct vy_run *run;
 	/** key to lookup within the page */
@@ -109,6 +117,34 @@ struct vy_page_read_task {
 	bool equal_found;
 	/** [out] resulting vinyl page */
 	struct vy_page *page;
+};
+
+/** Cbus task for vinyl index block read (demand-loading from .index2). */
+struct vy_index_block_read_task {
+	/** parent */
+	struct cbus_call_msg base;
+	/** Run to read from (has index_fd). */
+	struct vy_run *run;
+	/** Block number in the run's block directory. */
+	uint32_t block_no;
+	/**
+	 * [out] Decoded page_info entries.
+	 * Allocated by the callback; ownership is transferred
+	 * to the caller (and eventually to the index cache).
+	 */
+	struct vy_page_info *pages;
+	/** [out] Number of decoded pages. */
+	uint32_t page_count;
+	/** [out] Memory used by the decoded pages (for cache accounting). */
+	size_t mem_used;
+	/** [out] Binary fuse8 filter (if present in the block). */
+	binary_fuse8_t filter;
+	bool has_filter;
+	/** [out] MinHash sketch (if present in the block). */
+	struct minhash sketch;
+	bool has_sketch;
+	/** Key definition (needed for decoding min_key hints). */
+	struct key_def *cmp_def;
 };
 
 /** Destructor for env->zdctx_key thread-local variable */
@@ -187,6 +223,7 @@ vy_run_env_create(struct vy_run_env *env, struct tuple_format *key_format,
 	tt_pthread_key_create(&env->zdctx_key, vy_free_zdctx);
 	mempool_create(&env->read_task_pool, cord_slab_cache(),
 		       sizeof(struct vy_page_read_task));
+	vy_index_cache_create(&env->index_cache, VY_INDEX_CACHE_DEFAULT_SIZE);
 	/* Use cord-local seed, immune to background thread races. */
 	env->seed = rand_r(&cord()->seed);
 	env->initial_join = false;
@@ -200,6 +237,7 @@ vy_run_env_destroy(struct vy_run_env *env)
 {
 	if (env->reader_pool != NULL)
 		vy_run_env_stop_readers(env);
+	vy_index_cache_destroy(&env->index_cache);
 	mempool_destroy(&env->read_task_pool);
 	tt_pthread_key_delete(env->zdctx_key);
 	tuple_format_unref(env->key_format);
@@ -281,6 +319,7 @@ vy_run_new(struct vy_run_env *env, int64_t id)
 	run->id = id;
 	run->dump_lsn = -1;
 	run->fd = -1;
+	run->index_fd = -1;
 	run->refs = 1;
 	rlist_create(&run->in_lsm);
 	rlist_create(&run->in_unused);
@@ -299,10 +338,16 @@ vy_run_clear(struct vy_run *run)
 	run->page_info = NULL;
 	run->page_index_size = 0;
 	run->info.page_count = 0;
-	if (run->info.bloom != NULL) {
-		tuple_bloom_delete(run->info.bloom);
-		run->info.bloom = NULL;
+	if (run->block_dir != NULL) {
+		for (uint32_t i = 0; i < run->block_count; i++) {
+			free(run->block_dir[i].boundary_key);
+			if (run->block_dir[i].has_filter)
+				binary_fuse8_free(&run->block_dir[i].filter);
+		}
+		free(run->block_dir);
 	}
+	run->block_dir = NULL;
+	run->block_count = 0;
 	free(run->info.min_key);
 	run->info.min_key = NULL;
 	free(run->info.max_key);
@@ -313,82 +358,182 @@ void
 vy_run_delete(struct vy_run *run)
 {
 	assert(run->refs == 0);
+	/*
+	 * No need to invalidate index cache entries for this run:
+	 * they will naturally gravitate towards the end of the
+	 * LRU chain and get evicted when memory is needed.
+	 */
 	if (run->fd >= 0 && close(run->fd) < 0)
+		say_syserror("close failed");
+	if (run->index_fd >= 0 && close(run->index_fd) < 0)
 		say_syserror("close failed");
 	vy_run_clear(run);
 	TRASH(run);
 	free(run);
 }
 
-size_t
-vy_run_bloom_size(struct vy_run *run)
-{
-	return run->info.bloom == NULL ? 0 : tuple_bloom_size(run->info.bloom);
-}
+/* Forward declaration for demand-load from .index2. */
+static struct vy_index_cache_entry *
+vy_run_get_index_block(struct vy_run *run, uint32_t block_no,
+		       struct key_def *cmp_def,
+		       struct vy_run_iterator_stat *stat);
 
 uint32_t
+vy_block_dir_find_block(struct vy_run *run, struct vy_entry key,
+			struct key_def *cmp_def, enum iterator_type itype)
+{
+	bool is_lower_bound = itype == ITER_LT || itype == ITER_GE;
+
+	assert(run->block_dir != NULL);
+	assert(run->block_count > 0);
+
+	int32_t brange[2] = { -1, (int32_t)run->block_count };
+	do {
+		int32_t mid = brange[0] + (brange[1] - brange[0]) / 2;
+		struct vy_index_block_dir *d = &run->block_dir[mid];
+		int cmp = vy_entry_compare_with_raw_key(key,
+				d->boundary_key, d->boundary_key_hint,
+				cmp_def);
+		if (is_lower_bound)
+			brange[cmp <= 0] = mid;
+		else
+			brange[cmp < 0] = mid;
+	} while (brange[1] - brange[0] > 1);
+
+	if (brange[0] < 0)
+		return 0;
+	return (uint32_t)brange[0];
+}
+
+/**
+ * Two-level search using block directory + index cache.
+ *
+ * Level 1: binary search on block directory boundary keys to find
+ * the candidate block.
+ * Level 2: demand-load the block from the index cache and binary
+ * search within its page_info entries.
+ *
+ * @retval  0 Success, *result is set to the target page number.
+ * @retval -1 Error (disk I/O failure during demand-load).
+ */
+static int
+vy_page_index_find_page_impl(struct vy_run *run, struct vy_entry key,
+			     struct key_def *cmp_def, enum iterator_type itype,
+			     bool *equal_key, uint32_t *result)
+{
+	int dir = iterator_direction(itype);
+	bool is_lower_bound = itype == ITER_LT || itype == ITER_GE;
+
+	assert(run->block_count > 0);
+	assert(run->info.page_count > 0);
+
+	/*
+	 * Level 1: binary search in block directory.
+	 * Same algorithm as the page-level search, applied
+	 * to block boundary keys.
+	 */
+	int32_t brange[2] = { -1, (int32_t)run->block_count };
+	do {
+		int32_t mid = brange[0] + (brange[1] - brange[0]) / 2;
+		struct vy_index_block_dir *d = &run->block_dir[mid];
+		int cmp = vy_entry_compare_with_raw_key(key,
+				d->boundary_key, d->boundary_key_hint,
+				cmp_def);
+		if (is_lower_bound)
+			brange[cmp <= 0] = mid;
+		else
+			brange[cmp < 0] = mid;
+		*equal_key = *equal_key || cmp == 0;
+	} while (brange[1] - brange[0] > 1);
+
+	/*
+	 * The target page is in the last block whose boundary key
+	 * satisfies the search condition, i.e. brange[0].
+	 */
+	int32_t block_idx = brange[0];
+
+	if (block_idx < 0) {
+		if (dir < 0) {
+			/*
+			 * Key precedes all pages: no match
+			 * for reverse search.
+			 */
+			*result = run->info.page_count;
+			return 0;
+		}
+		/* Forward: key < all boundary keys, start at block 0. */
+		block_idx = 0;
+	}
+
+	/*
+	 * Level 2: load the block and search within it.
+	 */
+	struct vy_index_cache_entry *entry =
+		vy_run_get_index_block(run, block_idx, cmp_def, NULL);
+	if (entry == NULL)
+		return -1;
+
+	/*
+	 * Binary search within the block's pages.
+	 */
+	int32_t prange[2] = { -1, (int32_t)entry->page_count };
+	do {
+		int32_t mid = prange[0] + (prange[1] - prange[0]) / 2;
+		struct vy_page_info *info = &entry->pages[mid];
+		int cmp = vy_entry_compare_with_raw_key(key,
+				info->min_key, info->min_key_hint,
+				cmp_def);
+		if (is_lower_bound)
+			prange[cmp <= 0] = mid;
+		else
+			prange[cmp < 0] = mid;
+		*equal_key = *equal_key || cmp == 0;
+	} while (prange[1] - prange[0] > 1);
+
+	/*
+	 * Extract the result with local-to-global page number
+	 * conversion.
+	 */
+	if (prange[0] < 0)
+		prange[0] = (int32_t)entry->page_count;
+	uint32_t local_page = prange[dir > 0];
+
+	uint32_t global_page;
+	if (local_page >= entry->page_count) {
+		/*
+		 * Beyond this block: the answer is the first page
+		 * of the next block, or page_count if this is the
+		 * last block.
+		 */
+		if ((uint32_t)(block_idx + 1) < run->block_count)
+			global_page = run->block_dir[block_idx + 1].first_page_no;
+		else
+			global_page = run->info.page_count;
+	} else {
+		global_page = entry->first_page_no + local_page;
+	}
+
+	if (global_page > 0 && dir > 0)
+		global_page--;
+
+	*result = global_page;
+	return 0;
+}
+
+int
 vy_page_index_find_page(struct vy_run *run, struct vy_entry key,
 			struct key_def *cmp_def, enum iterator_type itype,
-			bool *equal_key)
+			bool *equal_key, uint32_t *result)
 {
 	if (itype == ITER_EQ)
 		itype = ITER_GE; /* One day it'll become obsolete */
 	assert(itype == ITER_GE || itype == ITER_GT ||
 	       itype == ITER_LE || itype == ITER_LT);
-	int dir = iterator_direction(itype);
 	*equal_key = false;
 
-	/**
-	 * Binary search in page index. Depends on given iterator_type:
-	 *  ITER_GE: lowest page with min_key >= given key.
-	 *  ITER_GT: lowest page with min_key > given key.
-	 *  ITER_LE: highest page with min_key <= given key.
-	 *  ITER_LT: highest page with min_key < given key.
-	 *
-	 * Example: we are searching for a value 2 in the run of 10 pages:
-	 * min_key:         [1   1   2   2   2   2   2   3   3   3]
-	 * we want to find: [    LT  GE              LE  GT       ]
-	 * For LT and GE it's a classical lower_bound search.
-	 * Let's set up a range with left page's min_key < key and
-	 *  right page's min >= key; binary cut the range until it
-	 *  becomes of length 1 and then LT pos = left bound of the range
-	 *  and GE pos = right bound of the range.
-	 * For LE and GT it's a classical upper_bound search.
-	 * Let's set up a range with left page's min_key <= key and
-	 *  right page's min > key; binary cut the range until it
-	 *  becomes of length 1 and then LE pos = left bound of the range
-	 *  and GT pos = right bound of the range.
-	 */
-	bool is_lower_bound = itype == ITER_LT || itype == ITER_GE;
-
-	assert(run->info.page_count > 0);
-	/* Initially the range is set with virtual positions */
-	int32_t range[2] = { -1, run->info.page_count };
-	assert(run->info.page_count > 0);
-	do {
-		int32_t mid = range[0] + (range[1] - range[0]) / 2;
-		struct vy_page_info *info = vy_run_page_info(run, mid);
-		int cmp = vy_entry_compare_with_raw_key(key, info->min_key,
-							info->min_key_hint,
-							cmp_def);
-		if (is_lower_bound)
-			range[cmp <= 0] = mid;
-		else
-			range[cmp < 0] = mid;
-		*equal_key = *equal_key || cmp == 0;
-	} while (range[1] - range[0] > 1);
-	if (range[0] < 0)
-		range[0] = run->info.page_count;
-	uint32_t page = range[dir > 0];
-
-	/**
-	 * Since page search uses only min_key of pages,
-	 *  for GE, GT and EQ the previous page can contain
-	 *  the point where iteration must be started.
-	 */
-	if (page > 0 && dir > 0)
-		return page - 1;
-	return page;
+	assert(run->block_dir != NULL);
+	return vy_page_index_find_page_impl(run, key, cmp_def, itype,
+					    equal_key, result);
 }
 
 struct vy_slice *
@@ -469,7 +614,7 @@ vy_slice_cut(struct vy_slice *slice, int64_t id, struct vy_entry begin,
  * @retval  0 Success.
  * @retval -1 Error.
  */
-static int
+int
 vy_page_info_decode(struct vy_page_info *page, const struct xrow_header *xrow,
 		    struct key_def *cmp_def, const char *filename)
 {
@@ -629,8 +774,11 @@ vy_run_info_decode(struct vy_run_info *run_info,
 			break;
 		case VY_RUN_INFO_BLOOM_FILTER_LEGACY:
 		case VY_RUN_INFO_BLOOM_FILTER:
-			run_info->bloom = tuple_bloom_decode(
-				&pos, iproto_to_tuple_bloom_version(key));
+			/*
+			 * Legacy per-run bloom filters are no longer
+			 * used.  Skip the data but don't fail.
+			 */
+			mp_next(&pos);
 			break;
 		case VY_RUN_INFO_STMT_STAT:
 			vy_stmt_stat_decode(&run_info->stmt_stat, &pos);
@@ -934,7 +1082,7 @@ vy_page_read_cb(struct cbus_call_msg *base)
 	ZSTD_DStream *zdctx = vy_env_get_zdctx(task->run->env);
 	if (zdctx == NULL)
 		return -1;
-	if (vy_page_read(task->page, task->page_info, task->run, zdctx) != 0)
+	if (vy_page_read(task->page, &task->page_info, task->run, zdctx) != 0)
 		return -1;
 	if (task->key.stmt != NULL &&
 	    vy_page_find_key(task->page, task->key, task->cmp_def,
@@ -942,6 +1090,519 @@ vy_page_read_cb(struct cbus_call_msg *base)
 			     &task->pos_in_page, &task->equal_found) != 0)
 		return -1;
 	return 0;
+}
+
+/**
+ * Read an index block from .index2 and return the first xrow.
+ *
+ * Reads raw data from @a fd at @a offset via pread, decompresses
+ * the xlog transaction, and returns the first xrow.  The xrow
+ * body points into a region-allocated buffer; the caller must
+ * call xlog_tx_cursor_destroy(@a tx_cursor) when done, and
+ * region_truncate the fiber gc region.
+ *
+ * @return 0 on success, -1 on error (diag is set).
+ */
+static int
+vy_index_block_read_xrow(int fd, off_t offset, uint32_t data_size,
+			  struct vy_run_env *env,
+			  struct xlog_tx_cursor *tx_cursor,
+			  struct xrow_header *xrow)
+{
+	char *buf = (char *)region_alloc(&fiber()->gc, data_size);
+	if (buf == NULL) {
+		diag_set(OutOfMemory, data_size, "region gc",
+			 "index block");
+		return -1;
+	}
+	ssize_t nread = fio_pread(fd, buf, data_size, offset);
+	if (nread < 0) {
+		diag_set(SystemError, "failed to read index block");
+		return -1;
+	}
+	if (nread != (ssize_t)data_size) {
+		diag_set(ClientError, ER_INVALID_INDEX_FILE,
+			 "Unexpected end of file reading index block");
+		return -1;
+	}
+	ZSTD_DStream *zdctx = vy_env_get_zdctx(env);
+	if (zdctx == NULL)
+		return -1;
+
+	const char *pos = buf;
+	ssize_t rc = xlog_tx_cursor_create(tx_cursor, &pos,
+					   buf + data_size, zdctx);
+	if (rc != 0) {
+		if (rc > 0)
+			diag_set(ClientError, ER_INVALID_INDEX_FILE,
+				 "Truncated index block transaction");
+		return -1;
+	}
+	if (xlog_tx_cursor_next_row(tx_cursor, xrow) != 0) {
+		xlog_tx_cursor_destroy(tx_cursor);
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * Decode a pages array from a msgpack position.
+ *
+ * @a data must point to a msgpack array of page_info maps.
+ * The returned @a pages array is heap-allocated; the caller
+ * is responsible for freeing it and each page's min_key.
+ *
+ * @param[out] mem_out  If non-NULL, receives the total memory
+ *                      consumed by the decoded pages and keys.
+ * @return 0 on success, -1 on error (diag is set).
+ */
+int
+vy_index_block_decode_pages(const char *data, struct key_def *cmp_def,
+			     struct vy_page_info **pages_out,
+			     uint32_t *count_out, size_t *mem_out)
+{
+	uint32_t count = mp_decode_array(&data);
+	struct vy_page_info *pages = (struct vy_page_info *)
+		calloc(count, sizeof(struct vy_page_info));
+	if (pages == NULL) {
+		diag_set(OutOfMemory,
+			 count * sizeof(struct vy_page_info),
+			 "calloc", "vy_page_info");
+		return -1;
+	}
+	size_t mem = count * sizeof(struct vy_page_info);
+	for (uint32_t p = 0; p < count; p++) {
+		struct xrow_header pi_xrow;
+		memset(&pi_xrow, 0, sizeof(pi_xrow));
+		pi_xrow.body->iov_base = (void *)data;
+		const char *start = data;
+		mp_next(&data);
+		pi_xrow.body->iov_len = data - start;
+		pi_xrow.bodycnt = 1;
+		pi_xrow.type = VY_INDEX_PAGE_INFO;
+		if (vy_page_info_decode(&pages[p], &pi_xrow,
+					cmp_def, "") < 0) {
+			for (uint32_t j = 0; j < p; j++) {
+				if (pages[j].min_key != NULL)
+					free(pages[j].min_key);
+			}
+			free(pages);
+			return -1;
+		}
+		if (pages[p].min_key != NULL) {
+			const char *key_end = pages[p].min_key;
+			mp_next(&key_end);
+			mem += key_end - pages[p].min_key;
+		}
+	}
+	*pages_out = pages;
+	*count_out = count;
+	if (mem_out != NULL)
+		*mem_out = mem;
+	return 0;
+}
+
+/**
+ * Callback for demand-loading an index block from .index2.
+ *
+ * Runs on a reader thread.  Reads a single xlog transaction
+ * from the .index2 file, decodes the page_info entries, and
+ * stores the result in the task's output fields.
+ */
+static int
+vy_index_block_read_cb(struct cbus_call_msg *base)
+{
+	struct vy_index_block_read_task *task =
+		(struct vy_index_block_read_task *)base;
+	struct vy_run *run = task->run;
+	uint32_t block_no = task->block_no;
+
+	assert(block_no < run->block_count);
+	struct vy_index_block_dir *dir = &run->block_dir[block_no];
+
+	size_t region_svp = region_used(&fiber()->gc);
+
+	struct xlog_tx_cursor tx_cursor;
+	struct xrow_header xrow;
+	if (vy_index_block_read_xrow(run->index_fd, dir->file_offset,
+				      dir->data_size, run->env,
+				      &tx_cursor, &xrow) != 0)
+		goto err;
+
+	if (xrow.type != VY_INDEX_BLOCK) {
+		diag_set(ClientError, ER_INVALID_INDEX_FILE,
+			 "Wrong xrow type in index block");
+		xlog_tx_cursor_destroy(&tx_cursor);
+		goto err;
+	}
+
+	/*
+	 * Decode the xrow body.
+	 *
+	 * New format (v2): the body is a msgpack map with keys
+	 *   VY_INDEX_BLOCK_PAGE_INFO, VY_INDEX_BLOCK_FILTER,
+	 *   VY_INDEX_BLOCK_SKETCH.
+	 *
+	 * Old format: the body is a bare msgpack array of page_info
+	 * maps (written before PDS support was added).
+	 *
+	 * We distinguish between the two by peeking at the first
+	 * msgpack byte: a map starts with 0xde/0xdf or fixmap
+	 * (0x80..0x8f), while an array starts with 0xdc/0xdd or
+	 * fixarray (0x90..0x9f).
+	 */
+	const char *bpos = xrow.body->iov_base;
+	const char *pages_data = NULL;
+	const char *filter_data = NULL;
+	uint32_t filter_size = 0;
+	const char *sketch_data = NULL;
+	uint32_t sketch_size = 0;
+
+	if (mp_typeof(*bpos) == MP_MAP) {
+		/* New map-based format. */
+		uint32_t map_size = mp_decode_map(&bpos);
+		for (uint32_t i = 0; i < map_size; i++) {
+			uint32_t key = mp_decode_uint(&bpos);
+			switch (key) {
+			case VY_INDEX_BLOCK_PAGE_INFO:
+				pages_data = bpos;
+				mp_next(&bpos);
+				break;
+			case VY_INDEX_BLOCK_FILTER:
+				filter_size = mp_decode_binl(&bpos);
+				filter_data = bpos;
+				bpos += filter_size;
+				break;
+			case VY_INDEX_BLOCK_SKETCH:
+				sketch_size = mp_decode_binl(&bpos);
+				sketch_data = bpos;
+				bpos += sketch_size;
+				break;
+			default:
+				mp_next(&bpos);
+				break;
+			}
+		}
+		if (pages_data == NULL) {
+			diag_set(ClientError, ER_INVALID_INDEX_FILE,
+				 "Missing PAGES key in index block");
+			xlog_tx_cursor_destroy(&tx_cursor);
+			goto err;
+		}
+	} else {
+		/* Old format: body is a bare array. */
+		pages_data = bpos;
+	}
+
+	/* Decode the pages array. */
+	struct vy_page_info *pages;
+	uint32_t arr_count;
+	size_t mem;
+	if (vy_index_block_decode_pages(pages_data, task->cmp_def,
+					 &pages, &arr_count, &mem) != 0) {
+		xlog_tx_cursor_destroy(&tx_cursor);
+		goto err;
+	}
+	mem += sizeof(struct vy_index_cache_entry);
+	if (arr_count != dir->page_count) {
+		diag_set(ClientError, ER_INVALID_INDEX_FILE,
+			 "Index block page count mismatch");
+		for (uint32_t j = 0; j < arr_count; j++) {
+			if (pages[j].min_key != NULL)
+				free(pages[j].min_key);
+		}
+		free(pages);
+		xlog_tx_cursor_destroy(&tx_cursor);
+		goto err;
+	}
+
+	/* Decode binary fuse8 filter if present. */
+	task->has_filter = false;
+	if (filter_data != NULL && filter_size > 0) {
+		if (binary_fuse8_deserialize(&task->filter, filter_data)) {
+			task->has_filter = true;
+			mem += binary_fuse8_size_in_bytes(&task->filter);
+		}
+	}
+
+	/* Decode MinHash sketch if present. */
+	task->has_sketch = false;
+	if (sketch_data != NULL && sketch_size == MINHASH_SIZE) {
+		memcpy(task->sketch.values, sketch_data, MINHASH_SIZE);
+		task->has_sketch = true;
+	}
+
+	xlog_tx_cursor_destroy(&tx_cursor);
+	region_truncate(&fiber()->gc, region_svp);
+
+	task->pages = pages;
+	task->page_count = arr_count;
+	task->mem_used = mem;
+	return 0;
+err:
+	region_truncate(&fiber()->gc, region_svp);
+	return -1;
+}
+
+/**
+ * Sentinel for tracking an in-flight index block load.
+ * Prevents duplicate disk reads when multiple fibers
+ * concurrently miss the same cache entry.
+ * Stack-allocated by the loading fiber.
+ */
+struct vy_index_block_loading {
+	struct rlist in_list;
+	int64_t run_id;
+	uint32_t block_no;
+	struct fiber_cond cond;
+};
+
+/** Free pages and filter loaded by an index block read task. */
+static void
+vy_index_block_read_task_free(struct vy_index_block_read_task *task)
+{
+	for (uint32_t i = 0; i < task->page_count; i++) {
+		if (task->pages[i].min_key != NULL)
+			free(task->pages[i].min_key);
+	}
+	free(task->pages);
+	if (task->has_filter)
+		binary_fuse8_free(&task->filter);
+}
+
+/**
+ * Load an index block for a v2 run, using the index cache.
+ *
+ * First checks the 2Q cache; on a miss, checks if another fiber
+ * is already loading this block (via a sentinel list) and waits
+ * for it.  If no one is loading, reads the block from the .index2
+ * file via a reader thread and inserts the result into the cache.
+ *
+ * @param run      The run (must have block_dir != NULL).
+ * @param block_no Block number to load.
+ * @param cmp_def  Key definition for decoding min_key hints.
+ * @return Cache entry with the decoded page_info array,
+ *         or NULL on error (diag is set).
+ */
+static struct vy_index_cache_entry *
+vy_run_get_index_block(struct vy_run *run, uint32_t block_no,
+		       struct key_def *cmp_def,
+		       struct vy_run_iterator_stat *stat)
+{
+	assert(run->block_dir != NULL);
+	assert(block_no < run->block_count);
+
+	struct vy_run_env *env = run->env;
+	struct vy_index_cache *cache = &env->index_cache;
+
+	/* Try the cache first. */
+	struct vy_index_cache_entry *entry =
+		vy_index_cache_get(cache, run->id, block_no);
+	if (entry != NULL) {
+		cache->stat.hit++;
+		if (stat != NULL)
+			stat->index_cache_hit++;
+		return entry;
+	}
+
+	/*
+	 * Check if another fiber is already loading this block.
+	 * If so, wait for it to finish and use the cached result.
+	 * Re-scan the list after wakeup: the first waiter to run
+	 * may register as a new loader before we get scheduled.
+	 */
+	struct vy_index_block_loading *loading;
+retry:
+	rlist_foreach_entry(loading, &cache->loading, in_list) {
+		if (loading->run_id == run->id &&
+		    loading->block_no == block_no) {
+			fiber_cond_wait(&loading->cond);
+			entry = vy_index_cache_get(cache, run->id,
+						   block_no);
+			if (entry != NULL) {
+				cache->stat.hit++;
+				if (stat != NULL)
+					stat->index_cache_hit++;
+				return entry;
+			}
+			/*
+			 * The loading fiber failed.  Re-scan the
+			 * sentinel list in case another waiter has
+			 * already registered as the new loader.
+			 */
+			goto retry;
+		}
+	}
+
+	/*
+	 * Count the miss only for actual disk loads (not for
+	 * fibers that waited on a sentinel and got a cache hit).
+	 */
+	cache->stat.miss++;
+	if (stat != NULL)
+		stat->index_cache_miss++;
+
+	/* Register as the loader for this block. */
+	struct vy_index_block_loading self;
+	self.run_id = run->id;
+	self.block_no = block_no;
+	fiber_cond_create(&self.cond);
+	rlist_add_entry(&cache->loading, &self, in_list);
+
+	/* Cache miss — demand-load from disk. */
+	struct vy_index_block_read_task task;
+	memset(&task, 0, sizeof(task));
+	task.run = run;
+	task.block_no = block_no;
+	task.cmp_def = cmp_def;
+
+	entry = NULL;
+
+	if (vy_run_env_coio_call(env, &task.base,
+				 vy_index_block_read_cb) != 0)
+		goto done;
+
+	ERROR_INJECT(ERRINJ_VY_INDEX_BLOCK_READ, {
+		diag_set(ClientError, ER_INJECTION,
+			 "vinyl index block read");
+		vy_index_block_read_task_free(&task);
+		goto done;
+	});
+
+	ERROR_INJECT_YIELD(ERRINJ_VY_INDEX_BLOCK_DELAY);
+
+	/*
+	 * Re-check the cache: another code path may have
+	 * populated it (shouldn't happen with the sentinel,
+	 * but check defensively).
+	 */
+	entry = vy_index_cache_get(cache, run->id, block_no);
+	if (entry != NULL) {
+		vy_index_block_read_task_free(&task);
+		goto done;
+	}
+
+	/* Insert into the cache.  Ownership of pages passes to the cache. */
+	struct vy_index_block_dir *dir = &run->block_dir[block_no];
+	binary_fuse8_t *filter_ptr = task.has_filter ? &task.filter : NULL;
+	struct minhash *sketch_ptr = task.has_sketch ? &task.sketch : NULL;
+	entry = vy_index_cache_put(cache, run->id, block_no,
+				    dir->first_page_no,
+				    task.pages, task.page_count,
+				    filter_ptr, sketch_ptr,
+				    task.mem_used);
+	if (entry == NULL) {
+		vy_index_block_read_task_free(&task);
+		goto done;
+	}
+done:
+	rlist_del_entry(&self, in_list);
+	fiber_cond_broadcast(&self.cond);
+	fiber_cond_destroy(&self.cond);
+	return entry;
+}
+
+struct vy_page_info *
+vy_run_page_info_v2(struct vy_run *run, uint32_t pos,
+		    struct key_def *cmp_def)
+{
+	assert(run->block_dir != NULL);
+	assert(pos < run->info.page_count);
+
+	/*
+	 * Find which block contains the given page.
+	 * Since blocks have VY_INDEX_BLOCK_SIZE pages (except
+	 * possibly the last), simple division works.
+	 */
+	uint32_t block_no = pos / VY_INDEX_BLOCK_SIZE;
+	if (block_no >= run->block_count)
+		block_no = run->block_count - 1;
+
+	struct vy_index_cache_entry *entry =
+		vy_run_get_index_block(run, block_no, cmp_def, NULL);
+	if (entry == NULL)
+		return NULL;
+
+	uint32_t local_pos = pos - entry->first_page_no;
+	assert(local_pos < entry->page_count);
+	return &entry->pages[local_pos];
+}
+
+/**
+ * Check the per-block binary fuse8 filter to determine if a
+ * given key might exist in the run.
+ *
+ * This is used for ITER_EQ optimization: if the filter says
+ * the key is definitely absent, we can skip the entire run.
+ *
+ * The function finds the block that would contain the key,
+ * loads it into the index cache, and checks its fuse filter.
+ *
+ * @param run     The run to check (must have block_dir != NULL).
+ * @param key     The search key.
+ * @param key_def Key definition for hashing.
+ * @param cmp_def Key definition for comparison.
+ *
+ * @retval  1 Key is definitely absent (filter hit).
+ * @retval  0 Key might be present (filter miss or no filter).
+ * @retval -1 Error (diag is set).
+ */
+static int
+vy_run_bloom_check(struct vy_run *run, struct vy_entry key,
+		   struct key_def *key_def, struct key_def *cmp_def,
+		   bool *checked)
+{
+	*checked = false;
+	if (run->block_dir == NULL || run->block_count == 0)
+		return 0;
+	/*
+	 * The fuse8 filter stores hashes of full keys.  A partial
+	 * key (fewer parts than key_def) hashes differently, so
+	 * the filter would always report "absent" — a false
+	 * negative.  Skip the check for partial keys.
+	 */
+	if (!vy_stmt_is_full_key(key.stmt, key_def))
+		return 0;
+
+	/*
+	 * Binary search in block directory to find the block
+	 * that would contain this key.
+	 */
+	int32_t lo = 0, hi = (int32_t)run->block_count;
+	while (lo < hi) {
+		int32_t mid = lo + (hi - lo) / 2;
+		struct vy_index_block_dir *d = &run->block_dir[mid];
+		int cmp = vy_entry_compare_with_raw_key(key,
+				d->boundary_key, d->boundary_key_hint,
+				cmp_def);
+		if (cmp < 0)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	/* The key would be in block (lo - 1). */
+	if (lo == 0)
+		return 0; /* Key precedes all blocks. */
+	uint32_t block_no = lo - 1;
+
+	/*
+	 * Use the in-memory filter from block_dir.  This avoids
+	 * yielding (unlike demand-loading from the index cache),
+	 * which is critical for concurrent index builds: a yield
+	 * here would change fiber scheduling and could cause the
+	 * build trigger to be removed while DML fibers are still
+	 * in flight.
+	 */
+	struct vy_index_block_dir *dir = &run->block_dir[block_no];
+	if (!dir->has_filter)
+		return 0; /* No filter available, must check data. */
+
+	*checked = true;
+	uint64_t h = vy_stmt_hash64(key, key_def);
+	if (binary_fuse8_contain(h, &dir->filter))
+		return 0; /* Key might be present. */
+
+	return 1; /* Key is definitely absent. */
 }
 
 /**
@@ -981,7 +1642,10 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 	}
 
 	/* Allocate buffers */
-	struct vy_page_info *page_info = vy_run_page_info(slice->run, page_no);
+	struct vy_page_info *page_info;
+	page_info = vy_run_page_info_v2(slice->run, page_no, itr->cmp_def);
+	if (page_info == NULL)
+		return -1;
 	page = vy_page_new(page_info);
 	if (page == NULL)
 		return -1;
@@ -995,7 +1659,7 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 		return -1;
 	}
 	task->run = slice->run;
-	task->page_info = page_info;
+	task->page_info = *page_info;
 	task->page = page;
 	task->key = key;
 	task->iterator_type = iterator_type;
@@ -1008,6 +1672,13 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 
 	*pos_in_page = task->pos_in_page;
 	*equal_found = task->equal_found;
+
+	/* Update read statistics from the task's copy of page_info,
+	 * since the original pointer may have been invalidated by
+	 * index cache eviction during the yield. */
+	uint32_t row_count = task->page_info.row_count;
+	uint32_t unpacked_size = task->page_info.unpacked_size;
+	uint32_t compressed_size = task->page_info.size;
 
 	mempool_free(&env->read_task_pool, task);
 	if (rc != 0) {
@@ -1023,9 +1694,9 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 	page->page_no = page_no;
 
 	/* Update read statistics. */
-	itr->stat->read.rows += page_info->row_count;
-	itr->stat->read.bytes += page_info->unpacked_size;
-	itr->stat->read.bytes_compressed += page_info->size;
+	itr->stat->read.rows += row_count;
+	itr->stat->read.bytes += unpacked_size;
+	itr->stat->read.bytes_compressed += compressed_size;
 	itr->stat->read.pages++;
 
 	*result = page;
@@ -1075,9 +1746,10 @@ vy_run_iterator_search(struct vy_run_iterator *itr,
 		       enum iterator_type iterator_type, struct vy_entry key,
 		       struct vy_run_iterator_pos *pos, bool *equal_key)
 {
-	pos->page_no = vy_page_index_find_page(itr->slice->run, key,
-					       itr->cmp_def, iterator_type,
-					       equal_key);
+	if (vy_page_index_find_page(itr->slice->run, key,
+				    itr->cmp_def, iterator_type,
+				    equal_key, &pos->page_no) != 0)
+		return -1;
 	if (pos->page_no == itr->slice->run->info.page_count)
 		return 1;
 	bool equal_in_page;
@@ -1118,8 +1790,11 @@ vy_run_iterator_next_pos(struct vy_run_iterator *itr,
 			if (pos->page_no == 0)
 				return 1;
 			pos->page_no--;
-			struct vy_page_info *page_info =
-				vy_run_page_info(run, pos->page_no);
+			struct vy_page_info *page_info;
+			page_info = vy_run_page_info_v2(run, pos->page_no,
+							itr->cmp_def);
+			if (page_info == NULL)
+				return -1;
 			assert(page_info->row_count > 0);
 			pos->pos_in_page = page_info->row_count - 1;
 		}
@@ -1127,8 +1802,11 @@ vy_run_iterator_next_pos(struct vy_run_iterator *itr,
 		assert(iterator_type == ITER_GE || iterator_type == ITER_GT ||
 		       iterator_type == ITER_EQ);
 		assert(pos->page_no < run->info.page_count);
-		struct vy_page_info *page_info =
-			vy_run_page_info(run, pos->page_no);
+		struct vy_page_info *page_info;
+		page_info = vy_run_page_info_v2(run, pos->page_no,
+						itr->cmp_def);
+		if (page_info == NULL)
+			return -1;
 		assert(page_info->row_count > 0);
 		pos->pos_in_page++;
 		if (pos->pos_in_page >= page_info->row_count) {
@@ -1289,20 +1967,28 @@ vy_run_iterator_seek(struct vy_run_iterator *itr, struct vy_entry last,
 {
 	struct key_def *cmp_def = itr->cmp_def;
 	struct vy_slice *slice = itr->slice;
-	struct tuple_bloom *bloom = slice->run->info.bloom;
 	struct vy_entry key = itr->key;
 	enum iterator_type iterator_type = itr->iterator_type;
 
 	*ret = vy_entry_none();
 	assert(itr->search_started);
 
-	/* Check the bloom filter on the first iteration. */
-	bool check_bloom = (itr->iterator_type == ITER_EQ &&
-			    itr->curr.stmt == NULL && bloom != NULL);
-	if (check_bloom && !vy_bloom_maybe_has(bloom, itr->key, itr->key_def)) {
-		vy_run_iterator_stop(itr);
-		itr->stat->bloom_hit++;
-		return 0;
+	/*
+	 * Check the per-block binary fuse filter on the first
+	 * iteration for EQ queries.
+	 */
+	bool check_bloom = false;
+	if (itr->iterator_type == ITER_EQ && itr->curr.stmt == NULL) {
+		int filter_rc = vy_run_bloom_check(slice->run, itr->key,
+						   itr->key_def, cmp_def,
+						   &check_bloom);
+		if (filter_rc < 0)
+			return -1;
+		if (filter_rc > 0) {
+			vy_run_iterator_stop(itr);
+			itr->stat->bloom_hit++;
+			return 0;
+		}
 	}
 
 	/*
@@ -1593,40 +2279,116 @@ vy_run_acct_page(struct vy_run *run, struct vy_page_info *page)
 	run->count.pages++;
 }
 
+/**
+ * Decode the block directory from the VY_RUN_INFO_BLOCK_DIR key
+ * in the run_info header.  The directory is a msgpack array of
+ * [boundary_key, page_count] pairs.
+ *
+ * @param run      Run to populate with block_dir / block_count.
+ * @param data     Pointer to the msgpack array (advanced on return).
+ * @param cmp_def  Key definition for hint computation.
+ * @param filename For error reporting.
+ *
+ * @retval  0 Success.
+ * @retval -1 Error.
+ */
 int
-vy_run_recover(struct vy_run *run, const char *dir,
-	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def)
+vy_block_dir_decode(struct vy_run *run, const char **data,
+		    struct key_def *cmp_def, const char *filename)
+{
+	uint32_t block_count = mp_decode_array(data);
+	if (block_count == 0) {
+		run->block_dir = NULL;
+		run->block_count = 0;
+		return 0;
+	}
+	run->block_dir = calloc(block_count, sizeof(struct vy_index_block_dir));
+	if (run->block_dir == NULL) {
+		diag_set(OutOfMemory,
+			 block_count * sizeof(struct vy_index_block_dir),
+			 "calloc", "struct vy_index_block_dir");
+		return -1;
+	}
+	run->block_count = block_count;
+	uint32_t page_no = 0;
+	for (uint32_t b = 0; b < block_count; b++) {
+		uint32_t arr_size = mp_decode_array(data);
+		if (arr_size < 2) {
+			diag_set(ClientError, ER_INVALID_INDEX_FILE,
+				 filename,
+				 "Invalid block directory entry");
+			return -1;
+		}
+		const char *key_beg = *data;
+		mp_next(data);
+		run->block_dir[b].boundary_key = vy_key_dup(key_beg);
+		if (run->block_dir[b].boundary_key == NULL)
+			return -1;
+		uint32_t part_count = mp_decode_array(&key_beg);
+		run->block_dir[b].boundary_key_hint =
+			key_hint(key_beg, part_count, cmp_def);
+		run->block_dir[b].page_count = mp_decode_uint(data);
+		run->block_dir[b].first_page_no = page_no;
+		page_no += run->block_dir[b].page_count;
+		/* Skip unknown fields for forward compatibility. */
+		for (uint32_t j = 2; j < arr_size; j++)
+			mp_next(data);
+	}
+	return 0;
+}
+
+/**
+ * Load block directory and metadata from a .index2 file.
+ *
+ * Reads the header row (run_info + block directory), then scans
+ * the remaining rows (index blocks) to record their file offsets
+ * in the block directory.  The .index2 file descriptor is kept
+ * open for demand-loading of index blocks.
+ *
+ * If @a decode_run_info is false, run_info is already populated
+ * (e.g. from the writer) and only block_dir is decoded.
+ *
+ * @retval  0 Success — run is populated with block_dir.
+ * @retval -1 Error.
+ * @retval  1 .index2 file not found (caller should rebuild it).
+ */
+static int
+vy_run_load_index2(struct vy_run *run, const char *dir,
+		   uint32_t space_id, uint32_t iid, struct key_def *cmp_def,
+		   bool decode_run_info)
 {
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dir,
-			    space_id, iid, run->id, VY_FILE_INDEX);
+			    space_id, iid, run->id, VY_FILE_INDEX2);
 
 	struct xlog_cursor cursor;
-	ERROR_INJECT_COUNTDOWN(ERRINJ_VY_RUN_RECOVER_COUNTDOWN, {
-		diag_set(ClientError, ER_INJECTION, "vinyl run recover");
+	if (xlog_cursor_open(&cursor, path) != 0) {
+		/*
+		 * .index2 doesn't exist — not an error, just
+		 * means this is a v1 run.
+		 */
+		struct error *e = diag_last_error(diag_get());
+		if (e->type == &type_SystemError && errno == ENOENT)
+			return 1;
 		goto fail;
-	});
-	if (xlog_cursor_open(&cursor, path))
-		goto fail;
+	}
 
 	struct xlog_meta *meta = &cursor.meta;
-	if (strcmp(meta->filetype, XLOG_META_TYPE_INDEX) != 0) {
+	if (strcmp(meta->filetype, XLOG_META_TYPE_INDEX2) != 0) {
 		diag_set(ClientError, ER_INVALID_XLOG_TYPE,
-			 XLOG_META_TYPE_INDEX, meta->filetype);
+			 XLOG_META_TYPE_INDEX2, meta->filetype);
 		goto fail_close;
 	}
 
-	/* Read run header. */
-	struct xrow_header xrow;
-	/* all rows should be in one tx */
+	/* Read the header transaction (first tx). */
 	int rc = xlog_cursor_next_tx(&cursor);
-
 	if (rc != 0) {
 		if (rc > 0)
 			diag_set(ClientError, ER_INVALID_INDEX_FILE,
 				 path, "Unexpected end of file");
 		goto fail_close;
 	}
+	struct xrow_header xrow;
 	rc = xlog_cursor_next_row(&cursor, &xrow);
 	if (rc != 0) {
 		if (rc > 0)
@@ -1634,7 +2396,6 @@ vy_run_recover(struct vy_run *run, const char *dir,
 				 path, "Unexpected end of file");
 		goto fail_close;
 	}
-
 	if (xrow.type != VY_INDEX_RUN_INFO) {
 		diag_set(ClientError, ER_INVALID_INDEX_FILE, path,
 			 tt_sprintf("Wrong xrow type (expected %d, got %u)",
@@ -1642,79 +2403,264 @@ vy_run_recover(struct vy_run *run, const char *dir,
 		goto fail_close;
 	}
 
-	if (vy_run_info_decode(&run->info, &xrow, path) != 0)
-		goto fail_close;
-
-	/* Allocate buffer for page info. */
-	run->page_info = calloc(run->info.page_count,
-				      sizeof(struct vy_page_info));
-	if (run->page_info == NULL) {
-		diag_set(OutOfMemory,
-			 run->info.page_count * sizeof(struct vy_page_info),
-			 "malloc", "struct vy_page_info");
-		goto fail_close;
+	if (decode_run_info) {
+		/*
+		 * Decode run_info.  The standard decoder handles
+		 * all known keys and skips unknown ones, so
+		 * BLOCK_DIR will be silently skipped.  We decode
+		 * it separately below.
+		 */
+		if (vy_run_info_decode(&run->info, &xrow, path) != 0)
+			goto fail_close;
 	}
 
-	for (uint32_t page_no = 0; page_no < run->info.page_count; page_no++) {
-		int rc = xlog_cursor_next_row(&cursor, &xrow);
-		if (rc != 0) {
-			if (rc > 0) {
-				/** To few pages in file */
-				diag_set(ClientError, ER_INVALID_INDEX_FILE,
-					 path, "Unexpected end of file");
+	/*
+	 * Re-scan the header body to find and decode BLOCK_DIR,
+	 * RUN_COUNT, and PAGE_INDEX_SIZE.
+	 */
+	const char *pos = xrow.body->iov_base;
+	uint32_t map_size = mp_decode_map(&pos);
+	for (uint32_t i = 0; i < map_size; i++) {
+		uint32_t key = mp_decode_uint(&pos);
+		if (key == VY_RUN_INFO_BLOCK_DIR) {
+			if (vy_block_dir_decode(run, &pos, cmp_def,
+						path) != 0)
+				goto fail_close;
+		} else if (key == VY_RUN_INFO_RUN_COUNT) {
+			uint32_t cnt_map = mp_decode_map(&pos);
+			for (uint32_t j = 0; j < cnt_map; j++) {
+				uint32_t ckey = mp_decode_uint(&pos);
+				switch (ckey) {
+				case 0:
+					run->count.rows = mp_decode_uint(&pos);
+					break;
+				case 1:
+					run->count.bytes = mp_decode_uint(&pos);
+					break;
+				case 2:
+					run->count.bytes_compressed =
+						mp_decode_uint(&pos);
+					break;
+				case 3:
+					run->count.pages = mp_decode_uint(&pos);
+					break;
+				default:
+					mp_next(&pos);
+					break;
+				}
 			}
-			/*
-			 * Limit the count of pages to
-			 * successfully created pages.
-			 */
-			run->info.page_count = page_no;
-			goto fail_close;
+		} else if (key == VY_RUN_INFO_PAGE_INDEX_SIZE) {
+			run->page_index_size = mp_decode_uint(&pos);
+		} else if (key == VY_RUN_INFO_SKETCH) {
+			uint32_t sketch_size = mp_decode_binl(&pos);
+			if (sketch_size == MINHASH_SIZE) {
+				memcpy(run->info.sketch.values, pos,
+				       MINHASH_SIZE);
+				run->info.has_sketch = true;
+			}
+			pos += sketch_size;
+		} else {
+			mp_next(&pos);
 		}
-		if (xrow.type != VY_INDEX_PAGE_INFO) {
-			diag_set(ClientError, ER_INVALID_INDEX_FILE,
-				 tt_sprintf("Wrong xrow type "
-					    "(expected %d, got %u)",
-					    VY_INDEX_PAGE_INFO,
-					    (unsigned)xrow.type));
-			goto fail_close;
-		}
-		struct vy_page_info *page = run->page_info + page_no;
-		if (vy_page_info_decode(page, &xrow, cmp_def, path) < 0) {
-			/**
-			 * Limit the count of pages to successfully
-			 * created pages
-			 */
-			run->info.page_count = page_no;
-			goto fail_close;
-		}
-		vy_run_acct_page(run, page);
 	}
 
-	/* We don't need to keep metadata file open any longer. */
-	xlog_cursor_close(&cursor, false);
-
-	/* Prepare data file for reading. */
-	vy_run_snprint_path(path, sizeof(path), dir,
-			    space_id, iid, run->id, VY_FILE_RUN);
-	if (xlog_cursor_open(&cursor, path))
-		goto fail;
-	meta = &cursor.meta;
-	if (strcmp(meta->filetype, XLOG_META_TYPE_RUN) != 0) {
-		diag_set(ClientError, ER_INVALID_XLOG_TYPE,
-			 XLOG_META_TYPE_RUN, meta->filetype);
+	if (run->block_dir == NULL) {
+		diag_set(ClientError, ER_INVALID_INDEX_FILE, path,
+			 "Missing block directory");
 		goto fail_close;
 	}
-	run->fd = cursor.fd;
+
+	/*
+	 * Scan the remaining transactions (index blocks) to record
+	 * their file offsets and sizes in the block directory.
+	 * Also extract the fuse8 filter from each block and store
+	 * it in the block_dir entry.  Having the filter in RAM
+	 * allows bloom checks without yielding to load the block
+	 * from disk.
+	 *
+	 * Page info is demand-loaded from .index2 via the index
+	 * cache (TX thread) or via blocking pread (compaction workers).
+	 */
+	for (uint32_t b = 0; b < run->block_count; b++) {
+		uint64_t block_start = xlog_cursor_pos(&cursor);
+		run->block_dir[b].file_offset = block_start;
+		run->block_dir[b].has_filter = false;
+		rc = xlog_cursor_next_tx(&cursor);
+		if (rc != 0) {
+			if (rc > 0)
+				diag_set(ClientError, ER_INVALID_INDEX_FILE,
+					 path, "Unexpected end of file "
+					 "(fewer index blocks than expected)");
+			goto fail_close;
+		}
+		run->block_dir[b].data_size =
+			(uint32_t)(xlog_cursor_pos(&cursor) - block_start);
+		/*
+		 * Read the block row and extract its fuse8 filter.
+		 * Failure is non-fatal: the block will still work
+		 * via demand-loaded page info, just without the
+		 * in-memory bloom optimization.
+		 */
+		struct xrow_header brow;
+		if (xlog_cursor_next_row(&cursor, &brow) != 0)
+			continue;
+		if (brow.type != VY_INDEX_BLOCK)
+			continue;
+		const char *bpos = brow.body->iov_base;
+		if (mp_typeof(*bpos) != MP_MAP)
+			continue;
+		uint32_t map_size = mp_decode_map(&bpos);
+		for (uint32_t k = 0; k < map_size; k++) {
+			uint32_t bkey = mp_decode_uint(&bpos);
+			if (bkey == VY_INDEX_BLOCK_FILTER) {
+				uint32_t fsize = mp_decode_binl(&bpos);
+				if (fsize > 0 &&
+				    binary_fuse8_deserialize(
+					&run->block_dir[b].filter,
+					bpos)) {
+					run->block_dir[b].has_filter = true;
+				}
+				bpos += fsize;
+			} else {
+				mp_next(&bpos);
+			}
+		}
+	}
+
+	/*
+	 * Keep the .index2 fd open for future demand-loading of
+	 * index blocks via pread.
+	 */
+	run->index_fd = cursor.fd;
 	xlog_cursor_close(&cursor, true);
 	return 0;
 
 fail_close:
 	xlog_cursor_close(&cursor, false);
 fail:
-	vy_run_clear(run);
-	diag_log();
-	say_error("failed to load `%s'", path);
+	/*
+	 * Only free resources allocated by this function
+	 * (block_dir).  Do NOT call vy_run_clear() here:
+	 * this function may be called after a successful
+	 * write, in which case the run's page_info, min_key,
+	 * and max_key must be preserved for vy_run_write_index2.
+	 *
+	 * Callers that use this function for recovery
+	 * (vy_run_recover_v2) do their own vy_run_clear()
+	 * on failure.
+	 */
+	if (run->block_dir != NULL) {
+		for (uint32_t i = 0; i < run->block_count; i++) {
+			free(run->block_dir[i].boundary_key);
+			if (run->block_dir[i].has_filter)
+				binary_fuse8_free(&run->block_dir[i].filter);
+		}
+		free(run->block_dir);
+	}
+	run->block_dir = NULL;
+	run->block_count = 0;
 	return -1;
+}
+
+/**
+ * Recover a run from a .index2 file.
+ *
+ * Loads the block directory via vy_run_load_index2(), then opens
+ * the .run data file.
+ *
+ * @retval  0 Success — run is populated with block_dir.
+ * @retval -1 Error.
+ * @retval  1 .index2 file not found (caller should rebuild it).
+ */
+static int
+vy_run_recover_v2(struct vy_run *run, const char *dir,
+		  uint32_t space_id, uint32_t iid, struct key_def *cmp_def)
+{
+	ERROR_INJECT_COUNTDOWN(ERRINJ_VY_RUN_RECOVER_COUNTDOWN, {
+		diag_set(ClientError, ER_INJECTION, "vinyl run recover");
+		return -1;
+	});
+	int rc = vy_run_load_index2(run, dir, space_id, iid, cmp_def,
+				    /*decode_run_info=*/true);
+	if (rc != 0)
+		return rc;
+
+	/* Open the .run data file. */
+	char path[PATH_MAX];
+	vy_run_snprint_path(path, sizeof(path), dir,
+			    space_id, iid, run->id, VY_FILE_RUN);
+	struct xlog_cursor cursor;
+	if (xlog_cursor_open(&cursor, path))
+		goto fail;
+	struct xlog_meta *meta = &cursor.meta;
+	if (strcmp(meta->filetype, XLOG_META_TYPE_RUN) != 0) {
+		diag_set(ClientError, ER_INVALID_XLOG_TYPE,
+			 XLOG_META_TYPE_RUN, meta->filetype);
+		xlog_cursor_close(&cursor, false);
+		goto fail;
+	}
+	run->fd = cursor.fd;
+	xlog_cursor_close(&cursor, true);
+	return 0;
+
+fail:
+	vy_run_clear(run);
+	return -1;
+}
+
+/* Forward declaration — defined further in the file. */
+static int
+vy_run_write_index2(struct vy_run *run, const char *dirpath,
+		    uint32_t space_id, uint32_t iid,
+		    struct vy_block_pds *pds_array);
+
+int
+vy_run_recover(struct vy_run *run, const char *dir,
+	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def,
+	       struct tuple_format *format)
+{
+	int v2rc = vy_run_recover_v2(run, dir, space_id, iid, cmp_def);
+	if (v2rc <= 0)
+		return v2rc; /* 0 = success, -1 = error */
+
+	/*
+	 * .index2 file not found.  Build it by scanning the .run
+	 * data file.  This handles both fresh installations and
+	 * upgrades from the old .index format.
+	 */
+	if (vy_run_rebuild_index(run, dir, space_id, iid,
+				 cmp_def, NULL, format, NULL) != 0) {
+		say_error("failed to rebuild index for run %lld",
+			  (long long)run->id);
+		return -1;
+	}
+
+	/*
+	 * .index2 has been written.  Clear the in-memory state
+	 * and re-recover via the v2 path so that block_dir is
+	 * set up for demand-loading.
+	 *
+	 * Close the fds opened by vy_run_rebuild_index before
+	 * re-recovery opens them again.
+	 */
+	int64_t saved_id = run->id;
+	if (run->fd >= 0) {
+		close(run->fd);
+		run->fd = -1;
+	}
+	if (run->index_fd >= 0) {
+		close(run->index_fd);
+		run->index_fd = -1;
+	}
+	vy_run_clear(run);
+	run->id = saved_id;
+	v2rc = vy_run_recover_v2(run, dir, space_id, iid, cmp_def);
+	if (v2rc != 0) {
+		say_error("failed to recover rebuilt .index2 for "
+			  "run %lld", (long long)saved_id);
+		return -1;
+	}
+	return 0;
 }
 
 /* dump statement to the run page buffers (stmt header and data) */
@@ -1799,75 +2745,6 @@ vy_run_alloc_page_info(struct vy_run *run, uint32_t *page_info_capacity)
 
 /** {{{ vy_page_info */
 
-/**
- * Encode vy_page_info as xrow.
- * Allocates using region_alloc.
- *
- * @param page_info page information to encode
- * @param[out] xrow xrow to fill
- *
- * @retval  0 success
- * @retval -1 error, check diag
- */
-static int
-vy_page_info_encode(const struct vy_page_info *page_info,
-		    struct xrow_header *xrow)
-{
-	struct region *region = &fiber()->gc;
-
-	uint32_t min_key_size;
-	const char *tmp = page_info->min_key;
-	assert(mp_typeof(*tmp) == MP_ARRAY);
-	mp_next(&tmp);
-	min_key_size = tmp - page_info->min_key;
-
-	/* calc tuple size */
-	uint32_t size;
-	/* 3 items: page offset, size, and map */
-	size = mp_sizeof_map(6) +
-	       mp_sizeof_uint(VY_PAGE_INFO_OFFSET) +
-	       mp_sizeof_uint(page_info->offset) +
-	       mp_sizeof_uint(VY_PAGE_INFO_SIZE) +
-	       mp_sizeof_uint(page_info->size) +
-	       mp_sizeof_uint(VY_PAGE_INFO_ROW_COUNT) +
-	       mp_sizeof_uint(page_info->row_count) +
-	       mp_sizeof_uint(VY_PAGE_INFO_MIN_KEY) +
-	       min_key_size +
-	       mp_sizeof_uint(VY_PAGE_INFO_UNPACKED_SIZE) +
-	       mp_sizeof_uint(page_info->unpacked_size) +
-	       mp_sizeof_uint(VY_PAGE_INFO_ROW_INDEX_OFFSET) +
-	       mp_sizeof_uint(page_info->row_index_offset);
-
-	char *pos = region_alloc(region, size);
-	if (pos == NULL) {
-		diag_set(OutOfMemory, size, "region", "page encode");
-		return -1;
-	}
-
-	memset(xrow, 0, sizeof(*xrow));
-	/* encode page */
-	xrow->body->iov_base = pos;
-	pos = mp_encode_map(pos, 6);
-	pos = mp_encode_uint(pos, VY_PAGE_INFO_OFFSET);
-	pos = mp_encode_uint(pos, page_info->offset);
-	pos = mp_encode_uint(pos, VY_PAGE_INFO_SIZE);
-	pos = mp_encode_uint(pos, page_info->size);
-	pos = mp_encode_uint(pos, VY_PAGE_INFO_ROW_COUNT);
-	pos = mp_encode_uint(pos, page_info->row_count);
-	pos = mp_encode_uint(pos, VY_PAGE_INFO_MIN_KEY);
-	memcpy(pos, page_info->min_key, min_key_size);
-	pos += min_key_size;
-	pos = mp_encode_uint(pos, VY_PAGE_INFO_UNPACKED_SIZE);
-	pos = mp_encode_uint(pos, page_info->unpacked_size);
-	pos = mp_encode_uint(pos, VY_PAGE_INFO_ROW_INDEX_OFFSET);
-	pos = mp_encode_uint(pos, page_info->row_index_offset);
-	xrow->body->iov_len = (void *)pos - xrow->body->iov_base;
-	xrow->bodycnt = 1;
-
-	xrow->type = VY_INDEX_PAGE_INFO;
-	return 0;
-}
-
 /** vy_page_info }}} */
 
 /** {{{ vy_run_info */
@@ -1903,20 +2780,21 @@ vy_stmt_stat_encode(const struct vy_stmt_stat *stat, char *buf)
 	return buf;
 }
 
+/* vy_run_info }}} */
+
+/* {{{ .index2 v2 format writer */
+
 /**
- * Encode vy_run_info as xrow
- * Allocates using region alloc
+ * Encode a run_info header for the .index2 format.
  *
- * @param run_info the run information
- * @param xrow xrow to fill.
- *
- * @retval  0 success
- * @retval -1 on error, check diag
+ * The header is the same as vy_run_info_encode() but with an
+ * additional VY_RUN_INFO_BLOCK_DIR key: a msgpack array where
+ * each element is a 2-element array [boundary_key, page_count].
  */
 static int
-vy_run_info_encode(const struct vy_run_info *run_info,
-		   struct xrow_header *xrow)
+vy_run_info_encode_v2(const struct vy_run *run, struct xrow_header *xrow)
 {
+	const struct vy_run_info *run_info = &run->info;
 	const char *tmp;
 	tmp = run_info->min_key;
 	mp_next(&tmp);
@@ -1925,13 +2803,56 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 	mp_next(&tmp);
 	size_t max_key_size = tmp - run_info->max_key;
 
-	uint32_t key_count = 6;
-	uint32_t bloom_key = 0;
-	if (run_info->bloom != NULL) {
-		key_count++;
-		bloom_key = tuple_bloom_version_to_iproto(
-			run_info->bloom->version);
+	/*
+	 * Build the block directory: an array of [boundary_key, page_count]
+	 * pairs.  Compute boundary keys and page counts from the in-memory
+	 * page_info array.
+	 */
+	uint32_t block_count = (run_info->page_count +
+				VY_INDEX_BLOCK_SIZE - 1) / VY_INDEX_BLOCK_SIZE;
+
+	/* Compute sizes of boundary keys. */
+	size_t *bkey_sizes = NULL;
+	if (block_count > 0) {
+		bkey_sizes = region_alloc(&fiber()->gc,
+					  block_count * sizeof(size_t));
+		if (bkey_sizes == NULL) {
+			diag_set(OutOfMemory, block_count * sizeof(size_t),
+				 "region", "bkey_sizes");
+			return -1;
+		}
 	}
+
+	size_t block_dir_data_size = mp_sizeof_array(block_count);
+	for (uint32_t b = 0; b < block_count; b++) {
+		uint32_t first_page = b * VY_INDEX_BLOCK_SIZE;
+		const struct vy_page_info *pi = &run->page_info[first_page];
+		tmp = pi->min_key;
+		mp_next(&tmp);
+		bkey_sizes[b] = tmp - pi->min_key;
+		uint32_t pages_in_block;
+		if (b < block_count - 1)
+			pages_in_block = VY_INDEX_BLOCK_SIZE;
+		else
+			pages_in_block = run_info->page_count -
+					 first_page;
+		block_dir_data_size += mp_sizeof_array(2) +
+				       bkey_sizes[b] +
+				       mp_sizeof_uint(pages_in_block);
+	}
+
+	uint32_t key_count = 9; /* 6 base + block_dir + run_count + page_index_size */
+	if (run_info->has_sketch)
+		key_count++;
+
+	/*
+	 * Compute RUN_COUNT map size: {rows, bytes, bytes_compressed, pages}
+	 */
+	size_t run_count_size = mp_sizeof_map(4) +
+		mp_sizeof_uint(0) + mp_sizeof_uint(run->count.rows) +
+		mp_sizeof_uint(1) + mp_sizeof_uint(run->count.bytes) +
+		mp_sizeof_uint(2) + mp_sizeof_uint(run->count.bytes_compressed) +
+		mp_sizeof_uint(3) + mp_sizeof_uint(run->count.pages);
 
 	size_t size = mp_sizeof_map(key_count);
 	size += mp_sizeof_uint(VY_RUN_INFO_MIN_KEY) + min_key_size;
@@ -1942,63 +2863,255 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 		mp_sizeof_uint(run_info->max_lsn);
 	size += mp_sizeof_uint(VY_RUN_INFO_PAGE_COUNT) +
 		mp_sizeof_uint(run_info->page_count);
-	if (run_info->bloom != NULL)
-		size += mp_sizeof_uint(bloom_key) +
-			tuple_bloom_size(run_info->bloom);
 	size += mp_sizeof_uint(VY_RUN_INFO_STMT_STAT) +
 		vy_stmt_stat_sizeof(&run_info->stmt_stat);
+	size += mp_sizeof_uint(VY_RUN_INFO_BLOCK_DIR) + block_dir_data_size;
+	size += mp_sizeof_uint(VY_RUN_INFO_RUN_COUNT) + run_count_size;
+	size += mp_sizeof_uint(VY_RUN_INFO_PAGE_INDEX_SIZE) +
+		mp_sizeof_uint(run->page_index_size);
+	if (run_info->has_sketch)
+		size += mp_sizeof_uint(VY_RUN_INFO_SKETCH) +
+			mp_sizeof_bin(MINHASH_SIZE);
 
 	char *pos = region_alloc(&fiber()->gc, size);
 	if (pos == NULL) {
-		diag_set(OutOfMemory, size, "region", "run encode");
+		diag_set(OutOfMemory, size, "region", "run info v2 encode");
 		return -1;
 	}
 	memset(xrow, 0, sizeof(*xrow));
 	xrow->body->iov_base = pos;
-	/* encode values */
+
 	pos = mp_encode_map(pos, key_count);
+
 	pos = mp_encode_uint(pos, VY_RUN_INFO_MIN_KEY);
 	memcpy(pos, run_info->min_key, min_key_size);
 	pos += min_key_size;
+
 	pos = mp_encode_uint(pos, VY_RUN_INFO_MAX_KEY);
 	memcpy(pos, run_info->max_key, max_key_size);
 	pos += max_key_size;
+
 	pos = mp_encode_uint(pos, VY_RUN_INFO_MIN_LSN);
 	pos = mp_encode_uint(pos, run_info->min_lsn);
+
 	pos = mp_encode_uint(pos, VY_RUN_INFO_MAX_LSN);
 	pos = mp_encode_uint(pos, run_info->max_lsn);
+
 	pos = mp_encode_uint(pos, VY_RUN_INFO_PAGE_COUNT);
 	pos = mp_encode_uint(pos, run_info->page_count);
-	if (run_info->bloom != NULL) {
-		pos = mp_encode_uint(pos, bloom_key);
-		pos = tuple_bloom_encode(run_info->bloom, pos);
-	}
+
+
 	pos = mp_encode_uint(pos, VY_RUN_INFO_STMT_STAT);
 	pos = vy_stmt_stat_encode(&run_info->stmt_stat, pos);
+
+	/* Encode block directory. */
+	pos = mp_encode_uint(pos, VY_RUN_INFO_BLOCK_DIR);
+	pos = mp_encode_array(pos, block_count);
+	for (uint32_t b = 0; b < block_count; b++) {
+		uint32_t first_page = b * VY_INDEX_BLOCK_SIZE;
+		const struct vy_page_info *pi = &run->page_info[first_page];
+		uint32_t pages_in_block;
+		if (b < block_count - 1)
+			pages_in_block = VY_INDEX_BLOCK_SIZE;
+		else
+			pages_in_block = run_info->page_count - first_page;
+		pos = mp_encode_array(pos, 2);
+		memcpy(pos, pi->min_key, bkey_sizes[b]);
+		pos += bkey_sizes[b];
+		pos = mp_encode_uint(pos, pages_in_block);
+	}
+
+	/* Encode aggregate run count. */
+	pos = mp_encode_uint(pos, VY_RUN_INFO_RUN_COUNT);
+	pos = mp_encode_map(pos, 4);
+	pos = mp_encode_uint(pos, 0);
+	pos = mp_encode_uint(pos, run->count.rows);
+	pos = mp_encode_uint(pos, 1);
+	pos = mp_encode_uint(pos, run->count.bytes);
+	pos = mp_encode_uint(pos, 2);
+	pos = mp_encode_uint(pos, run->count.bytes_compressed);
+	pos = mp_encode_uint(pos, 3);
+	pos = mp_encode_uint(pos, run->count.pages);
+
+	/* Encode page_index_size. */
+	pos = mp_encode_uint(pos, VY_RUN_INFO_PAGE_INDEX_SIZE);
+	pos = mp_encode_uint(pos, run->page_index_size);
+
+	/* Encode run-level MinHash sketch. */
+	if (run_info->has_sketch) {
+		pos = mp_encode_uint(pos, VY_RUN_INFO_SKETCH);
+		pos = mp_encode_binl(pos, MINHASH_SIZE);
+		memcpy(pos, run_info->sketch.values, MINHASH_SIZE);
+		pos += MINHASH_SIZE;
+	}
+
 	xrow->body->iov_len = (void *)pos - xrow->body->iov_base;
 	xrow->bodycnt = 1;
 	xrow->type = VY_INDEX_RUN_INFO;
 	return 0;
 }
 
-/* vy_run_info }}} */
-
 /**
- * Write run index to file.
+ * Encode a single index block as a msgpack map.
+ *
+ * The map has the following keys:
+ *   VY_INDEX_BLOCK_PAGE_INFO  → array of page_info maps
+ *   VY_INDEX_BLOCK_FILTER → binary fuse8 filter blob (if available)
+ *   VY_INDEX_BLOCK_SKETCH → MinHash sketch blob (if available)
+ *
+ * @param run       Run whose page_info array to read from.
+ * @param first     Global page number of the first page in the block.
+ * @param count     Number of pages in this block.
+ * @param pds       Per-block PDS, or NULL if not available.
+ * @param[out] xrow Xrow header to fill in.
+ *
+ * @retval  0 Success.
+ * @retval -1 Error.
  */
 static int
-vy_run_write_index(struct vy_run *run, const char *dirpath,
-		   uint32_t space_id, uint32_t iid)
+vy_index_block_encode(struct vy_run *run, uint32_t first, uint32_t count,
+		      struct vy_block_pds *pds, struct xrow_header *xrow)
+{
+	struct region *region = &fiber()->gc;
+
+	/*
+	 * First pass: compute the total size of the pages array.
+	 */
+	size_t pages_size = mp_sizeof_array(count);
+	for (uint32_t i = 0; i < count; i++) {
+		struct vy_page_info *pi = vy_run_page_info(run, first + i);
+		const char *tmp = pi->min_key;
+		mp_next(&tmp);
+		size_t min_key_size = tmp - pi->min_key;
+		pages_size += mp_sizeof_map(6) +
+			mp_sizeof_uint(VY_PAGE_INFO_OFFSET) +
+			mp_sizeof_uint(pi->offset) +
+			mp_sizeof_uint(VY_PAGE_INFO_SIZE) +
+			mp_sizeof_uint(pi->size) +
+			mp_sizeof_uint(VY_PAGE_INFO_ROW_COUNT) +
+			mp_sizeof_uint(pi->row_count) +
+			mp_sizeof_uint(VY_PAGE_INFO_MIN_KEY) +
+			min_key_size +
+			mp_sizeof_uint(VY_PAGE_INFO_UNPACKED_SIZE) +
+			mp_sizeof_uint(pi->unpacked_size) +
+			mp_sizeof_uint(VY_PAGE_INFO_ROW_INDEX_OFFSET) +
+			mp_sizeof_uint(pi->row_index_offset);
+	}
+
+	/* Compute filter and sketch blob sizes. */
+	size_t filter_blob_size = 0;
+	size_t sketch_blob_size = 0;
+	uint32_t map_keys = 1; /* at least PAGES */
+	if (pds != NULL && pds->has_filter) {
+		filter_blob_size =
+			binary_fuse8_serialization_bytes(&pds->filter);
+		map_keys++;
+	}
+	if (pds != NULL && !minhash_is_empty(&pds->sketch)) {
+		sketch_blob_size = MINHASH_SIZE;
+		map_keys++;
+	}
+
+	/* Total size: outer map + pages key/val + filter key/val + sketch key/val */
+	size_t total_size = mp_sizeof_map(map_keys);
+	total_size += mp_sizeof_uint(VY_INDEX_BLOCK_PAGE_INFO) + pages_size;
+	if (filter_blob_size > 0)
+		total_size += mp_sizeof_uint(VY_INDEX_BLOCK_FILTER) +
+			      mp_sizeof_bin(filter_blob_size);
+	if (sketch_blob_size > 0)
+		total_size += mp_sizeof_uint(VY_INDEX_BLOCK_SKETCH) +
+			      mp_sizeof_bin(sketch_blob_size);
+
+	char *buf = region_alloc(region, total_size);
+	if (buf == NULL) {
+		diag_set(OutOfMemory, total_size, "region",
+			 "index block encode");
+		return -1;
+	}
+
+	char *pos = buf;
+	pos = mp_encode_map(pos, map_keys);
+
+	/* Encode pages array. */
+	pos = mp_encode_uint(pos, VY_INDEX_BLOCK_PAGE_INFO);
+	pos = mp_encode_array(pos, count);
+	for (uint32_t i = 0; i < count; i++) {
+		struct vy_page_info *pi = vy_run_page_info(run, first + i);
+		const char *tmp = pi->min_key;
+		mp_next(&tmp);
+		size_t min_key_size = tmp - pi->min_key;
+
+		pos = mp_encode_map(pos, 6);
+		pos = mp_encode_uint(pos, VY_PAGE_INFO_OFFSET);
+		pos = mp_encode_uint(pos, pi->offset);
+		pos = mp_encode_uint(pos, VY_PAGE_INFO_SIZE);
+		pos = mp_encode_uint(pos, pi->size);
+		pos = mp_encode_uint(pos, VY_PAGE_INFO_ROW_COUNT);
+		pos = mp_encode_uint(pos, pi->row_count);
+		pos = mp_encode_uint(pos, VY_PAGE_INFO_MIN_KEY);
+		memcpy(pos, pi->min_key, min_key_size);
+		pos += min_key_size;
+		pos = mp_encode_uint(pos, VY_PAGE_INFO_UNPACKED_SIZE);
+		pos = mp_encode_uint(pos, pi->unpacked_size);
+		pos = mp_encode_uint(pos, VY_PAGE_INFO_ROW_INDEX_OFFSET);
+		pos = mp_encode_uint(pos, pi->row_index_offset);
+	}
+
+	/* Encode filter blob. */
+	if (filter_blob_size > 0) {
+		pos = mp_encode_uint(pos, VY_INDEX_BLOCK_FILTER);
+		pos = mp_encode_binl(pos, filter_blob_size);
+		binary_fuse8_serialize(&pds->filter, pos);
+		pos += filter_blob_size;
+	}
+
+	/* Encode sketch blob. */
+	if (sketch_blob_size > 0) {
+		pos = mp_encode_uint(pos, VY_INDEX_BLOCK_SKETCH);
+		pos = mp_encode_binl(pos, sketch_blob_size);
+		memcpy(pos, pds->sketch.values, sketch_blob_size);
+		pos += sketch_blob_size;
+	}
+
+	assert((size_t)(pos - buf) == total_size);
+
+	memset(xrow, 0, sizeof(*xrow));
+	xrow->body->iov_base = buf;
+	xrow->body->iov_len = total_size;
+	xrow->bodycnt = 1;
+	xrow->type = VY_INDEX_BLOCK;
+	return 0;
+}
+
+/**
+ * Write a .index2 file for the given run.
+ *
+ * The file contains:
+ *   - Row 0 (header): run_info + block directory
+ *   - Rows 1..K: index blocks (each is a batch of page_info entries)
+ *
+ * The header row is written as a standalone xlog transaction, followed
+ * by one transaction per index block.  Each transaction has its own
+ * CRC, enabling independent validation on demand-load.
+ *
+ * @param pds_array  Optional array of per-block PDS data.  If non-NULL,
+ *                   must have at least block_count elements.  If NULL,
+ *                   blocks are written without filter/sketch data.
+ */
+static int
+vy_run_write_index2(struct vy_run *run, const char *dirpath,
+		    uint32_t space_id, uint32_t iid,
+		    struct vy_block_pds *pds_array)
 {
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dirpath,
-			    space_id, iid, run->id, VY_FILE_INDEX);
+			    space_id, iid, run->id, VY_FILE_INDEX2);
 
 	say_info("writing `%s'", path);
 
 	struct xlog index_xlog;
 	struct xlog_meta meta;
-	xlog_meta_create(&meta, XLOG_META_TYPE_INDEX, &INSTANCE_UUID,
+	xlog_meta_create(&meta, XLOG_META_TYPE_INDEX2, &INSTANCE_UUID,
 			 NULL, NULL);
 	struct xlog_opts opts = xlog_opts_default;
 	opts.rate_limit = run->env->snap_io_rate_limit;
@@ -2006,49 +3119,69 @@ vy_run_write_index(struct vy_run *run, const char *dirpath,
 	if (xlog_create(&index_xlog, path, 0, &meta, &opts) < 0)
 		return -1;
 
-	xlog_tx_begin(&index_xlog);
 	struct region *region = &fiber()->gc;
-	size_t mem_used = region_used(region);
-
+	size_t region_svp = region_used(region);
 	struct xrow_header xrow;
-	if (vy_run_info_encode(&run->info, &xrow) != 0 ||
+
+	/* Write the header row (run_info + block directory). */
+	xlog_tx_begin(&index_xlog);
+	if (vy_run_info_encode_v2(run, &xrow) != 0 ||
 	    xlog_write_row(&index_xlog, &xrow) < 0)
 		goto fail_rollback;
+	region_truncate(region, region_svp);
+	if (xlog_tx_commit(&index_xlog) < 0 ||
+	    xlog_flush(&index_xlog) < 0)
+		goto fail;
 
-	for (uint32_t page_no = 0; page_no < run->info.page_count; ++page_no) {
-		struct vy_page_info *page_info = vy_run_page_info(run, page_no);
-		if (vy_page_info_encode(page_info, &xrow) < 0) {
+	/* Write index blocks, one transaction per block. */
+	uint32_t block_count = (run->info.page_count +
+				VY_INDEX_BLOCK_SIZE - 1) / VY_INDEX_BLOCK_SIZE;
+	for (uint32_t b = 0; b < block_count; b++) {
+		uint32_t first_page = b * VY_INDEX_BLOCK_SIZE;
+		uint32_t pages_in_block;
+		if (b < block_count - 1)
+			pages_in_block = VY_INDEX_BLOCK_SIZE;
+		else
+			pages_in_block = run->info.page_count - first_page;
+
+		struct vy_block_pds *pds = pds_array != NULL ?
+					   &pds_array[b] : NULL;
+		xlog_tx_begin(&index_xlog);
+		if (vy_index_block_encode(run, first_page, pages_in_block,
+					  pds, &xrow) != 0 ||
+		    xlog_write_row(&index_xlog, &xrow) < 0)
 			goto fail_rollback;
-		}
-		if (xlog_write_row(&index_xlog, &xrow) < 0)
-			goto fail_rollback;
+		region_truncate(region, region_svp);
+		if (xlog_tx_commit(&index_xlog) < 0 ||
+		    xlog_flush(&index_xlog) < 0)
+			goto fail;
 	}
 
-	region_truncate(region, mem_used);
-	if (xlog_tx_commit(&index_xlog) < 0)
+	if (xlog_flush(&index_xlog) < 0)
 		goto fail;
 
 	ERROR_INJECT(ERRINJ_VY_INDEX_FILE_RENAME, {
-		diag_set(ClientError, ER_INJECTION, "vinyl index file rename");
-		xlog_close(&index_xlog, false);
-		return -1;
+		diag_set(ClientError, ER_INJECTION,
+			 "vinyl index file rename");
+		goto fail;
 	});
 
-	if (xlog_flush(&index_xlog) < 0 ||
-	    xlog_rename(&index_xlog) < 0)
+	if (xlog_rename(&index_xlog) < 0)
 		goto fail;
 
 	xlog_close(&index_xlog, false);
 	return 0;
 
 fail_rollback:
-	region_truncate(region, mem_used);
+	region_truncate(region, region_svp);
 	xlog_tx_rollback(&index_xlog);
 fail:
 	xlog_close(&index_xlog, false);
 	unlink(path);
 	return -1;
 }
+
+/* .index2 v2 format writer }}} */
 
 int
 vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
@@ -2064,17 +3197,14 @@ vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 	writer->cmp_def = cmp_def;
 	writer->key_def = key_def;
 	writer->index_opts = *index_opts;
-	if (writer->index_opts.bloom_fpr < 1) {
-		writer->bloom = tuple_bloom_builder_new(key_def->part_count);
-		if (writer->bloom == NULL)
-			return -1;
-	}
 	xlog_clear(&writer->data_xlog);
 	ibuf_create(&writer->row_index_buf, &cord()->slabc,
 		    4096 * sizeof(uint32_t));
 	run->info.min_lsn = INT64_MAX;
 	run->info.max_lsn = -1;
 	assert(run->page_info == NULL);
+	/* Initialize per-block PDS accumulator. */
+	minhash_create(&writer->block_sketch);
 	return 0;
 }
 
@@ -2104,6 +3234,10 @@ vy_run_writer_create_xlog(struct vy_run_writer *writer)
 		return -1;
 	return 0;
 }
+
+/* Forward declaration. */
+static int
+vy_run_writer_finalize_block_pds(struct vy_run_writer *writer);
 
 /**
  * Start a new page with a min_key stored in @a first_entry.
@@ -2137,6 +3271,19 @@ vy_run_writer_start_page(struct vy_run_writer *writer,
 	vy_page_info_create(page, writer->data_xlog.offset, key,
 			    writer->cmp_def);
 	run->info.page_count++;
+
+	/*
+	 * Check if we've just crossed an index block boundary.
+	 * When page_count reaches a multiple of VY_INDEX_BLOCK_SIZE
+	 * (and it's not the very first page), the previous block
+	 * is complete and we can finalize its PDS.
+	 */
+	if (run->info.page_count > 1 &&
+	    (run->info.page_count - 1) % VY_INDEX_BLOCK_SIZE == 0) {
+		if (vy_run_writer_finalize_block_pds(writer) != 0)
+			return -1;
+	}
+
 	xlog_tx_begin(&writer->data_xlog);
 	return 0;
 }
@@ -2149,11 +3296,103 @@ vy_run_writer_start_page(struct vy_run_writer *writer,
  * @retval -1 Memory or IO error.
  * @retval  0 Success.
  */
+/**
+ * Accumulate a 64-bit key hash for the current block's
+ * binary fuse filter and MinHash sketch.
+ */
+static int
+vy_run_writer_hash_stmt(struct vy_run_writer *writer, struct vy_entry entry)
+{
+	uint64_t h = vy_stmt_hash64(entry, writer->key_def);
+	/* Grow the hash accumulator if needed. */
+	if (writer->block_hash_count >= writer->block_hash_cap) {
+		uint32_t new_cap = writer->block_hash_cap == 0 ?
+				   4096 : writer->block_hash_cap * 2;
+		uint64_t *new_buf = realloc(writer->block_hashes,
+					    new_cap * sizeof(uint64_t));
+		if (new_buf == NULL) {
+			diag_set(OutOfMemory,
+				 new_cap * sizeof(uint64_t),
+				 "realloc", "block_hashes");
+			return -1;
+		}
+		writer->block_hashes = new_buf;
+		writer->block_hash_cap = new_cap;
+	}
+	writer->block_hashes[writer->block_hash_count++] = h;
+	minhash_add(&writer->block_sketch, h);
+	return 0;
+}
+
+/**
+ * Finalize the PDS for the current index block: build a binary
+ * fuse8 filter from the accumulated hashes, store the sketch,
+ * and reset the accumulators for the next block.
+ */
+static int
+vy_run_writer_finalize_block_pds(struct vy_run_writer *writer)
+{
+	/* Grow the block_pds array if needed. */
+	if (writer->block_pds_count >= writer->block_pds_cap) {
+		uint32_t new_cap = writer->block_pds_cap == 0 ?
+				   16 : writer->block_pds_cap * 2;
+		struct vy_block_pds *new_buf = realloc(
+			writer->block_pds,
+			new_cap * sizeof(struct vy_block_pds));
+		if (new_buf == NULL) {
+			diag_set(OutOfMemory,
+				 new_cap * sizeof(struct vy_block_pds),
+				 "realloc", "block_pds");
+			return -1;
+		}
+		writer->block_pds = new_buf;
+		writer->block_pds_cap = new_cap;
+	}
+
+	struct vy_block_pds *pds =
+		&writer->block_pds[writer->block_pds_count];
+	memset(pds, 0, sizeof(*pds));
+
+	/*
+	 * Build binary fuse8 filter.  binary_fuse8_populate
+	 * requires at least 2 keys to build a filter.
+	 */
+	if (writer->block_hash_count > 1) {
+		if (!binary_fuse8_allocate(writer->block_hash_count,
+					    &pds->filter)) {
+			/*
+			 * Allocation failure is not fatal — we simply
+			 * skip the filter for this block.
+			 */
+			pds->has_filter = false;
+		} else {
+			if (binary_fuse8_populate(writer->block_hashes,
+						   writer->block_hash_count,
+						  &pds->filter)) {
+				pds->has_filter = true;
+			} else {
+				binary_fuse8_free(&pds->filter);
+				pds->has_filter = false;
+			}
+		}
+	}
+
+	/* Copy the MinHash sketch. */
+	pds->sketch = writer->block_sketch;
+
+	writer->block_pds_count++;
+
+	/* Reset accumulators for the next block. */
+	writer->block_hash_count = 0;
+	minhash_create(&writer->block_sketch);
+
+	return 0;
+}
+
 static int
 vy_run_writer_write_to_page(struct vy_run_writer *writer, struct vy_entry entry)
 {
-	if (writer->bloom != NULL &&
-	    vy_bloom_builder_add(writer->bloom, entry, writer->key_def) != 0)
+	if (vy_run_writer_hash_stmt(writer, entry) != 0)
 		return -1;
 	if (writer->last.stmt != NULL)
 		vy_stmt_unref_if_possible(writer->last.stmt);
@@ -2252,9 +3491,18 @@ vy_run_writer_destroy(struct vy_run_writer *writer, bool reuse_fd)
 		vy_stmt_unref_if_possible(writer->last.stmt);
 	if (xlog_is_open(&writer->data_xlog))
 		xlog_close(&writer->data_xlog, reuse_fd);
-	if (writer->bloom != NULL)
-		tuple_bloom_builder_delete(writer->bloom);
 	ibuf_destroy(&writer->row_index_buf);
+	/* Free PDS accumulators. */
+	free(writer->block_hashes);
+	writer->block_hashes = NULL;
+	if (writer->block_pds != NULL) {
+		for (uint32_t i = 0; i < writer->block_pds_count; i++) {
+			if (writer->block_pds[i].has_filter)
+				binary_fuse8_free(&writer->block_pds[i].filter);
+		}
+		free(writer->block_pds);
+		writer->block_pds = NULL;
+	}
 }
 
 int
@@ -2297,9 +3545,28 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 	    xlog_rename(&writer->data_xlog) < 0)
 		goto out;
 
-	if (writer->bloom != NULL)
-		run->info.bloom = tuple_bloom_new(writer->bloom,
-						  writer->index_opts.bloom_fpr);
+	/*
+	 * Finalize the last index block's PDS (the block that was
+	 * being accumulated when we ran out of pages).
+	 */
+	if (writer->block_hash_count > 0) {
+		if (vy_run_writer_finalize_block_pds(writer) != 0)
+			goto out;
+	}
+
+	/*
+	 * Merge all block sketches into a run-level sketch for
+	 * use in compaction overlap estimation.
+	 */
+	minhash_create(&run->info.sketch);
+	run->info.has_sketch = false;
+	for (uint32_t i = 0; i < writer->block_pds_count; i++) {
+		if (!minhash_is_empty(&writer->block_pds[i].sketch)) {
+			minhash_merge(&run->info.sketch,
+				      &writer->block_pds[i].sketch);
+			run->info.has_sketch = true;
+		}
+	}
 
 	/* Shrink to fit actual size. */
 	uint32_t page_count = run->info.page_count;
@@ -2310,9 +3577,31 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 		writer->page_info_capacity = page_count;
 	}
 
-	if (vy_run_write_index(run, writer->dirpath,
-			       writer->space_id, writer->iid) != 0)
+	if (vy_run_write_index2(run, writer->dirpath,
+				writer->space_id, writer->iid,
+				writer->block_pds) != 0)
 		goto out;
+
+	/*
+	 * Load the freshly-written .index2 to populate block_dir.
+	 * This must succeed — if it doesn't, the entire dump or
+	 * compaction is considered failed, and the .run and .index2
+	 * files will be garbage-collected.
+	 *
+	 * N.B.: must happen before vy_run_writer_destroy so that
+	 * on failure the caller can call vy_run_writer_abort.
+	 */
+	if (vy_run_load_index2(run, writer->dirpath, writer->space_id,
+			       writer->iid, writer->cmp_def,
+			       /*decode_run_info=*/false) != 0)
+		goto out;
+
+	/*
+	 * Free the in-memory page_info since pages are now
+	 * demand-loaded from .index2 (or served from cache).
+	 */
+	free(run->page_info);
+	run->page_info = NULL;
 
 	run->fd = writer->data_xlog.fd;
 	vy_run_writer_destroy(writer, true);
@@ -2334,7 +3623,8 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		     struct key_def *cmp_def, struct key_def *key_def,
 		     struct tuple_format *format, const struct index_opts *opts)
 {
-	assert(run->info.bloom == NULL);
+	(void)key_def;
+	(void)opts;
 	assert(run->page_info == NULL);
 	struct region *region = &fiber()->gc;
 	size_t mem_used = region_used(region);
@@ -2356,13 +3646,6 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	int64_t min_lsn = INT64_MAX;
 	struct tuple *prev_tuple = NULL;
 	char *page_min_key = NULL;
-
-	struct tuple_bloom_builder *bloom_builder = NULL;
-	if (opts->bloom_fpr < 1) {
-		bloom_builder = tuple_bloom_builder_new(key_def->part_count);
-		if (bloom_builder == NULL)
-			goto close_err;
-	}
 
 	off_t page_offset, next_page_offset = xlog_cursor_pos(&cursor);
 	while ((rc = xlog_cursor_next_tx(&cursor)) == 0) {
@@ -2388,14 +3671,6 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 			struct tuple *tuple = vy_stmt_decode(&xrow, format);
 			if (tuple == NULL)
 				goto close_err;
-			if (bloom_builder != NULL) {
-				struct vy_entry entry = {tuple, HINT_NONE};
-				if (vy_bloom_builder_add(bloom_builder, entry,
-							 key_def) != 0) {
-					tuple_unref(tuple);
-					goto close_err;
-				}
-			}
 			key = vy_stmt_is_key(tuple) ? tuple_data(tuple) :
 			      tuple_extract_key(tuple, cmp_def,
 						MULTIKEY_NONE, NULL);
@@ -2441,18 +3716,14 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	run->fd = cursor.fd;
 	xlog_cursor_close(&cursor, true);
 
-	if (bloom_builder != NULL) {
-		run->info.bloom = tuple_bloom_new(bloom_builder,
-						  opts->bloom_fpr);
-		tuple_bloom_builder_delete(bloom_builder);
-		bloom_builder = NULL;
-	}
-
-	/* New run index is ready for write, unlink old file if exists */
+	/* New run index is ready for write, unlink old files if exist */
 	vy_run_snprint_path(path, sizeof(path), dir,
 			    space_id, iid, run->id, VY_FILE_INDEX);
 	xlog_remove_file(path, 0);
-	if (vy_run_write_index(run, dir, space_id, iid) != 0)
+	vy_run_snprint_path(path, sizeof(path), dir,
+			    space_id, iid, run->id, VY_FILE_INDEX2);
+	xlog_remove_file(path, 0);
+	if (vy_run_write_index2(run, dir, space_id, iid, NULL) != 0)
 		goto close_err;
 	return 0;
 close_err:
@@ -2462,8 +3733,6 @@ close_err:
 		tuple_unref(prev_tuple);
 	if (page_min_key != NULL)
 		free(page_min_key);
-	if (bloom_builder != NULL)
-		tuple_bloom_builder_delete(bloom_builder);
 	if (xlog_cursor_is_open(&cursor))
 		xlog_cursor_close(&cursor, false);
 	return -1;
@@ -2526,23 +3795,130 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
 	return coio_call(vy_run_remove_files_f, dir, space_id, iid, run_id);
 }
 
+/* ----------------------------------------------------------------
+ * vy_compaction_stream — v2 compaction iterator for worker threads
+ * ---------------------------------------------------------------- */
+
+
 /**
- * Read a page with stream->page_no from the run and save it in stream->page.
- * Support function of slice stream.
- * @param stream - the stream.
- * @return 0 on success, -1 of memory or read error (diag is set).
+ * Free the locally cached index block.
  */
-static NODISCARD int
-vy_slice_stream_read_page(struct vy_slice_stream *stream)
+static void
+vy_compaction_stream_free_block(struct vy_compaction_stream *stream)
+{
+	if (stream->block_pages != NULL) {
+		for (uint32_t i = 0; i < stream->block_page_count; i++) {
+			if (stream->block_pages[i].min_key != NULL)
+				free(stream->block_pages[i].min_key);
+		}
+		free(stream->block_pages);
+		stream->block_pages = NULL;
+		stream->block_page_count = 0;
+	}
+}
+
+/**
+ * Load the index block containing @a page_no from the .index2 file
+ * via blocking pread (safe on a worker thread).
+ */
+static int
+vy_compaction_stream_load_block(struct vy_compaction_stream *stream,
+				uint32_t page_no)
 {
 	struct vy_run *run = stream->slice->run;
+	assert(run->block_dir != NULL);
 
+	uint32_t block_no = page_no / VY_INDEX_BLOCK_SIZE;
+	if (block_no >= run->block_count)
+		block_no = run->block_count - 1;
+	struct vy_index_block_dir *dir = &run->block_dir[block_no];
+
+	vy_compaction_stream_free_block(stream);
+
+	size_t region_svp = region_used(&fiber()->gc);
+	struct xlog_tx_cursor tx_cursor;
+	struct xrow_header xrow;
+	if (vy_index_block_read_xrow(run->index_fd, dir->file_offset,
+				      dir->data_size, run->env,
+				      &tx_cursor, &xrow) != 0)
+		goto err;
+
+	/*
+	 * v2 index blocks are encoded as a map:
+	 *   { VY_INDEX_BLOCK_PAGE_INFO: [page_info, ...], ... }
+	 * Decode the outer map and find the pages array.
+	 */
+	const char *bpos = xrow.body->iov_base;
+	uint32_t map_size = mp_decode_map(&bpos);
+	const char *pages_data = NULL;
+	for (uint32_t m = 0; m < map_size; m++) {
+		uint32_t key = mp_decode_uint(&bpos);
+		if (key == VY_INDEX_BLOCK_PAGE_INFO)
+			pages_data = bpos;
+		mp_next(&bpos);
+	}
+	if (pages_data == NULL) {
+		diag_set(ClientError, ER_INVALID_INDEX_FILE,
+			 "Missing PAGES key in index block");
+		xlog_tx_cursor_destroy(&tx_cursor);
+		goto err;
+	}
+
+	struct vy_page_info *pages;
+	uint32_t arr_count;
+	if (vy_index_block_decode_pages(pages_data, stream->cmp_def,
+					 &pages, &arr_count, NULL) != 0) {
+		xlog_tx_cursor_destroy(&tx_cursor);
+		goto err;
+	}
+
+	xlog_tx_cursor_destroy(&tx_cursor);
+	region_truncate(&fiber()->gc, region_svp);
+
+	stream->block_pages = pages;
+	stream->block_page_count = arr_count;
+	stream->block_first_page_no = dir->first_page_no;
+	return 0;
+err:
+	region_truncate(&fiber()->gc, region_svp);
+	return -1;
+}
+
+/**
+ * Get page_info for a given page number from the stream's
+ * locally cached block, loading it if necessary.
+ */
+static struct vy_page_info *
+vy_compaction_stream_page_info(struct vy_compaction_stream *stream,
+			       uint32_t page_no)
+{
+	if (stream->block_pages == NULL ||
+	    page_no < stream->block_first_page_no ||
+	    page_no >= stream->block_first_page_no +
+		       stream->block_page_count) {
+		if (vy_compaction_stream_load_block(stream, page_no) != 0)
+			return NULL;
+	}
+	uint32_t local = page_no - stream->block_first_page_no;
+	assert(local < stream->block_page_count);
+	return &stream->block_pages[local];
+}
+
+static NODISCARD int
+vy_compaction_stream_read_page(struct vy_compaction_stream *stream)
+{
+	struct vy_run *run = stream->slice->run;
 	assert(stream->page == NULL);
+
 	ZSTD_DStream *zdctx = vy_env_get_zdctx(run->env);
 	if (zdctx == NULL)
 		return -1;
 
-	struct vy_page_info *page_info = vy_run_page_info(run, stream->page_no);
+	struct vy_page_info *page_info =
+		vy_compaction_stream_page_info(stream, stream->page_no);
+	if (page_info == NULL)
+		return -1;
+
 	stream->page = vy_page_new(page_info);
 	if (stream->page == NULL)
 		return -1;
@@ -2555,26 +3931,19 @@ vy_slice_stream_read_page(struct vy_slice_stream *stream)
 	return 0;
 }
 
-/**
- * Binary search in a run for the given key. Find the first position with
- * a tuple greater or equal to slice
- * @retval 0 success
- * @retval -1 read or memory error
- */
-static NODISCARD int
-vy_slice_stream_search(struct vy_stmt_stream *virt_stream)
+static int
+vy_compaction_stream_search(struct vy_stmt_stream *virt_stream)
 {
-	assert(virt_stream->iface->start == vy_slice_stream_search);
-	struct vy_slice_stream *stream = (struct vy_slice_stream *)virt_stream;
+	struct vy_compaction_stream *stream =
+		(struct vy_compaction_stream *)virt_stream;
 	assert(stream->page == NULL);
 	if (stream->slice->begin.stmt == NULL) {
-		/* Already at the beginning */
 		assert(stream->page_no == 0);
 		assert(stream->pos_in_page == 0);
 		return 0;
 	}
 
-	if (vy_slice_stream_read_page(stream) != 0)
+	if (vy_compaction_stream_read_page(stream) != 0)
 		return -1;
 
 	bool unused;
@@ -2587,7 +3956,6 @@ vy_slice_stream_search(struct vy_stmt_stream *virt_stream)
 	}
 
 	if (stream->pos_in_page == stream->page->row_count) {
-		/* The first tuple is in the beginning of the next page */
 		vy_page_delete(stream->page);
 		stream->page = NULL;
 		stream->page_no++;
@@ -2596,33 +3964,25 @@ vy_slice_stream_search(struct vy_stmt_stream *virt_stream)
 	return 0;
 }
 
-/**
- * Get the value from the stream and move to the next position.
- * Set *ret to the value or NULL if EOF.
- * @param virt_stream - virtual stream.
- * @param ret - pointer to the result.
- * @return 0 on success, -1 on memory or read error.
- */
 static NODISCARD int
-vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
+vy_compaction_stream_next(struct vy_stmt_stream *virt_stream,
+			  struct vy_entry *ret)
 {
-	assert(virt_stream->iface->next == vy_slice_stream_next);
-	struct vy_slice_stream *stream = (struct vy_slice_stream *)virt_stream;
+	struct vy_compaction_stream *stream =
+		(struct vy_compaction_stream *)virt_stream;
 
-	/* If the slice is ended, return EOF */
 	if (stream->page_no > stream->slice->last_page_no) {
 		*ret = vy_entry_none();
 		return 0;
 	}
 
-	/* If current page is not already read, read it */
-	if (stream->page == NULL && vy_slice_stream_read_page(stream) != 0)
+	if (stream->page == NULL &&
+	    vy_compaction_stream_read_page(stream) != 0)
 		return -1;
 
-	/* Read current tuple from the page */
 	struct vy_entry entry = vy_page_stmt(stream->page, stream->pos_in_page,
 					     stream->cmp_def, stream->format);
-	if (entry.stmt == NULL) /* Read or memory error */
+	if (entry.stmt == NULL)
 		return -1;
 
 	/* Check that the tuple is not out of slice bounds = */
@@ -2634,23 +3994,18 @@ vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 		return 0;
 	}
 
-	/* We definitely has the next non-null tuple. Save it in stream */
 	if (stream->entry.stmt != NULL)
 		tuple_unref(stream->entry.stmt);
 	stream->entry = entry;
 	*ret = entry;
 
-	/* Increment position */
 	stream->pos_in_page++;
 
-	/* Check whether the position is out of page */
-	struct vy_page_info *page_info = vy_run_page_info(stream->slice->run,
-							  stream->page_no);
+	struct vy_page_info *page_info =
+		vy_compaction_stream_page_info(stream, stream->page_no);
+	if (page_info == NULL)
+		return -1;
 	if (stream->pos_in_page >= page_info->row_count) {
-		/**
-		 * Out of page. Free page, move the position to the next page
-		 * and * nullify page pointer to read it on the next iteration.
-		 */
 		vy_page_delete(stream->page);
 		stream->page = NULL;
 		stream->page_no++;
@@ -2660,14 +4015,11 @@ vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 	return 0;
 }
 
-/**
- * Free resources.
- */
 static void
-vy_slice_stream_stop(struct vy_stmt_stream *virt_stream)
+vy_compaction_stream_stop(struct vy_stmt_stream *virt_stream)
 {
-	assert(virt_stream->iface->stop == vy_slice_stream_stop);
-	struct vy_slice_stream *stream = (struct vy_slice_stream *)virt_stream;
+	struct vy_compaction_stream *stream =
+		(struct vy_compaction_stream *)virt_stream;
 	if (stream->page != NULL) {
 		vy_page_delete(stream->page);
 		stream->page = NULL;
@@ -2676,34 +4028,37 @@ vy_slice_stream_stop(struct vy_stmt_stream *virt_stream)
 		tuple_unref(stream->entry.stmt);
 		stream->entry = vy_entry_none();
 	}
+	vy_compaction_stream_free_block(stream);
 }
 
 static void
-vy_slice_stream_close(struct vy_stmt_stream *virt_stream)
+vy_compaction_stream_close(struct vy_stmt_stream *virt_stream)
 {
-	assert(virt_stream->iface->close == vy_slice_stream_close);
-	struct vy_slice_stream *stream = (struct vy_slice_stream *)virt_stream;
+	struct vy_compaction_stream *stream =
+		(struct vy_compaction_stream *)virt_stream;
 	tuple_format_unref(stream->format);
 }
 
-static const struct vy_stmt_stream_iface vy_slice_stream_iface = {
-	.start = vy_slice_stream_search,
-	.next = vy_slice_stream_next,
-	.stop = vy_slice_stream_stop,
-	.close = vy_slice_stream_close,
+static const struct vy_stmt_stream_iface vy_compaction_stream_iface = {
+	.start = vy_compaction_stream_search,
+	.next = vy_compaction_stream_next,
+	.stop = vy_compaction_stream_stop,
+	.close = vy_compaction_stream_close,
 };
 
 void
-vy_slice_stream_open(struct vy_slice_stream *stream, struct vy_slice *slice,
-		     struct key_def *cmp_def, struct tuple_format *format)
+vy_compaction_stream_open(struct vy_compaction_stream *stream,
+			  struct vy_slice *slice, struct key_def *cmp_def,
+			  struct tuple_format *format)
 {
-	stream->base.iface = &vy_slice_stream_iface;
-
+	stream->base.iface = &vy_compaction_stream_iface;
 	stream->page_no = slice->first_page_no;
-	stream->pos_in_page = 0; /* We'll find it later */
+	stream->pos_in_page = 0;
 	stream->page = NULL;
 	stream->entry = vy_entry_none();
-
+	stream->block_pages = NULL;
+	stream->block_page_count = 0;
+	stream->block_first_page_no = 0;
 	stream->slice = slice;
 	stream->cmp_def = cmp_def;
 	stream->format = format;

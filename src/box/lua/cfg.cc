@@ -275,6 +275,17 @@ lbox_cfg_set_vinyl_cache(struct lua_State *L)
 }
 
 static int
+lbox_cfg_set_vinyl_index_cache(struct lua_State *L)
+{
+	try {
+		box_set_vinyl_index_cache();
+	} catch (Exception *) {
+		luaT_error(L);
+	}
+	return 0;
+}
+
+static int
 lbox_cfg_set_vinyl_timeout(struct lua_State *L)
 {
 	try {
@@ -494,6 +505,7 @@ box_lua_cfg_init(struct lua_State *L)
 		{"cfg_set_vinyl_memory", lbox_cfg_set_vinyl_memory},
 		{"cfg_set_vinyl_max_tuple_size", lbox_cfg_set_vinyl_max_tuple_size},
 		{"cfg_set_vinyl_cache", lbox_cfg_set_vinyl_cache},
+		{"cfg_set_vinyl_index_cache", lbox_cfg_set_vinyl_index_cache},
 		{"cfg_set_vinyl_timeout", lbox_cfg_set_vinyl_timeout},
 		{"cfg_set_force_recovery", lbox_cfg_set_force_recovery},
 		{"cfg_set_election_mode", lbox_cfg_set_election_mode},

@@ -359,7 +359,7 @@ vy_lsm_recover_run(struct vy_lsm *lsm, struct vy_run_recovery_info *run_info,
 	run->dump_lsn = run_info->dump_lsn;
 	run->dump_count = run_info->dump_count;
 	if (vy_run_recover(run, lsm->env->path, lsm->space_id, lsm->index_id,
-			   lsm->cmp_def) != 0 &&
+			   lsm->cmp_def, lsm->disk_format) != 0 &&
 	    (!force_recovery ||
 	     vy_run_rebuild_index(run, lsm->env->path,
 				  lsm->space_id, lsm->index_id,
@@ -723,7 +723,6 @@ void
 vy_lsm_add_run(struct vy_lsm *lsm, struct vy_run *run)
 {
 	struct vy_lsm_env *env = lsm->env;
-	size_t bloom_size = vy_run_bloom_size(run);
 	size_t page_index_size = run->page_index_size;
 
 	assert(rlist_empty(&run->in_lsm));
@@ -732,17 +731,14 @@ vy_lsm_add_run(struct vy_lsm *lsm, struct vy_run *run)
 	vy_disk_stmt_counter_add(&lsm->stat.disk.count, &run->count);
 	vy_stmt_stat_add(&lsm->stat.disk.stmt, &run->info.stmt_stat);
 
-	lsm->bloom_size += bloom_size;
 	lsm->page_index_size += page_index_size;
-
-	env->bloom_size += bloom_size;
 	env->page_index_size += page_index_size;
 
 	/* Data size is consistent with space.bsize. */
 	if (lsm->index_id == 0)
 		env->disk_data_size += run->count.bytes;
 	/* Index size is consistent with index.bsize. */
-	env->disk_index_size += bloom_size + page_index_size;
+	env->disk_index_size += page_index_size;
 	if (lsm->index_id > 0)
 		env->disk_index_size += run->count.bytes;
 }
@@ -751,7 +747,6 @@ void
 vy_lsm_remove_run(struct vy_lsm *lsm, struct vy_run *run)
 {
 	struct vy_lsm_env *env = lsm->env;
-	size_t bloom_size = vy_run_bloom_size(run);
 	size_t page_index_size = run->page_index_size;
 
 	assert(lsm->run_count > 0);
@@ -761,17 +756,14 @@ vy_lsm_remove_run(struct vy_lsm *lsm, struct vy_run *run)
 	vy_disk_stmt_counter_sub(&lsm->stat.disk.count, &run->count);
 	vy_stmt_stat_sub(&lsm->stat.disk.stmt, &run->info.stmt_stat);
 
-	lsm->bloom_size -= bloom_size;
 	lsm->page_index_size -= page_index_size;
-
-	env->bloom_size -= bloom_size;
 	env->page_index_size -= page_index_size;
 
 	/* Data size is consistent with space.bsize. */
 	if (lsm->index_id == 0)
 		env->disk_data_size -= run->count.bytes;
 	/* Index size is consistent with index.bsize. */
-	env->disk_index_size -= bloom_size + page_index_size;
+	env->disk_index_size -= page_index_size;
 	if (lsm->index_id > 0)
 		env->disk_index_size -= run->count.bytes;
 }
@@ -1255,6 +1247,11 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
 		}
 	}
 
+	/*
+	 * Verify the split invariant: neither part is empty.
+	 */
+	for (int i = 0; i < n_parts; i++)
+		assert(parts[i]->slice_count > 0);
 	/*
 	 * Log change in metadata.
 	 */

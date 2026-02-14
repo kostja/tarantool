@@ -680,20 +680,18 @@ vy_stmt_extract_key_raw(const char *data, const char *data_end,
 			int multikey_idx);
 
 /**
- * Add a statement hash to a bloom filter builder.
- * See tuple_bloom_builder_add() for more details.
+ * Compute a 64-bit hash of a vinyl statement's key.
+ *
+ * Uses PMurHash32 with two different seeds to produce
+ * a full 64-bit hash.  The hash is suitable for use with
+ * binary fuse filters and MinHash sketches.
+ *
+ * @param entry  Statement or key to hash.
+ * @param key_def Key definition for hashing.
+ * @return 64-bit hash value.
  */
-int
-vy_bloom_builder_add(struct tuple_bloom_builder *builder,
-		     struct vy_entry entry, struct key_def *key_def);
-
-/**
- * Check if a statement hash is present in a bloom filter.
- * See tuple_bloom_maybe_has() for more details.
- */
-bool
-vy_bloom_maybe_has(const struct tuple_bloom *bloom,
-		   struct vy_entry entry, struct key_def *key_def);
+uint64_t
+vy_stmt_hash64(struct vy_entry entry, struct key_def *key_def);
 
 /**
  * Encode vy_stmt for a primary key as xrow_header

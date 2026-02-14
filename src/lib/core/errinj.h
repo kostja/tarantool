@@ -163,6 +163,8 @@ struct errinj {
 	_(ERRINJ_VY_COMPACTION_DELAY, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_DUMP_DELAY, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_GC, ERRINJ_BOOL, {.bparam = false}) \
+	_(ERRINJ_VY_INDEX_BLOCK_DELAY, ERRINJ_BOOL, {.bparam = false}) \
+	_(ERRINJ_VY_INDEX_BLOCK_READ, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_INDEX_DUMP, ERRINJ_INT, {.iparam = -1}) \
 	_(ERRINJ_VY_INDEX_FILE_RENAME, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_LOG_FILE_RENAME, ERRINJ_BOOL, {.bparam = false}) \

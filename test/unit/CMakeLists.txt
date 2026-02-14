@@ -423,6 +423,7 @@ create_unit_test(PREFIX vy_point_lookup
                          ${PROJECT_SOURCE_DIR}/src/box/vy_stmt.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_mem.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_run.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_index_cache.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_range.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_tx.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_read_set.c
@@ -441,8 +442,27 @@ create_unit_test(PREFIX vy_split_point
                  SOURCES vy_split_point.c
                          vy_iterators_helper.c
                          vy_log_stub.c
+                         vy_index_cache_stub.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_range.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_run.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_stmt.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_mem.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_upsert.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_history.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_cache.c
+                         ${PROJECT_SOURCE_DIR}/src/box/key_def.c
+                         ${PROJECT_SOURCE_DIR}/src/box/index_def.c
+                         core_test_utils.c
+                 LIBRARIES core tuple xrow xlog unit ${LIB_DL}
+)
+
+create_unit_test(PREFIX vy_page_index
+                 SOURCES vy_page_index.c
+                         vy_iterators_helper.c
+                         vy_log_stub.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_range.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_run.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_index_cache.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_stmt.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_mem.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_upsert.c
@@ -462,6 +482,7 @@ create_unit_test(PREFIX column_mask
 create_unit_test(PREFIX vy_write_iterator
                  SOURCES vy_write_iterator.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_run.c
+                         vy_index_cache_stub.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_upsert.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_write_iterator.c
                          ${ITERATOR_TEST_SOURCES}
