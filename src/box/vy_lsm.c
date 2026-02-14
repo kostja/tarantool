@@ -697,36 +697,22 @@ vy_lsm_compaction_priority(struct vy_lsm *lsm)
 int64_t
 vy_lsm_range_size(struct vy_lsm *lsm)
 {
-	/* Use the configured range size if available. */
+	/*
+	 * Use the configured range size, or the compile-time
+	 * minimum if not set.
+	 *
+	 * The old heuristic that derived the range size from
+	 * dumps_per_compaction and last-level bytes is removed:
+	 * a fixed default is simpler and avoids the feedback
+	 * loops that caused the heuristic to over-shrink ranges
+	 * in skewed workloads, leading to excessive compaction.
+	 *
+	 * Cap at VY_MAX_RANGE_SIZE so that a single compaction
+	 * job finishes in reasonable time.
+	 */
 	if (lsm->opts.range_size > 0)
-		return lsm->opts.range_size;
-	/*
-	 * Ideally, we want to compact roughly the same amount of
-	 * data after each dump so as to avoid IO bursts caused by
-	 * simultaneous major compaction of a bunch of ranges,
-	 * because such IO bursts can lead to a deviation of the
-	 * LSM tree from the configured shape and, as a result,
-	 * increased read amplification. To achieve that, we need
-	 * to have at least as many ranges as the number of dumps
-	 * it takes to trigger major compaction in a range. We
-	 * create four times more than that for better smoothing.
-	 */
-	int range_count = 4 * vy_lsm_dumps_per_compaction(lsm);
-	/*
-	 * As soon as the index gets large enough, we can expect
-	 * the dump to impact enough ranges to avoid the need for
-	 * smaller ranges, so use the actual range count. Besides,
-	 * if the workload is skewed towards the edge of the
-	 * range, dumps per compaction average out around 2-3 and
-	 * the heuristics above tends to over-reduce the target
-	 * range size.
-	 */
-	range_count = MAX(range_count, lsm->range_count);
-	int64_t range_size = range_count == 0 ? 0 :
-		lsm->stat.disk.last_level_count.bytes / range_count;
-	range_size = MAX(range_size, VY_MIN_RANGE_SIZE);
-	range_size = MIN(range_size, VY_MAX_RANGE_SIZE);
-	return range_size;
+		return MIN(lsm->opts.range_size, VY_MAX_RANGE_SIZE);
+	return VY_MIN_RANGE_SIZE;
 }
 
 void
