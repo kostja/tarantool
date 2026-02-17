@@ -2275,6 +2275,7 @@ vy_recovery_new_f(va_list ap)
 	recovery->run_hash = NULL;
 	recovery->slice_hash = NULL;
 	recovery->max_id = -1;
+	recovery->snapshot_max_id = -1;
 	recovery->in_rebootstrap = false;
 	recovery->has_errors = false;
 
@@ -2310,6 +2311,7 @@ vy_recovery_new_f(va_list ap)
 		say_verbose("load vylog record: %s",
 			    vy_log_record_str(&record));
 		if (record.type == VY_LOG_SNAPSHOT) {
+			recovery->snapshot_max_id = recovery->max_id;
 			if ((flags & VY_RECOVERY_LOAD_CHECKPOINT) != 0)
 				break;
 			continue;

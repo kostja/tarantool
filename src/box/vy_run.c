@@ -2491,14 +2491,10 @@ try_rmdir(const char *path)
 	return rc;
 }
 
-static ssize_t
-vy_run_remove_files_f(va_list ap)
+int
+vy_run_remove_files_sync(const char *dir, uint32_t space_id,
+			 uint32_t iid, int64_t run_id)
 {
-	const char *dir = va_arg(ap, typeof(dir));
-	uint32_t space_id = va_arg(ap, typeof(space_id));
-	uint32_t iid = va_arg(ap, typeof(iid));
-	int64_t run_id = va_arg(ap, typeof(run_id));
-
 	ERROR_INJECT(ERRINJ_VY_GC,
 		     {say_error("error injection: vinyl run %lld not deleted",
 				(long long)run_id); return -1;});
@@ -2522,6 +2518,16 @@ vy_run_remove_files_f(va_list ap)
 	vy_space_snprint_path(path, sizeof(path), dir, space_id);
 	try_rmdir(path);
 	return ret;
+}
+
+static ssize_t
+vy_run_remove_files_f(va_list ap)
+{
+	const char *dir = va_arg(ap, typeof(dir));
+	uint32_t space_id = va_arg(ap, typeof(space_id));
+	uint32_t iid = va_arg(ap, typeof(iid));
+	int64_t run_id = va_arg(ap, typeof(run_id));
+	return vy_run_remove_files_sync(dir, space_id, iid, run_id);
 }
 
 int

@@ -506,7 +506,16 @@ vy_run_snprint_path(char *buf, int size, const char *dir,
  * Remove all files (data, index) corresponding to a run
  * with the given id. Return 0 on success, -1 if unlink()
  * failed.
+ *
+ * This is the synchronous (blocking) version — it must be
+ * called from a coio worker thread.  Use vy_run_remove_files()
+ * for the yielding wrapper that dispatches to coio.
  */
+int
+vy_run_remove_files_sync(const char *dir, uint32_t space_id,
+			 uint32_t iid, int64_t run_id);
+
+/** Yielding wrapper around vy_run_remove_files_sync(). */
 int
 vy_run_remove_files(const char *dir, uint32_t space_id,
 		    uint32_t iid, int64_t run_id);

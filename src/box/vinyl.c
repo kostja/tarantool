@@ -144,6 +144,39 @@ static void
 vy_gc(struct vy_env *env, struct vy_recovery *recovery,
       unsigned int gc_mask, int64_t gc_lsn);
 
+static void
+vy_gc_run(struct vy_env *env, struct vy_lsm_recovery_info *lsm_info,
+	  struct vy_run_recovery_info *run_info);
+
+/** Entry in a batch of run files to delete. */
+struct vy_gc_entry {
+	uint32_t space_id;
+	uint32_t iid;
+	int64_t run_id;
+	/** Set to true if files were deleted successfully. */
+	bool ok;
+};
+
+/** Argument for vy_gc_batch_f(). */
+struct vy_gc_batch {
+	const char *dir;
+	struct vy_gc_entry *entries;
+	int count;
+};
+
+/** Delete files for a batch of runs (runs in a coio worker thread). */
+static ssize_t
+vy_gc_batch_f(va_list ap)
+{
+	struct vy_gc_batch *batch = va_arg(ap, struct vy_gc_batch *);
+	for (int i = 0; i < batch->count; i++) {
+		struct vy_gc_entry *e = &batch->entries[i];
+		e->ok = vy_run_remove_files_sync(batch->dir, e->space_id,
+						 e->iid, e->run_id) == 0;
+	}
+	return 0;
+}
+
 struct vinyl_iterator {
 	struct iterator base;
 	/** Memory pool the iterator was allocated from. */
@@ -2898,6 +2931,94 @@ vinyl_engine_wait_checkpoint(struct engine *engine,
 	assert(env->status == VINYL_ONLINE);
 	if (vy_scheduler_wait_checkpoint(&env->scheduler) != 0)
 		return -1;
+	/*
+	 * Delete run files for "ephemeral" runs — runs that were
+	 * created and dropped since the last vylog rotation.  Such
+	 * runs are not referenced by any checkpoint and can be
+	 * safely forgotten regardless of checkpoint_count.
+	 *
+	 * Writing FORGET_RUN records before vy_log_rotate() ensures
+	 * that the rotated vylog is clean: vy_recovery_new_locked()
+	 * called inside vy_log_rotate() flushes all pending vylog
+	 * records (including FORGET_RUN written here) to disk before
+	 * reading the vylog.
+	 *
+	 * Runs that predate the last rotation are cleaned up by
+	 * vinyl_engine_collect_garbage(), which is called after
+	 * the new checkpoint is registered and old ones are trimmed.
+	 */
+	struct vy_recovery *recovery = vy_recovery_new(-1, 0);
+	if (recovery != NULL) {
+		int64_t max_id = recovery->snapshot_max_id;
+		/*
+		 * First pass: count ephemeral runs to allocate
+		 * the batch array.
+		 */
+		int count = 0;
+		struct vy_lsm_recovery_info *lsm_info;
+		rlist_foreach_entry(lsm_info, &recovery->lsms,
+				    in_recovery) {
+			struct vy_run_recovery_info *run_info;
+			rlist_foreach_entry(run_info, &lsm_info->runs,
+					    in_lsm) {
+				if (run_info->is_dropped &&
+				    !run_info->is_forgotten &&
+				    run_info->id > max_id)
+					count++;
+			}
+		}
+		if (count > 0) {
+			/*
+			 * Second pass: fill the batch and delete
+			 * all files in a single coio call.
+			 */
+			struct vy_gc_entry *entries = calloc(count,
+							    sizeof(*entries));
+			if (entries != NULL) {
+				int idx = 0;
+				rlist_foreach_entry(lsm_info,
+						   &recovery->lsms,
+						   in_recovery) {
+					struct vy_run_recovery_info *run_info;
+					rlist_foreach_entry(run_info,
+							    &lsm_info->runs,
+							    in_lsm) {
+						if (run_info->is_dropped &&
+						    !run_info->is_forgotten &&
+						    run_info->id > max_id) {
+							entries[idx].space_id =
+								lsm_info->space_id;
+							entries[idx].iid =
+								lsm_info->index_id;
+							entries[idx].run_id =
+								run_info->id;
+							idx++;
+						}
+					}
+				}
+				assert(idx == count);
+				struct vy_gc_batch batch = {
+					.dir = env->path,
+					.entries = entries,
+					.count = count,
+				};
+				coio_call(vy_gc_batch_f, &batch);
+				/*
+				 * Write FORGET_RUN for each run
+				 * whose files were deleted.
+				 */
+				for (int i = 0; i < count; i++) {
+					if (!entries[i].ok)
+						continue;
+					vy_log_tx_begin();
+					vy_log_forget_run(entries[i].run_id);
+					vy_log_tx_try_commit();
+				}
+				free(entries);
+			}
+		}
+		vy_recovery_delete(recovery);
+	}
 	if (vy_log_rotate(vclock) != 0)
 		return -1;
 	return 0;

@@ -310,6 +310,12 @@ struct vy_recovery {
 	 */
 	int64_t max_id;
 	/**
+	 * Maximal vinyl object ID at the VY_LOG_SNAPSHOT marker.
+	 * Objects with id > snapshot_max_id were created after the
+	 * last vylog rotation. -1 if no snapshot marker was seen.
+	 */
+	int64_t snapshot_max_id;
+	/**
 	 * Set if we are currently processing a rebootstrap section,
 	 * i.e. we encountered a VY_LOG_REBOOTSTRAP record and haven't
 	 * seen matching VY_LOG_ABORT_REBOOTSTRAP.
