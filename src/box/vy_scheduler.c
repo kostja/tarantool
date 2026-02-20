@@ -2056,12 +2056,24 @@ vy_scheduler_f(va_list va)
 		if (tasks_failed > 0)
 			goto error;
 		/* Get a task to schedule. */
+		int64_t gen_before_schedule = scheduler->generation;
 		if (vy_schedule(scheduler, &task) != 0)
 			goto error;
 		/* Nothing to do or all workers are busy. */
 		if (task == NULL) {
-			/* Wait for changes. */
-			fiber_cond_wait(&scheduler->scheduler_cond);
+			/*
+			 * vy_schedule() may yield (e.g., during a
+			 * range split in vy_log_tx_commit).  While
+			 * it yields, a worker may push a completed
+			 * task or vy_scheduler_trigger_dump() may
+			 * start a new dump round.  In either case
+			 * the fiber_cond_signal sent to scheduler_cond
+			 * is lost because this fiber is not waiting.
+			 * Recheck before sleeping.
+			 */
+			if (stailq_empty(&scheduler->processed_tasks) &&
+			    scheduler->generation == gen_before_schedule)
+				fiber_cond_wait(&scheduler->scheduler_cond);
 			continue;
 		}
 
