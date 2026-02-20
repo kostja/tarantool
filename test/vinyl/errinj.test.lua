@@ -234,11 +234,19 @@ s:drop()
 
 -- Point select from secondary index during snapshot.
 -- Once upon time that leaded to crash.
+--
+-- Preconditions:
+-- - box.snapshot() before the fiber ensures a disk run exists,
+--   without which ERRINJ_VY_POINT_LOOKUP_DELAY doesn't fire.
+-- - run_count_per_level is set high to prevent compaction, which
+--   would deadlock waiting for slices pinned by the fiber.
 s = box.schema.space.create('test', {engine = 'vinyl'})
-i1 = s:create_index('pk', {parts = {1, 'uint'}, bloom_fpr = 0.5})
-i2 = s:create_index('sk', {parts = {2, 'uint'}, bloom_fpr = 0.5})
+i1 = s:create_index('pk', {parts = {1, 'uint'}, bloom_fpr = 0.5, run_count_per_level = 100})
+i2 = s:create_index('sk', {parts = {2, 'uint'}, bloom_fpr = 0.5, run_count_per_level = 100})
 
 for i = 1,10 do s:replace{i, i, 0} end
+
+box.snapshot()
 
 test_run:cmd("setopt delimiter ';'")
 f = fiber.new(function()
