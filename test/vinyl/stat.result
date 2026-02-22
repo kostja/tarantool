@@ -1706,7 +1706,10 @@ box.stat.vinyl().disk.data_compacted
 ---
 - 11815
 ...
-for i = 1, 100, 10 do s:replace{i, i * 1000, digest.urandom(100)} end
+-- Use 0 for pk=1 so that the secondary index run begins at key 0,
+-- which is within the first run's [1, 100] range and makes the runs
+-- overlap (required by compaction plan trim).
+for i = 1, 100, 10 do s:replace{i, i == 1 and 0 or i * 1000, digest.urandom(100)} end
 ---
 ...
 box.snapshot()
@@ -1742,11 +1745,11 @@ i1:stat().disk.last_level
 - bytes_compressed: <bytes_compressed>
   pages: 2
   rows: 100
-  bytes: 11841
+  bytes: 11839
 ...
 box.stat.vinyl().disk.data_compacted
 ---
-- 11841
+- 11839
 ...
 i2:compact()
 ---
@@ -1759,11 +1762,11 @@ i2:stat().disk.last_level
 - bytes_compressed: <bytes_compressed>
   pages: 1
   rows: 110
-  bytes: 1794
+  bytes: 1792
 ...
 box.stat.vinyl().disk.data_compacted
 ---
-- 11841
+- 11839
 ...
 s:drop()
 ---

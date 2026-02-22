@@ -95,9 +95,10 @@ bloom_fpr = bloom_fpr * 2
 pk:alter({page_size = page_size, run_count_per_level = 1, bloom_fpr = bloom_fpr})
 pad_size = page_size / 5
 pad = string.rep('I', pad_size)
--- Create 4 pages with new sizes in new run
-for i = 1, 20 do space:replace{i + 20, pad} end
-est_bsize = est_bsize + pad_size * 20
+-- Create 4 pages with new sizes in new run (use overlapping keys
+-- so that compaction plan trim doesn't dismiss the plan).
+for i = 1, 20 do space:replace{i, pad} end
+est_bsize = pad_size * 20
 box.snapshot()
 pk:compact()
 -- Wait for compaction

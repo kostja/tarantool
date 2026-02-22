@@ -953,10 +953,121 @@ test_vy_slice_cut_boundaries(void)
 	footer();
 }
 
+/**
+ * Helper for trim tests.  Builds a range with slices described by
+ * @specs, calls vy_range_update_compaction_priority (which runs
+ * vy_compaction_plan_check_shape), then checks
+ * that the resulting plan count matches @expected_count.
+ *
+ * @specs must end with a VY_SLICE_LAST sentinel.
+ * All slices must have the same bytes so they land on the same LSM
+ * level and trigger compaction with run_count_per_level = 1.
+ */
+static void
+run_trim_case(const char *name, const struct vy_slice_i64 *specs,
+	      int expected_count)
+{
+	int n;
+	struct vy_slice **slices;
+	struct vy_range *range = vy_test_range_new(specs, &slices, &n);
+
+	struct index_opts opts;
+	index_opts_create(&opts);
+	opts.run_count_per_level = 1;
+	opts.run_size_ratio = 2;
+	/*
+	 * Use a large range_size to prevent the split heuristic
+	 * from firing — we only want to test trim here.
+	 */
+	opts.range_size = INT64_MAX / 2;
+
+	vy_range_update_compaction_priority(range, &opts, opts.range_size);
+	is(range->compaction_plan.count, expected_count, "%s", name);
+
+	vy_test_range_delete(range, slices, n);
+}
+
+static void
+test_vy_compaction_plan_trim(void)
+{
+	header();
+	plan(4);
+
+	/*
+	 * Case 1: all slices overlap.
+	 * Three slices with overlapping [begin, max_key] ranges.
+	 * Expect all 3 kept.
+	 */
+	struct vy_slice_i64 case_all_overlap[] = {
+		{ .begin = 1, .end = 50, .end_type = END_IN, .bytes = 8192 },
+		{ .begin = 20, .end = 70, .end_type = END_IN, .bytes = 8192 },
+		{ .begin = 40, .end = 90, .end_type = END_IN, .bytes = 8192 },
+		VY_SLICE_LAST,
+	};
+	run_trim_case("all slices overlap: keep all 3",
+		      case_all_overlap, 3);
+
+	/*
+	 * Case 2: no slices overlap.
+	 * Trim finds no cluster larger than 1, so the plan
+	 * is trimmed to 0 slices (a single slice has nothing
+	 * to merge with).
+	 */
+	struct vy_slice_i64 case_no_overlap[] = {
+		{ .begin = 1, .end = 10, .end_type = END_IN, .bytes = 8192 },
+		{ .begin = 20, .end = 30, .end_type = END_IN, .bytes = 8192 },
+		{ .begin = 40, .end = 50, .end_type = END_IN, .bytes = 8192 },
+		VY_SLICE_LAST,
+	};
+	run_trim_case("no overlap: trimmed to 0",
+		      case_no_overlap, 0);
+
+	/*
+	 * Case 3: two overlap, one disjoint.
+	 * Slices A [1,50] and B [20,70] overlap; C [200,300]
+	 * is disjoint.  Largest cluster is {A, B} with size 2.
+	 */
+	struct vy_slice_i64 case_mixed[] = {
+		{ .begin = 1, .end = 50, .end_type = END_IN, .bytes = 8192 },
+		{ .begin = 20, .end = 70, .end_type = END_IN, .bytes = 8192 },
+		{ .begin = 200, .end = 300, .end_type = END_IN, .bytes = 8192 },
+		VY_SLICE_LAST,
+	};
+	run_trim_case("two overlap, one disjoint: keep 2",
+		      case_mixed, 2);
+
+	/*
+	 * Case 4: two disjoint clusters, pick larger.
+	 * Cluster 1: A [1,30] + B [20,50] (size 2).
+	 * Cluster 2: C [100,150] + D [120,170] + E [140,200]
+	 * (size 3).
+	 * F [500,600] is alone.
+	 * Expected: cluster 2 wins with 3 slices.
+	 */
+	struct vy_slice_i64 case_two_clusters[] = {
+		{ .begin = 1, .end = 30, .end_type = END_IN, .bytes = 8192 },
+		{ .begin = 20, .end = 50, .end_type = END_IN, .bytes = 8192 },
+		{ .begin = 100, .end = 150, .end_type = END_IN,
+		  .bytes = 8192 },
+		{ .begin = 120, .end = 170, .end_type = END_IN,
+		  .bytes = 8192 },
+		{ .begin = 140, .end = 200, .end_type = END_IN,
+		  .bytes = 8192 },
+		{ .begin = 500, .end = 600, .end_type = END_IN,
+		  .bytes = 8192 },
+		VY_SLICE_LAST,
+	};
+	run_trim_case("two clusters, pick larger (3 slices)",
+		      case_two_clusters, 3);
+
+	check_plan();
+	footer();
+}
+
 int
 main(void)
 {
-	plan(4);
+	plan(5);
 	header();
 
 	vy_iterator_C_test_init(128 * 1024);
@@ -970,6 +1081,7 @@ main(void)
 	test_vy_range_find_best_split();
 	test_split_with_widened_slice_end();
 	test_vy_slice_cut_boundaries();
+	test_vy_compaction_plan_trim();
 
 	key_def_delete(cmp_def);
 	vy_run_env_destroy(&run_env);

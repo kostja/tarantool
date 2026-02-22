@@ -28,7 +28,7 @@ end
 
 -- Check that run files are deleted by gc.
 s:insert{1} box.snapshot() -- dump
-s:insert{2} box.snapshot() -- dump + compaction
+s:replace{1, 2} box.snapshot() -- dump + compaction (overlapping key)
 while s.index.pk:stat().run_count > 1 do fiber.sleep(0.01) end -- wait for compaction
 gc()
 assert(wait_gc(ls_data, 2))

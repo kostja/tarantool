@@ -430,6 +430,7 @@ create_unit_test(PREFIX vy_split_point
                          ${PROJECT_SOURCE_DIR}/src/box/vy_history.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_cache.c
                          ${PROJECT_SOURCE_DIR}/src/box/key_def.c
+                         ${PROJECT_SOURCE_DIR}/src/box/index_def.c
                          core_test_utils.c
                  LIBRARIES core tuple xrow xlog unit ${LIB_DL}
 )

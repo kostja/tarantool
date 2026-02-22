@@ -261,11 +261,12 @@ pad_size = page_size / 5
 pad = string.rep('I', pad_size)
 ---
 ...
--- Create 4 pages with new sizes in new run
-for i = 1, 20 do space:replace{i + 20, pad} end
+-- Create 4 pages with new sizes in new run (use overlapping keys
+-- so that compaction plan trim doesn't dismiss the plan).
+for i = 1, 20 do space:replace{i, pad} end
 ---
 ...
-est_bsize = est_bsize + pad_size * 20
+est_bsize = pad_size * 20
 ---
 ...
 box.snapshot()
@@ -281,7 +282,7 @@ while pk:stat().run_count ~= 1 do fiber.sleep(0.01) end
 ...
 pk:stat().disk.pages
 ---
-- 6
+- 4
 ...
 space.index.pk.options.page_size
 ---

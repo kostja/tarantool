@@ -1563,10 +1563,14 @@ vy_task_compaction_complete(struct vy_task *task)
 	} else
 		vy_run_discard(new_run);
 
-	range->needs_compaction = false; /* Successful compaction. */
 	/*
 	 * Replace compacted slices with the resulting slice and
 	 * account compaction in LSM tree statistics.
+	 *
+	 * Note: needs_compaction is not cleared here.  Trim may
+	 * have selected only one overlap cluster, and the remaining
+	 * clusters still need compaction.  The flag is cleared by
+	 * vy_compaction_plan_seal() once no work remains.
 	 */
 	vy_lsm_update_range(lsm, range, new_slice, plan->slices);
 	vy_disk_stmt_counter_reset(&compaction_input);

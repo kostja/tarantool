@@ -513,7 +513,10 @@ i1:stat().disk.last_level
 i2:stat().disk.last_level
 box.stat.vinyl().disk.data_compacted
 
-for i = 1, 100, 10 do s:replace{i, i * 1000, digest.urandom(100)} end
+-- Use 0 for pk=1 so that the secondary index run begins at key 0,
+-- which is within the first run's [1, 100] range and makes the runs
+-- overlap (required by compaction plan trim).
+for i = 1, 100, 10 do s:replace{i, i == 1 and 0 or i * 1000, digest.urandom(100)} end
 box.snapshot()
 
 i1:stat().disk.last_level

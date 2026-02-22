@@ -329,11 +329,19 @@ s = box.schema.space.create('test', {engine = 'vinyl'})
 pk = s:create_index('pk', {run_count_per_level = 10, run_size_ratio = 2})
 sk = s:create_index('sk', {run_count_per_level = 10, run_size_ratio = 2, parts = {2, 'unsigned', 3, 'string'}, unique = false})
 
+-- Write a run that spans the entire key range, ensuring all
+-- subsequent runs overlap with it. This prevents the compaction
+-- plan trim algorithm from dropping disjoint dummy runs.
+s:replace{0, 0, ''}
+s:replace{10000, 10000, ''}
+box.snapshot()
+
 -- Write a run big enough to prevent major compaction from kicking in
 -- (run_count_per_level is ignored on the last level - see gh-3657).
-dummy_rows = 100
+-- dummy_rows accounts for the 2 anchor rows above.
+dummy_rows = 102
 pad = string.rep('z', 50 * 1024)
-for i = 1, dummy_rows do s:replace{i + 1000, i + 1000, pad} end
+for i = 1, 100 do s:replace{i + 1000, i + 1000, pad} end
 box.snapshot()
 pk:compact()
 sk:compact()
@@ -365,7 +373,7 @@ box.cfg{vinyl_defer_deletes = true}
 s = box.space.test
 pk = s.index.pk
 sk = s.index.sk
-dummy_rows = 100
+dummy_rows = 102
 
 -- Should be 360, the same amount of statements as before restart.
 -- If we applied all deferred DELETEs, including the dumped ones,

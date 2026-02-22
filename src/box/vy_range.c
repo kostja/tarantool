@@ -470,6 +470,139 @@ vy_range_remove_slice(struct vy_range *range, struct vy_slice *slice)
 	range->version++;
 }
 
+/** A qsort element for sorting plan slices by begin key. */
+struct vy_trim_point {
+	/** Slice this point refers to. */
+	struct vy_slice *slice;
+	/** Key definition for comparing begin keys. */
+	struct key_def *cmp_def;
+	/** Position in plan->slices before sorting. */
+	int index;
+};
+
+/** Compare trim points by slice begin key. NULL (= -inf) first. */
+static int
+vy_trim_point_cmp(const void *a, const void *b)
+{
+	const struct vy_trim_point *ea = a;
+	const struct vy_trim_point *eb = b;
+	if (ea->slice->begin.stmt == NULL)
+		return (eb->slice->begin.stmt == NULL) ? 0 : -1;
+	if (eb->slice->begin.stmt == NULL)
+		return 1;
+	return vy_entry_compare(ea->slice->begin, eb->slice->begin,
+				ea->cmp_def);
+}
+
+/** Compare trim points by original position in the plan. */
+static int
+vy_trim_point_pos_cmp(const void *a, const void *b)
+{
+	const struct vy_trim_point *ea = a;
+	const struct vy_trim_point *eb = b;
+	return ea->index < eb->index ? -1 : ea->index > eb->index;
+}
+
+/**
+ * Trim non-overlapping slices from the compaction plan.
+ *
+ * Find the largest overlap cluster among plan slices and keep
+ * only those.
+ *
+ * A slice's data range is [slice->begin, run->info.max_key].
+ * We don't use slice->end because it equals range->end for
+ * all slices in the same range.
+ */
+static void
+vy_compaction_plan_trim(struct vy_range *range,
+			const struct index_opts *opts)
+{
+	struct vy_compaction_plan *plan = &range->compaction_plan;
+	if (plan->count <= 1)
+		return;
+	/*
+	 * Don't trim tiny ranges: trimming would leave
+	 * many small run files on disk.
+	 */
+	if (range->count.bytes < 2 * (int64_t)opts->page_size)
+		return;
+
+	struct key_def *cmp_def = range->cmp_def;
+	int slice_count = plan->count;
+
+	/* Sort plan slices by begin key. */
+	struct vy_trim_point trim[slice_count];
+	struct vy_trim_point *end = trim + slice_count;
+	struct vy_trim_point *point = trim;
+	for (; point < end; point++) {
+		*point = (struct vy_trim_point) {
+			.slice = plan->slices[point - trim],
+			.cmp_def = cmp_def,
+			.index = point - trim,
+		};
+	}
+	qsort(trim, slice_count, sizeof(struct vy_trim_point),
+	      vy_trim_point_cmp);
+
+	/*
+	 * Sweep to find overlap clusters.  Track the maximum
+	 * data end (run->info.max_key); when the next slice's
+	 * begin exceeds it, a new cluster starts.  Pick the
+	 * cluster with the most slices.
+	 */
+	struct vy_trim_point *best = trim;
+	int best_len = 1;
+	struct vy_trim_point *cur = trim;
+	const char *max_end_key = cur->slice->run->info.max_key;
+
+	for (point = cur + 1; point < end; point++) {
+		struct vy_slice *s = point->slice;
+		/* Is s disjoint from the current cluster? */
+		bool disjoint = s->begin.stmt != NULL &&
+			vy_entry_compare_with_raw_key(
+				s->begin, max_end_key,
+				HINT_NONE, cmp_def) > 0;
+		if (disjoint) {
+			if (point - cur > best_len) {
+				best = cur;
+				best_len = point - cur;
+			}
+			cur = point;
+			max_end_key = s->run->info.max_key;
+		} else {
+			/* Extend the cluster. */
+			if (vy_key_compare(s->run->info.max_key,
+					   HINT_NONE, max_end_key,
+					   HINT_NONE, cmp_def) > 0)
+				max_end_key = s->run->info.max_key;
+		}
+	}
+	/* Check the last cluster. */
+	if (end - cur > best_len) {
+		best = cur;
+		best_len = end - cur;
+	}
+
+	if (best_len == slice_count) {
+		/* All slices overlap.  Nothing to trim. */
+		return;
+	}
+	say_verbose("compaction plan for range %s trimmed "
+		    "from %d to %d slices (largest overlap cluster)",
+		    vy_range_str(range), slice_count, best_len);
+
+	/* Restore newest-first order and rewrite plan->slices. */
+	qsort(best, best_len, sizeof(*best), vy_trim_point_pos_cmp);
+
+	plan->count = best_len;
+	struct vy_slice **dst = plan->slices;
+	for (point = best; point < best + best_len; point++)
+		*dst++ = point->slice;
+	/* A single slice has nothing to merge with. */
+	if (plan->count <= 1)
+		plan->count = 0;
+}
+
 /**
  * To reduce write amplification caused by compaction, we follow
  * the LSM tree design. Runs in each range are divided into groups
@@ -649,15 +782,19 @@ vy_compaction_plan_check_shape(struct vy_range *range,
 			break;
 	}
 	/*
-	 * If the original plan included the oldest slice in the
-	 * range but trim then excludes it (disjoint from the
-	 * selected cluster), the cluster's keys have no older
-	 * versions below. Mark the compaction as last-level so
-	 * that tombstones and deferred DELETEs are handled
-	 * correctly, whether or not the cluster is trimmed.
+	 * Compute is_last_level before calling trim.  The flag is
+	 * true when no slice outside the plan has an older version
+	 * of any key inside it.  When all slices are initially
+	 * selected (count == slice_count) the oldest slice is in the
+	 * plan and there are no versions below it.  Trim can only
+	 * remove slices from the plan, never add new ones, so if it
+	 * removes the oldest slice the remaining cluster still has
+	 * no older versions outside: the flag correctly survives the
+	 * trim.
 	 */
 	range->compaction_plan.is_last_level =
 		range->compaction_plan.count == range->slice_count;
+	vy_compaction_plan_trim(range, opts);
 }
 
 void
