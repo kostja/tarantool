@@ -1738,16 +1738,7 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	 */
 	if (!plan->is_bloat && plan->is_last_level)
 		dump_count -= plan->slices[plan->count - 1]->run->dump_count;
-	/*
-	 * Do not update dumps_per_compaction in case compaction
-	 * was triggered manually to avoid unexpected side effects,
-	 * such as splitting/coalescing ranges for no good reason.
-	 */
-	if (range->needs_compaction)
-		new_run->dump_count =
-			plan->slices[plan->count - 1]->run->dump_count;
-	else
-		new_run->dump_count = dump_count;
+	new_run->dump_count = dump_count;
 
 	task->range = range;
 	task->new_run = new_run;
