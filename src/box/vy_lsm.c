@@ -863,6 +863,40 @@ vy_lsm_update_range(struct vy_lsm *lsm, struct vy_range *range,
 }
 
 void
+vy_lsm_debloat(struct vy_lsm *lsm, struct vy_range *start,
+	       struct vy_run *run, bool forward)
+{
+	typedef struct vy_range *(*vy_range_step_f)(
+		vy_range_tree_t *, struct vy_range *);
+	vy_range_step_f step = forward
+		? vy_range_tree_next : vy_range_tree_prev;
+
+	for (struct vy_range *r = step(&lsm->range_tree, start); r != NULL;
+	     r = step(&lsm->range_tree, r)) {
+		/* Boundary check. */
+		if (forward) {
+			if (r->begin.stmt != NULL &&
+			    vy_entry_compare_with_raw_key(
+					r->begin, run->info.max_key,
+					HINT_NONE, lsm->cmp_def) > 0)
+				return;
+		} else {
+			if (r->end.stmt != NULL &&
+			    vy_entry_compare_with_raw_key(
+					r->end, run->info.min_key,
+					HINT_NONE, lsm->cmp_def) <= 0)
+				return;
+		}
+		if (vy_range_has_run(r, run)) {
+			if (!heap_node_is_stray(&r->heap_node) &&
+			    r->compaction_plan.priority == 0)
+				vy_lsm_update_range(lsm, r, NULL, NULL);
+			return;
+		}
+	}
+}
+
+void
 vy_lsm_acct_dump(struct vy_lsm *lsm, double time,
 		 const struct vy_stmt_counter *input,
 		 const struct vy_disk_stmt_counter *output)

@@ -30,6 +30,308 @@ g.after_each(function(cg)
 end)
 
 --
+-- Bloat compaction: after a range split, two ranges share one run
+-- file via separate slices.  When one range compacts its slice,
+-- the other range's slice pins unreferenced data.  The bloat
+-- detection should compact that slice too.
+--
+-- The shared run here is the original compacted run that was
+-- split into two ranges.  To consume its slice, we dump a small
+-- overlapping set to one range (placing it at a different level
+-- than the large original) and then use compact() to force
+-- compaction of all slices via needs_compaction.  The other
+-- range has only 1 slice, so compact() is a no-op for it.
+-- After the first range compacts, bloat propagation fires for
+-- the second range.
+--
+-- The small dump at a different level avoids triggering auto-
+-- compaction regardless of the level_count > 1 guard: each
+-- level has exactly 1 run, so level_run_count never exceeds 1.
+--
+g.test_bloat_compaction_after_split = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        -- 80 rows × 200 bytes ≈ 17 KB per dump.  range_size=8192
+        -- ensures exactly 1 median split after compaction
+        -- (17 KB > 2×8192, sub-ranges ~8.5 KB < 1.5×8192).
+        s:create_index('pk', {
+            run_count_per_level = 100,
+            page_size = 512,
+            range_size = 8192,
+        })
+
+        -- Phase 1: Dump keys 1..80 twice, then force-compact.
+        -- compact() merges the 2 runs into one.  The merged run
+        -- (~17 KB) exceeds range_size, triggering a proactive
+        -- split into 2 ranges that share the merged run.
+        for i = 1, 80 do s:replace{i, string.rep('x', 200)} end
+        box.snapshot()
+        for i = 1, 80 do s:replace{i, string.rep('y', 200)} end
+        box.snapshot()
+        s.index.pk:compact()
+
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_ge(s.index.pk:stat().disk.compaction.count, 1)
+            t.assert_equals(s.index.pk:stat().range_count, 2)
+            t.assert_equals(s.index.pk:stat().run_count, 1)
+        end)
+
+        -- Phase 2: Dump a small overlapping set (~5 keys × 200
+        -- bytes ≈ 1 KB) to one range.  The dump is ~10× smaller
+        -- than the original per-range slice (~8.5 KB), placing
+        -- it at a different level.  compact() sets needs_compaction
+        -- on both ranges, but range 2 has only 1 slice (the
+        -- original's slice), so its plan stays empty.  Range 1
+        -- compacts (needs_compaction selects all 2 slices),
+        -- consuming its slice of the shared run.  Bloat
+        -- propagation then fires for range 2.
+        local compaction_before =
+            s.index.pk:stat().disk.compaction.count
+        for i = 1, 5 do s:replace{i, string.rep('z', 200)} end
+        box.snapshot()
+        s.index.pk:compact()
+
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+            t.assert_ge(s.index.pk:stat().disk.compaction.count,
+                        compaction_before + 2)
+        end)
+        local stat = s.index.pk:stat()
+        t.assert_equals(stat.range_count, 2)
+        t.assert_equals(stat.run_count, 2)
+    end)
+end
+
+--
+-- Bloat propagation chain: after compacting one range that shares
+-- a run, debloat propagation wakes the next idle neighbor, which
+-- bloat-compacts and wakes the next, forming a chain.
+--
+-- Setup: 4 data ranges + 1 anchor range.  The anchor (keys
+-- 10001-10100) is created first so that the rightmost data range
+-- has a finite end key (not +inf).
+--
+--   1. Anchor dump → 5 ranges after splits: anchor + 4 data.
+--   2. Shared dump spanning all 4 data ranges, 20 keys each.
+--   3. Trigger compaction in range 1 (group 0, the leftmost).
+--      Debloat wave goes strictly left → right: range 1 → 2
+--      → 3 → 4.  Total: 1 shape + 3 bloat = 4.
+--
+-- Level_count independence: all runs in the target range land at
+-- level 0 (level_count=1), so the level_count > 1 guard never
+-- fires regardless of whether it exists.
+--
+g.test_bloat_propagation_across_ranges = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 100,
+            page_size = 128,
+            range_size = 33000,
+        })
+
+        local pad = string.rep('x', 200)
+
+        -- Anchor range: 100 keys at 10001-10100.  Dumped first
+        -- so that the last data range (group 3, keys 3001-3150)
+        -- gets a finite end key instead of +inf.
+        for k = 10001, 10100 do s:replace{k, pad} end
+        box.snapshot()
+
+        -- Phase 1: Create 4 disjoint data runs.  Each run covers
+        -- one key group (150 keys × ~215 bytes ≈ 33 KB ≈
+        -- range_size).  Split cascade → 4 data ranges + anchor.
+        for group = 0, 3 do
+            for k = group * 1000 + 1, group * 1000 + 150 do
+                s:replace{k, pad}
+            end
+            box.snapshot()
+        end
+        t.helpers.retrying({timeout = 30}, function()
+            t.assert_equals(s.index.pk:stat().range_count, 5)
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+        end)
+        -- Prevent further splits: the target range will have
+        -- up to ~70 KB after trigger dumps.  Set range_size
+        -- high enough to avoid splits (1.5 × 100000 = 150 KB).
+        s.index.pk:alter({range_size = 100000})
+
+        -- Phase 2: Single shared dump spanning all 4 data ranges.
+        -- 20 keys × ~215 bytes per range ≈ 4.3 KB per slice.
+        -- With page_size=128, the run has ~80 pages total, ~20
+        -- per slice.  This is large enough for bloat detection:
+        -- after one slice is removed, waste ≈ 20*20/80 = 5 ≥ 2.
+        for group = 0, 3 do
+            for k = group * 1000 + 1, group * 1000 + 20 do
+                s:replace{k, pad}
+            end
+        end
+        box.snapshot()
+
+        t.helpers.retrying({timeout = 10}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+        end)
+        t.assert_equals(s.index.pk:stat().range_count, 5,
+                        'no splits after overlapping dump')
+
+        -- Phase 3: Set run_count_per_level=2.  Each data range
+        -- has 2 slices: original (~33 KB) and shared (~4 KB).
+        -- With level_count=1 (both at same level),
+        -- level_run_count=2 does NOT exceed rcpl=2.
+        s.index.pk:alter({run_count_per_level = 2})
+
+        local compaction_before =
+            s.index.pk:stat().disk.compaction.count
+
+        -- Loop-based trigger dumps to range 1 (group 0, keys
+        -- 1-150, overlapping with original).  Each dump creates
+        -- a ~33 KB run at level 0.  With 3+ runs at level 0,
+        -- level_run_count > rcpl=2 → shape compaction selects
+        -- all slices (including shared dump's slice), consuming
+        -- the shared run.  The debloat wave then propagates
+        -- strictly left → right: range 2 → 3 → 4.
+        for _ = 1, 10 do
+            for k = 1, 150 do s:replace{k, pad} end
+            box.snapshot()
+            t.helpers.retrying({timeout = 5}, function()
+                t.assert_equals(
+                    box.stat.vinyl().scheduler.idle, 1)
+            end)
+            if s.index.pk:stat().disk.compaction.count
+                    > compaction_before then
+                break
+            end
+        end
+
+        -- After shape compaction in range 1 consumes the shared
+        -- run's slice, debloat propagation walks right through
+        -- ranges 2 → 3 → 4.
+        -- Wait for the full chain: 1 shape + 3 bloat = 4.
+        t.helpers.retrying({timeout = 30}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+            t.assert_ge(s.index.pk:stat().disk.compaction.count
+                        - compaction_before, 4)
+        end)
+        t.assert_equals(box.stat.vinyl().scheduler.tasks_failed, 0)
+
+        -- Verify data integrity: 4 groups × 150 + anchor 100
+        -- = 700.
+        t.assert_equals(s:count(), 700)
+    end)
+end
+
+--
+-- Bidirectional debloat wave: trigger compaction from the middle
+-- so the wave propagates both left and right.
+--
+-- Setup: 8 data ranges.  Shared dump covers only central 6
+-- (ranges 2-7, groups 1-6), leaving ranges 1 and 8 (groups 0
+-- and 7) without shared data.
+--
+-- Each range has its original run (~33 KB, 150 keys).  The shared
+-- dump has 20 keys per range → ~4.3 KB per slice, ~120 pages total.
+-- All slices sit at the same level (level_count=1).  Trigger
+-- dumps to range 5 (group 4) push level_run_count past rcpl=2,
+-- causing shape compaction that consumes the shared run's slice.
+-- The wave propagates outward from range 5: forward through
+-- ranges 6-7 and backward through ranges 4, 3, 2.  Ranges 1 and
+-- 8 have no shared slice and are NOT debloated.
+--
+g.test_debloat_bidirectional_wave = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 100,
+            page_size = 128,
+            range_size = 33000,
+        })
+
+        local pad = string.rep('x', 200)
+
+        -- Phase 1: 8 disjoint data dumps.
+        -- Groups: keys i*1000+1 .. i*1000+150 (i = 0..7).
+        -- Each group: 150 keys × ~215 bytes ≈ 33 KB ≈ range_size.
+        -- Split cascade → 8 ranges, 1 run each.
+        for group = 0, 7 do
+            for k = group * 1000 + 1, group * 1000 + 150 do
+                s:replace{k, pad}
+            end
+            box.snapshot()
+        end
+        t.helpers.retrying({timeout = 30}, function()
+            t.assert_equals(s.index.pk:stat().range_count, 8)
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+        end)
+
+        -- Prevent further splits.
+        s.index.pk:alter({range_size = 100000})
+
+        -- Phase 2: Shared dump spanning only groups 1-6 (ranges
+        -- 2-7).  Skip groups 0 and 7 (ranges 1 and 8).
+        -- 20 keys × ~215 bytes per range ≈ 4.3 KB per slice.
+        -- With page_size=128, ~120 pages total, ~20 per slice.
+        for group = 1, 6 do
+            for k = group * 1000 + 1, group * 1000 + 20 do
+                s:replace{k, pad}
+            end
+        end
+        box.snapshot()
+
+        t.helpers.retrying({timeout = 10}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+        end)
+
+        local compaction_before =
+            s.index.pk:stat().disk.compaction.count
+
+        -- Phase 3: Set rcpl=2.  Each range with a shared dump
+        -- has 2 slices at level_count=1.  level_run_count=2
+        -- does not exceed rcpl=2, so no auto-compaction.
+        s.index.pk:alter({run_count_per_level = 2})
+
+        -- Loop: dump 150 overlapping keys to range 5 (group 4,
+        -- keys 4001-4150).  Each dump is ~33 KB, same level as
+        -- the original.  With 3+ runs at level 0 → shape
+        -- compaction selects all slices including shared dump.
+        for _ = 1, 10 do
+            for k = 4001, 4150 do s:replace{k, pad} end
+            box.snapshot()
+            t.helpers.retrying({timeout = 5}, function()
+                t.assert_equals(
+                    box.stat.vinyl().scheduler.idle, 1)
+            end)
+            if s.index.pk:stat().disk.compaction.count
+                    > compaction_before then
+                break
+            end
+        end
+
+        -- Phase 4: Wait for the bidirectional debloat wave.
+        -- Range 5 (group 4): shape compaction.
+        -- Forward:  ranges 6 → 7 (bloat, groups 5-6).
+        -- Backward: ranges 4 → 3 → 2 (bloat, groups 3, 2, 1).
+        -- Total: 1 shape + 5 bloat = 6.
+        -- Ranges 1 and 8 (groups 0, 7) have no shared slice.
+        t.helpers.retrying({timeout = 30}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+            t.assert_ge(s.index.pk:stat().disk.compaction.count
+                        - compaction_before, 6)
+        end)
+        t.assert_equals(box.stat.vinyl().scheduler.tasks_failed, 0)
+
+        -- Verify data integrity: 8 groups × 150 keys = 1200.
+        t.assert_equals(s:count(), 1200)
+    end)
+end
+
+--
 -- Disjoint dumps in a range that exceeds range_size should trigger
 -- a split even though trim reduces the compaction plan to a single
 -- slice.
@@ -471,5 +773,70 @@ g.test_dump_does_not_produce_deferred_delete = function(cg)
 
         -- sk = dummy + 20 disk + 10 memory DELETEs = dummy + 30.
         t.assert_equals(sk:stat().rows - dummy_rows, 30)
+    end)
+end
+
+--
+-- Negative test: verify that a slice with waste below the bloat
+-- threshold is NOT compacted.
+--
+-- Setup: 2 ranges from a split sharing a small run.  After one
+-- range compacts (via compact()), the shared run has minimal
+-- waste: with ~4 pages total and ~2 pages per slice,
+-- unreferenced ≈ 2, waste = 2*2/4 = 1 < 2.  Bloat compaction
+-- should NOT fire.
+--
+g.test_bloat_below_threshold = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 100,
+            page_size = 512,
+            range_size = 1024,
+        })
+
+        -- Phase 1: Create a small run and split into 2 ranges.
+        -- 10 keys × 200 bytes ≈ 2 KB.  With page_size=512,
+        -- the shared run has ~4 pages.
+        for i = 1, 10 do s:replace{i, string.rep('x', 200)} end
+        box.snapshot()
+        for i = 1, 10 do s:replace{i, string.rep('y', 200)} end
+        box.snapshot()
+        s.index.pk:compact()
+
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_ge(s.index.pk:stat().disk.compaction.count, 1)
+            t.assert_equals(s.index.pk:stat().range_count, 2)
+            t.assert_equals(s.index.pk:stat().run_count, 1)
+        end)
+
+        -- Phase 2: Dump a small overlapping set to one range
+        -- and force compaction via compact().  Range 1 (keys
+        -- 1-2) has 2 slices → compact merges them, consuming
+        -- the shared run's slice.  Range 2 has only 1 slice →
+        -- compact() is a no-op.  After compaction, the shared
+        -- run's waste is too small for bloat detection.
+        local compaction_before =
+            s.index.pk:stat().disk.compaction.count
+        for i = 1, 2 do s:replace{i, string.rep('z', 200)} end
+        box.snapshot()
+        s.index.pk:compact()
+
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+            t.assert_gt(s.index.pk:stat().disk.compaction.count,
+                        compaction_before)
+        end)
+        local compaction_after =
+            s.index.pk:stat().disk.compaction.count
+
+        -- Wait and verify no additional compaction fires.
+        -- The shared run's waste is below the threshold.
+        fiber.sleep(1)
+        t.assert_equals(s.index.pk:stat().disk.compaction.count,
+                        compaction_after,
+                        'no bloat compaction below threshold')
     end)
 end

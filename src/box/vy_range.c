@@ -185,12 +185,24 @@ vy_compaction_plan_reset(struct vy_compaction_plan *plan, int slice_count)
 	plan->count = 0;
 	plan->priority = 0;
 	plan->is_last_level = false;
+	plan->is_bloat = false;
 	plan->split_key = NULL;
 	if (plan->slices == NULL || slice_count > plan->capacity) {
 		plan->slices = xrealloc(plan->slices, (slice_count + 1) *
 					sizeof(*plan->slices));
 		plan->capacity = slice_count;
 	}
+}
+
+/**
+ * True if neither split nor compaction has been planned yet.
+ * Used during plan construction (before seal) to decide
+ * whether to run the bloat check.
+ */
+static inline bool
+vy_compaction_plan_is_empty(const struct vy_compaction_plan *plan)
+{
+	return plan->count == 0 && plan->split_key == NULL;
 }
 
 static inline void
@@ -258,6 +270,7 @@ vy_compaction_plan_move(struct vy_compaction_plan *dst,
 	src->capacity = 0;
 	src->priority = 0;
 	src->is_last_level = false;
+	src->is_bloat = false;
 	src->split_key = NULL;
 }
 
@@ -294,8 +307,10 @@ vy_range_delete(struct vy_range *range)
 	vy_compaction_plan_destroy(&range->compaction_plan);
 
 	struct vy_slice *slice, *next_slice;
-	rlist_foreach_entry_safe(slice, &range->slices, in_range, next_slice)
+	rlist_foreach_entry_safe(slice, &range->slices, in_range, next_slice) {
+		vy_range_remove_slice(range, slice);
 		vy_slice_delete(slice);
+	}
 
 	TRASH(range);
 	free(range);
@@ -436,6 +451,7 @@ vy_range_init_slice(struct vy_range *range, struct vy_slice *slice)
 					  slice_pages, run_pages);
 	slice->count.bytes_compressed = DIV_ROUND_UP(
 		run->count.bytes_compressed * slice_pages, run_pages);
+	run->referenced_pages += slice->count.pages;
 }
 
 void
@@ -467,7 +483,19 @@ vy_range_remove_slice(struct vy_range *range, struct vy_slice *slice)
 	rlist_del_entry(slice, in_range);
 	range->slice_count--;
 	vy_disk_stmt_counter_sub(&range->count, &slice->count);
+	slice->run->referenced_pages -= slice->count.pages;
 	range->version++;
+}
+
+bool
+vy_range_has_run(struct vy_range *range, struct vy_run *run)
+{
+	struct vy_slice *slice;
+	rlist_foreach_entry(slice, &range->slices, in_range) {
+		if (slice->run == run)
+			return true;
+	}
+	return false;
 }
 
 /** A qsort element for sorting plan slices by begin key. */
@@ -800,6 +828,65 @@ vy_compaction_plan_check_shape(struct vy_range *range,
 	vy_compaction_plan_trim(range, opts);
 }
 
+/**
+ * Check for space amplification from unfair range splits.
+ *
+ * After a range split (or a dump that spans many ranges) several
+ * slices may reference the same run file.  A slice that covers
+ * only a fraction of its run file pins the entire file on disk.
+ * The unreferenced portion of the file is computed from
+ * run->referenced_pages: pages not covered by any live slice.
+ * To determine the waste attributable to a particular slice,
+ * we scale the total waste proportionally to the slice's share
+ * of the run: waste * slice_pages / run_pages.  This avoids
+ * depending on run->slice_count, which may be stale during
+ * debloat propagation.
+ *
+ * We compact the single most bloated slice, but only when more
+ * than 10% of the run is unreferenced and the absolute waste
+ * attributed to the slice is at least 2 pages.
+ *
+ * After this compaction completes, the priority is recomputed and
+ * the next most bloated slice (if any) will be handled in a
+ * subsequent cycle.
+ */
+static void
+vy_compaction_plan_check_bloat(struct vy_range *range)
+{
+	struct vy_slice *bloated = NULL;
+	uint32_t max_waste = 0;
+	struct vy_slice *slice;
+	rlist_foreach_entry(slice, &range->slices, in_range) {
+		struct vy_run *run = slice->run;
+		uint32_t run_pages = run->info.page_count;
+		/*
+		 * referenced_pages may slightly exceed run_pages
+		 * because two slices can share a boundary page
+		 * (the split point falls inside a page).
+		 */
+		if (run->referenced_pages >= run_pages)
+			continue;
+		uint32_t unreferenced = run_pages -
+					run->referenced_pages;
+		uint32_t slice_pages = slice->count.pages;
+		uint32_t waste = (uint64_t)unreferenced *
+				 slice_pages / run_pages;
+		if (waste >= 2 && (uint64_t)unreferenced * 10 > run_pages &&
+		    waste > max_waste) {
+			max_waste = waste;
+			bloated = slice;
+		}
+	}
+	if (bloated != NULL) {
+		say_verbose("compaction plan for range %s: bloat compaction "
+			    "scheduled (waste %u pages from run %lld)",
+			    vy_range_str(range), max_waste,
+			    (long long)bloated->run->id);
+		vy_compaction_plan_add(&range->compaction_plan, bloated);
+		range->compaction_plan.is_bloat = true;
+	}
+}
+
 void
 vy_range_update_compaction_priority(struct vy_range *range,
 				    const struct index_opts *opts,
@@ -826,6 +913,8 @@ vy_range_update_compaction_priority(struct vy_range *range,
 		} else if (range->slice_count >= 2) {
 			vy_compaction_plan_check_shape(range, opts);
 		}
+		if (vy_compaction_plan_is_empty(&range->compaction_plan))
+			vy_compaction_plan_check_bloat(range);
 	}
 	vy_compaction_plan_seal(range);
 }

@@ -522,6 +522,17 @@ vy_lsm_update_range(struct vy_lsm *lsm, struct vy_range *range,
 		    struct vy_slice *add_slice, struct vy_slice **del_slices);
 
 /**
+ * Starting from @a start, walk the range tree in the given
+ * direction and find the first in-heap range that references
+ * @a run.  Recompute its compaction priority and update the
+ * heap.  Stop at the first match -- the scheduler will handle
+ * one range at a time.
+ */
+void
+vy_lsm_debloat(struct vy_lsm *lsm, struct vy_range *start,
+	       struct vy_run *run, bool forward);
+
+/**
  * Account dump in LSM tree statistics.
  */
 void

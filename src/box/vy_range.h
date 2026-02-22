@@ -51,6 +51,7 @@ extern "C" {
 
 struct index_opts;
 struct key_def;
+struct vy_run;
 struct vy_slice;
 
 /**
@@ -116,6 +117,12 @@ struct vy_compaction_plan {
 	 * is removed from the scheduler heap while its task runs.
 	 */
 	const char *split_key;
+	/**
+	 * True if this is a single-slice bloat compaction:
+	 * a slice whose run file has significant unreferenced
+	 * data is rewritten to a tightly-scoped run.
+	 */
+	bool is_bloat;
 };
 
 /**
@@ -324,6 +331,10 @@ vy_range_add_slice_before(struct vy_range *range, struct vy_slice *slice,
 /** Remove a run slice from a range's list. */
 void
 vy_range_remove_slice(struct vy_range *range, struct vy_slice *slice);
+
+/** Return true if the range has a slice that references @a run. */
+bool
+vy_range_has_run(struct vy_range *range, struct vy_run *run);
 
 /**
  * Update compaction priority of a range.

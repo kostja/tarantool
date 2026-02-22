@@ -168,6 +168,14 @@ struct vy_run {
 	/** Number of slices created for this run. */
 	int slice_count;
 	/**
+	 * Total pages referenced by all live slices of this run.
+	 * Incremented in vy_range_add_slice (via vy_range_init_slice),
+	 * decremented in vy_range_remove_slice.  Used to compute the
+	 * unreferenced portion of the run file for bloat detection.
+	 * Page counts are exact (no rounding), unlike byte estimates.
+	 */
+	uint32_t referenced_pages;
+	/**
 	 * Counter used on completion of a compaction task to check if
 	 * all slices of the run have been compacted and so the run is
 	 * not used any more and should be deleted.

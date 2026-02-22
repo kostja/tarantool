@@ -1240,12 +1240,29 @@ vy_task_dump_complete(struct vy_task *task)
 	 * do, a concurrent read iterator may see an inconsistent
 	 * LSM tree state, when the same statement is present twice,
 	 * in memory and on disk.
+	 *
+	 * We split the work into two passes.  Pass 1 adds all
+	 * slices to their ranges and updates run->referenced_pages.
+	 * Pass 2 recomputes compaction priorities and updates the
+	 * scheduler heap.  This order matters: the bloat check in
+	 * vy_range_update_compaction_priority needs the final
+	 * referenced_pages to avoid false positives from sibling
+	 * slices that haven't been initialized yet.
 	 */
 	for (range = begin_range, i = 0; range != end_range;
 	     range = vy_range_tree_next(&lsm->range_tree, range), i++) {
 		assert(i < lsm->range_count);
 		slice = new_slices[i];
-		vy_lsm_update_range(lsm, range, slice, NULL);
+		vy_lsm_unacct_range(lsm, range);
+		vy_range_add_slice(range, slice);
+	}
+	for (range = begin_range, i = 0; range != end_range;
+	     range = vy_range_tree_next(&lsm->range_tree, range), i++) {
+		vy_range_update_compaction_priority(range, &lsm->opts,
+						    vy_lsm_range_size(lsm));
+		vy_lsm_acct_range(lsm, range);
+		if (!heap_node_is_stray(&range->heap_node))
+			vy_range_heap_update(&lsm->range_heap, range);
 	}
 	free(new_slices);
 
@@ -1501,17 +1518,27 @@ vy_task_compaction_complete(struct vy_task *task)
 	}
 
 	/*
-	 * Build the list of runs that became unused
-	 * as a result of compaction.
+	 * Build the list of runs that became unused as a result of
+	 * compaction.  Two sweeps over plan->slices:
+	 *
+	 * 1. Increment compacted_slice_count for each slice's run.
+	 * 2. Check: if compacted_slice_count == slice_count, the run
+	 *    is unused -- add to in_unused list and reset the counter.
+	 *    Otherwise the run is shared with other ranges -- keep the
+	 *    counter nonzero so that sweep 3 (below) can find it.
 	 */
 	RLIST_HEAD(unused_runs);
 	for (int i = 0; i < plan->count; i++)
 		plan->slices[i]->run->compacted_slice_count++;
 	for (int i = 0; i < plan->count; i++) {
 		run = plan->slices[i]->run;
-		if (run->compacted_slice_count == run->slice_count)
+		if (run->compacted_slice_count == 0)
+			continue; /* already processed */
+		if (run->compacted_slice_count == run->slice_count) {
 			rlist_add_entry(&unused_runs, run, in_unused);
-		run->compacted_slice_count = 0;
+			run->compacted_slice_count = 0;
+		}
+		/* Shared runs: compacted_slice_count stays > 0. */
 	}
 
 	/*
@@ -1573,6 +1600,25 @@ vy_task_compaction_complete(struct vy_task *task)
 	 * vy_compaction_plan_seal() once no work remains.
 	 */
 	vy_lsm_update_range(lsm, range, new_slice, plan->slices);
+	/*
+	 * Sweep 3: propagate shared runs to neighbor ranges now that
+	 * vy_lsm_update_range has removed the compacted slices and
+	 * updated run->referenced_pages.  The bloat check in the
+	 * neighbors will now correctly see unreferenced pages.
+	 *
+	 * A run appearing in multiple plan slices (e.g. after a
+	 * split-coalesce without an intervening compaction) may be
+	 * visited twice, causing a redundant propagation.  This is
+	 * harmless and extremely rare.
+	 */
+	for (int i = 0; i < plan->count; i++) {
+		run = plan->slices[i]->run;
+		if (run->compacted_slice_count == 0)
+			continue; /* unused or already propagated */
+		vy_lsm_debloat(lsm, range, run, true);
+		vy_lsm_debloat(lsm, range, run, false);
+		run->compacted_slice_count = 0;
+	}
 	vy_disk_stmt_counter_reset(&compaction_input);
 	/*
 	 * Unaccount unused runs and delete compacted slices.
@@ -1641,7 +1687,7 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 
 	struct vy_range *range = vy_range_heap_top(&lsm->range_heap);
 	assert(range != NULL);
-	assert(range->compaction_plan.count > 1);
+	assert(range->compaction_plan.count > 0);
 
 	struct vy_task *task = vy_task_new(scheduler, worker, lsm,
 					   &compaction_ops);
@@ -1674,7 +1720,14 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 		dump_count += slice->run->dump_count;
 	}
 	assert(new_run->dump_lsn >= 0);
-	if (plan->is_last_level)
+	/*
+	 * For a bloat compaction (single-slice rewrite), preserve
+	 * the original dump_count.  The standard last-level formula
+	 * (sum - base_run.dump_count) is designed for multi-run
+	 * merges and produces 0 for a single-run rewrite, which
+	 * would corrupt dumps_per_compaction statistics.
+	 */
+	if (!plan->is_bloat && plan->is_last_level)
 		dump_count -= plan->slices[plan->count - 1]->run->dump_count;
 	/*
 	 * Do not update dumps_per_compaction in case compaction

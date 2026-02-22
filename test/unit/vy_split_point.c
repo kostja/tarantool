@@ -1064,6 +1064,79 @@ test_vy_compaction_plan_trim(void)
 	footer();
 }
 
+/**
+ * Test that vy_range_update_compaction_priority does not run the
+ * bloat check when a split is already scheduled.
+ *
+ * Without the guard, vy_compaction_plan_check_bloat adds a slice
+ * to the plan (count > 0) while split_key is also set.
+ * vy_compaction_plan_seal then hits assert(plan->count == 0)
+ * in the split_key branch.
+ */
+static void
+test_bloat_guard_with_split(void)
+{
+	header();
+	plan(3);
+
+	/*
+	 * Two disjoint slices large enough to trigger a split.
+	 * One of the runs is bloated (unreferenced pages).
+	 * range_size is set so that total bytes > range_size * 3/2
+	 * and the sweep finds a split point.
+	 */
+	struct vy_slice_i64 specs[] = {
+		{ .begin = 10, .end = 20, .end_type = END_EX,
+		  .bytes = 1000, },
+		{ .begin = 30, .end = 40, .end_type = END_EX,
+		  .bytes = 1000, },
+		VY_SLICE_LAST,
+	};
+	int n;
+	struct vy_slice **slices;
+	struct vy_range *range = vy_test_range_new(specs, &slices, &n);
+
+	/*
+	 * Make the first slice's run bloated: 100 pages in the run
+	 * file but only 10 referenced by live slices.  The bloat
+	 * threshold is MAX(2, slice_pages / 10).  With 20 slice
+	 * pages, threshold = 2, waste = (100 - 10) / 1 = 90 > 2.
+	 */
+	struct vy_run *run = slices[0]->run;
+	run->info.page_count = 100;
+	run->referenced_pages = 10;
+	slices[0]->count.pages = 20;
+
+	struct index_opts opts;
+	index_opts_create(&opts);
+	opts.run_count_per_level = 100; /* prevent shape compaction */
+
+	/*
+	 * range_size must be small enough that range->count.bytes
+	 * (2000) >= range_size * 3/2, triggering vy_range_needs_split.
+	 * With range_size = 1024, 2000 >= 1536.
+	 */
+	int64_t range_size = 1024;
+
+	/*
+	 * Without the fix this would crash with:
+	 * assert(plan->count == 0) in vy_compaction_plan_seal.
+	 */
+	vy_range_update_compaction_priority(range, &opts, range_size);
+
+	ok(range->compaction_plan.split_key != NULL,
+	   "split is scheduled");
+	is(range->compaction_plan.count, 0,
+	   "bloat check skipped (count == 0)");
+	ok(!range->compaction_plan.is_bloat,
+	   "bloat flag not set");
+
+	vy_test_range_delete(range, slices, n);
+
+	check_plan();
+	footer();
+}
+
 int
 main(void)
 {
@@ -1082,6 +1155,7 @@ main(void)
 	test_split_with_widened_slice_end();
 	test_vy_slice_cut_boundaries();
 	test_vy_compaction_plan_trim();
+	test_bloat_guard_with_split();
 
 	key_def_delete(cmp_def);
 	vy_run_env_destroy(&run_env);
