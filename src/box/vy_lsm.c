@@ -322,7 +322,6 @@ vy_lsm_create(struct vy_lsm *lsm)
 		return -1;
 	assert(lsm->range_count == 0);
 	vy_lsm_add_range(lsm, range);
-	vy_lsm_acct_range(lsm, range);
 
 	/* Write the new LSM tree record to vylog. */
 	vy_log_tx_begin();
@@ -586,7 +585,6 @@ vy_lsm_recover(struct vy_lsm *lsm, struct vy_recovery *recovery,
 		if (range == NULL)
 			return -1;
 		vy_lsm_add_range(lsm, range);
-		vy_lsm_acct_range(lsm, range);
 		return 0;
 	}
 
@@ -628,10 +626,7 @@ vy_lsm_recover(struct vy_lsm *lsm, struct vy_recovery *recovery,
 	if (rc != 0)
 		return -1;
 
-	/*
-	 * Account ranges to the LSM tree and check that the range tree
-	 * does not have holes or overlaps.
-	 */
+	/* Check that the range tree does not have holes or overlaps. */
 	struct vy_range *range, *prev = NULL;
 	for (range = vy_range_tree_first(&lsm->range_tree); range != NULL;
 	     prev = range, range = vy_range_tree_next(&lsm->range_tree, range)) {
@@ -656,8 +651,6 @@ vy_lsm_recover(struct vy_lsm *lsm, struct vy_recovery *recovery,
 					    (long long)range->id));
 			return -1;
 		}
-		vy_range_update_dumps_per_compaction(range);
-		vy_lsm_acct_range(lsm, range);
 	}
 	if (prev == NULL) {
 		diag_set(ClientError, ER_INVALID_VYLOG_FILE,
@@ -698,7 +691,7 @@ vy_lsm_compaction_priority(struct vy_lsm *lsm)
 	 */
 	if (lsm->is_dropped)
 		return 0;
-	return range->compaction_priority;
+	return range->compaction_plan.priority;
 }
 
 int64_t
@@ -800,6 +793,11 @@ vy_lsm_add_range(struct vy_lsm *lsm, struct vy_range *range)
 	vy_range_heap_insert(&lsm->range_heap, range);
 	vy_range_tree_insert(&lsm->range_tree, range);
 	lsm->range_count++;
+	lsm->range_tree_version++;
+	vy_range_update_compaction_priority(range, &lsm->opts,
+					    vy_lsm_range_size(lsm));
+	vy_lsm_acct_range(lsm, range);
+	vy_range_heap_update(&lsm->range_heap, range);
 }
 
 void
@@ -844,6 +842,37 @@ vy_lsm_unacct_range(struct vy_lsm *lsm, struct vy_range *range)
 					 &slice->count);
 		if (lsm->index_id == 0)
 			lsm->env->compacted_data_size -= slice->count.bytes;
+	}
+}
+
+void
+vy_lsm_update_range(struct vy_lsm *lsm, struct vy_range *range,
+		    struct vy_slice *add_slice, struct vy_slice **del_slices)
+{
+	vy_lsm_unacct_range(lsm, range);
+	if (add_slice != NULL) {
+		if (del_slices) {
+			vy_range_add_slice_before(range, add_slice,
+						  *del_slices);
+		} else {
+			vy_range_add_slice(range, add_slice);
+		}
+	}
+	if (del_slices && *del_slices) {
+		range->n_compactions++;
+		while (*del_slices) {
+			vy_range_remove_slice(range, *del_slices++);
+		}
+	}
+	vy_range_update_compaction_priority(range, &lsm->opts,
+					    vy_lsm_range_size(lsm));
+	vy_lsm_acct_range(lsm, range);
+	/*
+	 * The range is removed from the LSM heap during compaction.
+	 * A dump or forced compaction may happen concurrently.
+	 */
+	if (!heap_node_is_stray(&range->heap_node)) {
+		vy_range_heap_update(&lsm->range_heap, range);
 	}
 }
 
@@ -1188,12 +1217,8 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
 	for (int i = 0; i < n_parts; i++) {
 		part = parts[i];
 		part->needs_compaction = range->needs_compaction;
-		vy_range_update_compaction_priority(part, &lsm->opts);
-		vy_range_update_dumps_per_compaction(part);
 		vy_lsm_add_range(lsm, part);
-		vy_lsm_acct_range(lsm, part);
 	}
-	lsm->range_tree_version++;
 
 	say_verbose("%s: split range %s by key %s", vy_lsm_name(lsm),
 		    vy_range_str(range), tuple_str(split_key.stmt));
@@ -1279,11 +1304,7 @@ vy_lsm_coalesce_range(struct vy_lsm *lsm, struct vy_range *range)
 	 * we don't need to compact the resulting range as long
 	 * as it fits the configured LSM tree shape.
 	 */
-	vy_range_update_compaction_priority(result, &lsm->opts);
-	vy_range_update_dumps_per_compaction(result);
-	vy_lsm_acct_range(lsm, result);
 	vy_lsm_add_range(lsm, result);
-	lsm->range_tree_version++;
 
 	say_verbose("%s: coalesced ranges %s",
 		    vy_lsm_name(lsm), vy_range_str(result));
@@ -1306,11 +1327,7 @@ vy_lsm_force_compaction(struct vy_lsm *lsm)
 
 	vy_range_tree_ifirst(&lsm->range_tree, &it);
 	while ((range = vy_range_tree_inext(&it)) != NULL) {
-		vy_lsm_unacct_range(lsm, range);
 		range->needs_compaction = true;
-		vy_range_update_compaction_priority(range, &lsm->opts);
-		vy_lsm_acct_range(lsm, range);
+		vy_lsm_update_range(lsm, range, NULL, NULL);
 	}
-
-	vy_range_heap_update_all(&lsm->range_heap);
 }

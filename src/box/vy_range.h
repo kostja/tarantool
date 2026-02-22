@@ -54,6 +54,72 @@ struct key_def;
 struct vy_slice;
 
 /**
+ * A pre-computed compaction plan for a range.
+ *
+ * The goal of compaction is to reduce read amplification.
+ * All ranges for which the LSM tree has more runs per
+ * level than run_count_per_level or run size larger than
+ * one defined by run_size_ratio of this level are candidates
+ * for compaction.
+ * Unlike other LSM implementations, Vinyl can have many
+ * sorted runs in a single level, and is able to compact
+ * runs from any number of adjacent levels. Moreover,
+ * higher levels are always taken in when compacting
+ * a lower level - i.e. L1 is always included when
+ * compacting L2, and both L1 and L2 are always included
+ * when compacting L3.
+ *
+ * The lower the level is scheduled for compaction,
+ * the bigger it tends to be because upper levels are
+ * taken in.
+ *
+ * Built by vy_range_update_compaction_priority() and consumed
+ * by vy_task_compaction_new().  Stores the exact set
+ * of slices that should be compacted together.  The number of
+ * slices in the plan (count) is also used as the compaction
+ * priority: if it is 0, the range doesn't need to be compacted.
+ *
+ * @sa vy_range_update_compaction_priority()
+ */
+struct vy_compaction_plan {
+	/**
+	 * Array of slice pointers selected for compaction.
+	 * Dynamically allocated.  NULL if no plan is set.
+	 */
+	struct vy_slice **slices;
+	/** Number of slices in the plan. */
+	int count;
+	/** Allocated size of the @a slices array. */
+	int capacity;
+	/**
+	 * Scheduling priority.  Normally equals @a count, but
+	 * set to 1 for empty ranges that need coalescing.
+	 */
+	int priority;
+	/**
+	 * True if the plan includes the last (oldest) slice
+	 * in the range, meaning this is a major compaction
+	 * that can drop tombstones and dead tuples.
+	 */
+	bool is_last_level;
+};
+
+/**
+ * Free the resources held by a compaction plan.
+ * Use for final cleanup (range/task deletion).
+ */
+void
+vy_compaction_plan_destroy(struct vy_compaction_plan *plan);
+
+/**
+ * Move a compaction plan from @a src to @a dst.
+ * After the move, @a src is empty (allocation transferred).
+ */
+void
+vy_compaction_plan_move(struct vy_compaction_plan *dst,
+			struct vy_compaction_plan *src);
+
+/**
  * Range of keys in an LSM tree stored on disk.
  */
 struct vy_range {
@@ -82,37 +148,14 @@ struct vy_range {
 	struct rlist slices;
 	/** Number of entries in the ->slices list. */
 	int slice_count;
-	/**
-	 * The goal of compaction is to reduce read amplification.
-	 * All ranges for which the LSM tree has more runs per
-	 * level than run_count_per_level or run size larger than
-	 * one defined by run_size_ratio of this level are candidates
-	 * for compaction.
-	 * Unlike other LSM implementations, Vinyl can have many
-	 * sorted runs in a single level, and is able to compact
-	 * runs from any number of adjacent levels. Moreover,
-	 * higher levels are always taken in when compacting
-	 * a lower level - i.e. L1 is always included when
-	 * compacting L2, and both L1 and L2 are always included
-	 * when compacting L3.
-	 *
-	 * This variable contains the number of runs the next
-	 * compaction of this range will include. If it is 0,
-	 * the range doesn't need to be compacted.
-	 *
-	 * The lower the level is scheduled for compaction,
-	 * the bigger it tends to be because upper levels are
-	 * taken in.
-	 * @sa vy_range_update_compaction_priority() to see
-	 * how we  decide how many runs to compact next time.
-	 */
-	int compaction_priority;
 	/** Number of statements that need to be compacted. */
 	struct vy_disk_stmt_counter compaction_queue;
+	/** Pre-computed compaction plan, see struct vy_compaction_plan. */
+	struct vy_compaction_plan compaction_plan;
 	/**
 	 * If this flag is set, the range must be scheduled for
-	 * major compaction, i.e. its compaction_priority must be
-	 * raised to max (slice_count). The flag is set by
+	 * major compaction, i.e. all its slices must be included
+	 * in the compaction plan. The flag is set by
 	 * vy_lsm_force_compaction() and cleared when the range
 	 * is scheduled for compaction.
 	 */
@@ -168,13 +211,13 @@ vy_split_point_cmp(const void *a, const void *b);
 
 /**
  * Heap of all ranges of the same LSM tree, prioritized by
- * vy_range->compaction_priority.
+ * vy_range->compaction_plan.priority.
  */
 #define HEAP_NAME vy_range_heap
 static inline bool
 vy_range_heap_less(struct vy_range *r1, struct vy_range *r2)
 {
-	return r1->compaction_priority > r2->compaction_priority;
+	return r1->compaction_plan.priority > r2->compaction_plan.priority;
 }
 #define HEAP_LESS(h, l, r) vy_range_heap_less(l, r)
 #define heap_value_t struct vy_range
@@ -271,12 +314,14 @@ vy_range_remove_slice(struct vy_range *range, struct vy_slice *slice);
 /**
  * Update compaction priority of a range.
  *
- * @param range     The range.
- * @param opts      Index options.
+ * @param range      The range.
+ * @param opts       Index options.
+ * @param range_size Target range size (for split detection).
  */
 void
 vy_range_update_compaction_priority(struct vy_range *range,
-				    const struct index_opts *opts);
+				    const struct index_opts *opts,
+				    int64_t range_size);
 
 /**
  * Update the value of range->dumps_per_compaction.

@@ -514,6 +514,14 @@ void
 vy_lsm_unacct_range(struct vy_lsm *lsm, struct vy_range *range);
 
 /**
+ * Recompute the compaction priority of a range and update
+ * the LSM tree statistics accordingly (dump/compaction).
+ */
+void
+vy_lsm_update_range(struct vy_lsm *lsm, struct vy_range *range,
+		    struct vy_slice *add_slice, struct vy_slice **del_slices);
+
+/**
  * Account dump in LSM tree statistics.
  */
 void

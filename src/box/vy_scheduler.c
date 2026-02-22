@@ -191,13 +191,13 @@ struct vy_task {
 	/** Write iterator producing statements for the new run. */
 	struct vy_stmt_stream *wi;
 	/**
-	 * First (newest) and last (oldest) slices to compact.
+	 * Compaction plan moved from the range.
 	 *
 	 * While a compaction task is in progress, a new slice
 	 * can be added to a range by concurrent dump, so we
 	 * need to remember the slices we are compacting.
 	 */
-	struct vy_slice *first_slice, *last_slice;
+	struct vy_compaction_plan compaction_plan;
 	/**
 	 * Index options may be modified while a task is in
 	 * progress so we save them here to safely access them
@@ -262,6 +262,7 @@ vy_task_delete(struct vy_task *task)
 {
 	assert(task->deferred_delete_batch == NULL);
 	assert(task->deferred_delete_in_progress == 0);
+	vy_compaction_plan_destroy(&task->compaction_plan);
 	key_def_delete(task->cmp_def);
 	key_def_delete(task->key_def);
 	vy_lsm_unref(task->lsm);
@@ -1228,13 +1229,8 @@ vy_task_dump_complete(struct vy_task *task)
 	     range = vy_range_tree_next(&lsm->range_tree, range), i++) {
 		assert(i < lsm->range_count);
 		slice = new_slices[i];
-		vy_lsm_unacct_range(lsm, range);
-		vy_range_add_slice(range, slice);
-		vy_range_update_compaction_priority(range, &lsm->opts);
-		vy_range_update_dumps_per_compaction(range);
-		vy_lsm_acct_range(lsm, range);
+		vy_lsm_update_range(lsm, range, slice, NULL);
 	}
-	vy_range_heap_update_all(&lsm->range_heap);
 	free(new_slices);
 
 delete_mems:
@@ -1457,11 +1453,13 @@ vy_task_compaction_complete(struct vy_task *task)
 	double compaction_time = ev_monotonic_now(loop()) - task->start_time;
 	struct vy_disk_stmt_counter compaction_output = new_run->count;
 	struct vy_disk_stmt_counter compaction_input;
-	struct vy_slice *first_slice = task->first_slice;
-	struct vy_slice *last_slice = task->last_slice;
-	struct vy_slice *slice, *next_slice, *new_slice = NULL;
+	struct vy_compaction_plan *plan = &task->compaction_plan;
+	struct vy_slice *new_slice = NULL;
 	struct vy_run *run;
 
+	/* Put the range back into the compaction queue. */
+	assert(heap_node_is_stray(&range->heap_node));
+	vy_range_heap_insert(&lsm->range_heap, range);
 	/*
 	 * The LSM tree could have been dropped while we were writing the new
 	 * run. In this case all the information about the LSM tree ranges
@@ -1491,29 +1489,21 @@ vy_task_compaction_complete(struct vy_task *task)
 	 * as a result of compaction.
 	 */
 	RLIST_HEAD(unused_runs);
-	for (slice = first_slice; ; slice = rlist_next_entry(slice, in_range)) {
-		slice->run->compacted_slice_count++;
-		if (slice == last_slice)
-			break;
-	}
-	for (slice = first_slice; ; slice = rlist_next_entry(slice, in_range)) {
-		run = slice->run;
+	for (int i = 0; i < plan->count; i++)
+		plan->slices[i]->run->compacted_slice_count++;
+	for (int i = 0; i < plan->count; i++) {
+		run = plan->slices[i]->run;
 		if (run->compacted_slice_count == run->slice_count)
 			rlist_add_entry(&unused_runs, run, in_unused);
-		slice->run->compacted_slice_count = 0;
-		if (slice == last_slice)
-			break;
+		run->compacted_slice_count = 0;
 	}
 
 	/*
 	 * Log change in metadata.
 	 */
 	vy_log_tx_begin();
-	for (slice = first_slice; ; slice = rlist_next_entry(slice, in_range)) {
-		vy_log_delete_slice(slice->id);
-		if (slice == last_slice)
-			break;
-	}
+	for (int i = 0; i < plan->count; i++)
+		vy_log_delete_slice(plan->slices[i]->id);
 	rlist_foreach_entry(run, &unused_runs, in_unused)
 		vy_log_drop_run(run->id, VY_LOG_GC_LSN_CURRENT);
 	if (new_slice != NULL) {
@@ -1557,54 +1547,32 @@ vy_task_compaction_complete(struct vy_task *task)
 	} else
 		vy_run_discard(new_run);
 
+	range->needs_compaction = false; /* Successful compaction. */
 	/*
 	 * Replace compacted slices with the resulting slice and
 	 * account compaction in LSM tree statistics.
-	 *
-	 * Note, since a slice might have been added to the range
-	 * by a concurrent dump while compaction was in progress,
-	 * we must insert the new slice at the same position where
-	 * the compacted slices were.
 	 */
-	RLIST_HEAD(compacted_slices);
-	vy_lsm_unacct_range(lsm, range);
-	if (new_slice != NULL)
-		vy_range_add_slice_before(range, new_slice, first_slice);
+	vy_lsm_update_range(lsm, range, new_slice, plan->slices);
 	vy_disk_stmt_counter_reset(&compaction_input);
-	for (slice = first_slice; ; slice = next_slice) {
-		next_slice = rlist_next_entry(slice, in_range);
-		vy_range_remove_slice(range, slice);
-		rlist_add_entry(&compacted_slices, slice, in_range);
-		vy_disk_stmt_counter_add(&compaction_input, &slice->count);
-		if (slice == last_slice)
-			break;
-	}
-	range->n_compactions++;
-	vy_range_update_compaction_priority(range, &lsm->opts);
-	vy_range_update_dumps_per_compaction(range);
-	vy_lsm_acct_range(lsm, range);
-	vy_lsm_acct_compaction(lsm, compaction_time,
-			       &compaction_input, &compaction_output);
-	scheduler->stat.compaction_input += compaction_input.bytes;
-	scheduler->stat.compaction_output += compaction_output.bytes;
-	scheduler->stat.compaction_time += compaction_time;
-
 	/*
 	 * Unaccount unused runs and delete compacted slices.
 	 */
 	rlist_foreach_entry(run, &unused_runs, in_unused)
 		vy_lsm_remove_run(lsm, run);
-	rlist_foreach_entry_safe(slice, &compacted_slices,
-				 in_range, next_slice) {
+	for (int i = 0; i < plan->count; i++) {
+		struct vy_slice *slice = plan->slices[i];
+		vy_disk_stmt_counter_add(&compaction_input, &slice->count);
 		vy_slice_wait_pinned(slice);
 		vy_slice_delete(slice);
 	}
+	vy_lsm_acct_compaction(lsm, compaction_time,
+			       &compaction_input, &compaction_output);
+	scheduler->stat.compaction_input += compaction_input.bytes;
+	scheduler->stat.compaction_output += compaction_output.bytes;
+	scheduler->stat.compaction_time += compaction_time;
 out:
 	/* The iterator has been cleaned up in worker. */
 	task->wi->iface->close(task->wi);
-
-	assert(heap_node_is_stray(&range->heap_node));
-	vy_range_heap_insert(&lsm->range_heap, range);
 	vy_scheduler_update_lsm(scheduler, lsm);
 
 	say_verbose("%s: completed compacting range %s",
@@ -1622,15 +1590,22 @@ vy_task_compaction_abort(struct vy_task *task)
 	/* The iterator has been cleaned up in worker. */
 	task->wi->iface->close(task->wi);
 
+	/*
+	 * The range is already in the queue if it's an abort of
+	 * compaction complete hook.
+	 */
+	if (heap_node_is_stray(&range->heap_node)) {
+		vy_range_heap_insert(&lsm->range_heap, range);
+	}
+
 	struct error *e = diag_last_error(&task->diag);
 	error_log(e);
 	say_error("%s: failed to compact range %s",
 		  vy_lsm_name(lsm), vy_range_str(range));
 
 	vy_run_discard(task->new_run);
-
-	assert(heap_node_is_stray(&range->heap_node));
-	vy_range_heap_insert(&lsm->range_heap, range);
+	/* Rebuild the compaction plan - it was moved out in vy_task_new. */
+	vy_lsm_update_range(lsm, range, NULL, NULL);
 	vy_scheduler_update_lsm(scheduler, lsm);
 }
 
@@ -1646,7 +1621,7 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 
 	struct vy_range *range = vy_range_heap_top(&lsm->range_heap);
 	assert(range != NULL);
-	assert(range->compaction_priority > 1);
+	assert(range->compaction_plan.count > 1);
 
 	if (vy_lsm_split_range(lsm, range) ||
 	    vy_lsm_coalesce_range(lsm, range)) {
@@ -1663,10 +1638,11 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	if (new_run == NULL)
 		goto err_run;
 
+	struct vy_compaction_plan *plan = &range->compaction_plan;
 	struct vy_stmt_stream *wi;
-	bool is_last_level = (range->compaction_priority == range->slice_count);
 	wi = vy_write_iterator_new(task->cmp_def, lsm->index_id == 0,
-				   is_last_level, scheduler->read_views,
+				   plan->is_last_level,
+				   scheduler->read_views,
 				   lsm->index_id > 0 ? NULL :
 				   &task->deferred_delete_handler);
 	if (wi == NULL)
@@ -1674,37 +1650,28 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 
 	struct vy_slice *slice;
 	int32_t dump_count = 0;
-	int n = range->compaction_priority;
-	rlist_foreach_entry(slice, &range->slices, in_range) {
+	for (int i = 0; i < plan->count; i++) {
+		slice = plan->slices[i];
 		if (vy_write_iterator_new_slice(wi, slice,
 						lsm->disk_format) != 0)
 			goto err_wi_sub;
 		new_run->dump_lsn = MAX(new_run->dump_lsn,
 					slice->run->dump_lsn);
 		dump_count += slice->run->dump_count;
-		/* Remember the slices we are compacting. */
-		if (task->first_slice == NULL)
-			task->first_slice = slice;
-		task->last_slice = slice;
-
-		if (--n == 0)
-			break;
 	}
-	assert(n == 0);
 	assert(new_run->dump_lsn >= 0);
-	if (range->compaction_priority == range->slice_count)
-		dump_count -= slice->run->dump_count;
+	if (plan->is_last_level)
+		dump_count -= plan->slices[plan->count - 1]->run->dump_count;
 	/*
 	 * Do not update dumps_per_compaction in case compaction
 	 * was triggered manually to avoid unexpected side effects,
 	 * such as splitting/coalescing ranges for no good reason.
 	 */
 	if (range->needs_compaction)
-		new_run->dump_count = slice->run->dump_count;
+		new_run->dump_count =
+			plan->slices[plan->count - 1]->run->dump_count;
 	else
 		new_run->dump_count = dump_count;
-
-	range->needs_compaction = false;
 
 	task->range = range;
 	task->new_run = new_run;
@@ -1719,7 +1686,11 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 
 	say_verbose("%s: started compacting range %s, runs %d/%d",
 		    vy_lsm_name(lsm), vy_range_str(range),
-		    range->compaction_priority, range->slice_count);
+		    plan->count, range->slice_count);
+	/* Move the compaction plan from the range to the task. */
+	vy_compaction_plan_move(&task->compaction_plan,
+				&range->compaction_plan);
+
 	*p_task = task;
 	return 0;
 

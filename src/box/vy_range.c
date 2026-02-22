@@ -174,6 +174,76 @@ vy_range_tree_find_by_key(vy_range_tree_t *tree,
 	return range;
 }
 
+/**
+ * Clear a compaction plan but keep the allocation for reuse.
+ * Ensure the slices array can hold at least @a slice_count
+ * entries plus a NULL terminator.
+ */
+static void
+vy_compaction_plan_reset(struct vy_compaction_plan *plan, int slice_count)
+{
+	plan->count = 0;
+	plan->priority = 0;
+	plan->is_last_level = false;
+	if (plan->slices == NULL || slice_count > plan->capacity) {
+		plan->slices = xrealloc(plan->slices, (slice_count + 1) *
+					sizeof(*plan->slices));
+		plan->capacity = slice_count;
+	}
+}
+
+static inline void
+vy_compaction_plan_add(struct vy_compaction_plan *plan,
+		       struct vy_slice *slice)
+{
+	assert(plan->count < plan->capacity);
+	plan->slices[plan->count++] = slice;
+	plan->slices[plan->count] = NULL;
+}
+
+/**
+ * Finalize the compaction plan: compute compaction_queue from
+ * the selected slices. Assign priority and clear needs_compaction
+ * if there is nothing to compact.
+ */
+static void
+vy_compaction_plan_seal(struct vy_range *range)
+{
+	struct vy_compaction_plan *plan = &range->compaction_plan;
+	assert(plan->slices != NULL);
+	vy_disk_stmt_counter_reset(&range->compaction_queue);
+	if (plan->count > 0) {
+		for (int i = 0; i < plan->count; i++)
+			vy_disk_stmt_counter_add(&range->compaction_queue,
+						 &plan->slices[i]->count);
+		plan->priority = plan->count;
+	} else {
+		/* No work for forced compaction. */
+		range->needs_compaction = false;
+	}
+	plan->slices[plan->count] = NULL;
+}
+
+void
+vy_compaction_plan_destroy(struct vy_compaction_plan *plan)
+{
+	free(plan->slices);
+	plan->slices = NULL;
+}
+
+void
+vy_compaction_plan_move(struct vy_compaction_plan *dst,
+			struct vy_compaction_plan *src)
+{
+	assert(dst->slices == NULL);
+	*dst = *src;
+	src->slices = NULL;
+	src->count = 0;
+	src->capacity = 0;
+	src->priority = 0;
+	src->is_last_level = false;
+}
+
 struct vy_range *
 vy_range_new(int64_t id, struct vy_entry begin, struct vy_entry end,
 	     struct key_def *cmp_def)
@@ -204,6 +274,7 @@ vy_range_delete(struct vy_range *range)
 		tuple_unref(range->begin.stmt);
 	if (range->end.stmt != NULL)
 		tuple_unref(range->end.stmt);
+	vy_compaction_plan_destroy(&range->compaction_plan);
 
 	struct vy_slice *slice, *next_slice;
 	rlist_foreach_entry_safe(slice, &range->slices, in_range, next_slice)
@@ -401,32 +472,20 @@ vy_range_remove_slice(struct vy_range *range, struct vy_slice *slice)
  * compaction is relatively cheap, because of the level size
  * ratio.
  *
- * Given a range, this function computes the maximal level that needs
- * to be compacted and sets @compaction_priority to the number of runs
- * in this level and all preceding levels.
+ * Given a range, this function computes the maximal level that
+ * needs to be compacted and returns the number of slices in this
+ * level and all preceding levels (0 if nothing to do).
+ *
+ * The algorithm assigns slices to levels by comparing their sizes
+ * against a geometrically growing target.  Cascading compactions
+ * are avoided by accounting for the estimated output run size.
  */
-void
-vy_range_update_compaction_priority(struct vy_range *range,
-				    const struct index_opts *opts)
+static int
+vy_range_compaction_slice_count(struct vy_range *range,
+				const struct index_opts *opts)
 {
-	assert(opts->run_count_per_level > 0);
-	assert(opts->run_size_ratio > 1);
-
-	range->compaction_priority = 0;
-	vy_disk_stmt_counter_reset(&range->compaction_queue);
-
-	if (range->slice_count <= 1) {
-		/* Nothing to compact. */
-		range->needs_compaction = false;
-		return;
-	}
-
-	if (range->needs_compaction) {
-		range->compaction_priority = range->slice_count;
-		range->compaction_queue = range->count;
-		return;
-	}
-
+	/* Number of slices to compact (0 = nothing to do). */
+	int compact_slice_count = 0;
 	/* Total number of statements in checked runs. */
 	struct vy_disk_stmt_counter total_stmt_count;
 	vy_disk_stmt_counter_reset(&total_stmt_count);
@@ -533,8 +592,7 @@ vy_range_update_compaction_priority(struct vy_range *range,
 			 * for compaction. We compact all runs at
 			 * this level and upper levels.
 			 */
-			range->compaction_priority = total_run_count;
-			range->compaction_queue = total_stmt_count;
+			compact_slice_count = total_run_count;
 			est_new_run_size = total_stmt_count.bytes;
 		}
 	}
@@ -544,9 +602,63 @@ vy_range_update_compaction_priority(struct vy_range *range,
 		 * Do not store more than one run at the last level
 		 * to keep space amplification low.
 		 */
-		range->compaction_priority = total_run_count;
-		range->compaction_queue = total_stmt_count;
+		compact_slice_count = total_run_count;
 	}
+
+	return compact_slice_count;
+}
+
+/**
+ * Check if the range needs shape-based compaction and populate
+ * the compaction plan with the topmost slices that need it.
+ */
+static void
+vy_compaction_plan_check_shape(struct vy_range *range,
+			       const struct index_opts *opts)
+{
+	assert(range->slice_count >= 2);
+	int count = 0;
+	if (range->needs_compaction) {
+		count = range->slice_count;
+	} else {
+		count = vy_range_compaction_slice_count(range, opts);
+	}
+	if (count == 0)
+		return;
+	struct vy_slice *slice;
+	rlist_foreach_entry(slice, &range->slices, in_range) {
+		vy_compaction_plan_add(&range->compaction_plan, slice);
+		if (range->compaction_plan.count == count)
+			break;
+	}
+	/*
+	 * If the original plan included the oldest slice in the
+	 * range but trim then excludes it (disjoint from the
+	 * selected cluster), the cluster's keys have no older
+	 * versions below. Mark the compaction as last-level so
+	 * that tombstones and deferred DELETEs are handled
+	 * correctly, whether or not the cluster is trimmed.
+	 */
+	range->compaction_plan.is_last_level =
+		range->compaction_plan.count == range->slice_count;
+}
+
+void
+vy_range_update_compaction_priority(struct vy_range *range,
+				    const struct index_opts *opts,
+				    int64_t range_size)
+{
+	assert(opts->run_count_per_level > 0);
+	assert(opts->run_size_ratio > 1);
+	(void)range_size;
+	vy_range_update_dumps_per_compaction(range);
+
+	vy_compaction_plan_reset(&range->compaction_plan, range->slice_count);
+	vy_disk_stmt_counter_reset(&range->compaction_queue);
+	if (range->slice_count >= 2) {
+		vy_compaction_plan_check_shape(range, opts);
+	}
+	vy_compaction_plan_seal(range);
 }
 
 void
