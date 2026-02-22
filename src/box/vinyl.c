@@ -1370,6 +1370,21 @@ vy_get_by_secondary_tuple(struct vy_lsm *lsm, struct vy_tx *tx,
 		 * propagated to the secondary index yet. In this
 		 * case silently skip this tuple.
 		 */
+		/*
+		 * Charge the wasted primary lookup to the primary's
+		 * read-amp stat.  The orphan exists because the
+		 * primary hasn't compacted to produce deferred
+		 * deletes yet.  Use the primary tuple size to reflect
+		 * the actual cost of the unnecessary lookup.  This
+		 * signal accumulates across all secondary indexes,
+		 * eventually triggering primary compaction to clean
+		 * up deferred deletes.
+		 */
+		if (pk_entry.stmt != NULL)
+			vy_lsm_acct_read_amp(lsm->pk,
+					     lsm->pk->last_range,
+					     tuple_size(pk_entry.stmt),
+					     NULL);
 		vy_stmt_counter_acct_tuple(&lsm->stat.skip, entry.stmt);
 		if (pk_entry.stmt != NULL) {
 			vy_stmt_counter_acct_tuple(&lsm->pk->stat.skip,
@@ -2644,6 +2659,21 @@ static void
 vy_squash_schedule(struct vy_lsm *lsm, struct vy_entry entry,
 		   void /* struct vy_env */ *arg);
 
+/**
+ * Callback invoked when read-amp waste in a range crosses
+ * the compaction threshold.  Recomputes the range's compaction
+ * priority and updates the scheduler's compaction heap.
+ */
+static void
+vy_env_compaction_trigger(struct vy_lsm *lsm, struct vy_range *range,
+			  void *arg /* struct vy_env */)
+{
+	struct vy_env *env = arg;
+	vy_lsm_update_range(lsm, range, NULL, NULL);
+	vy_scheduler_update_lsm(&env->scheduler, lsm);
+	fiber_cond_signal(&env->scheduler.scheduler_cond);
+}
+
 static struct vy_env *
 vy_env_new(const char *path, size_t memory,
 	   int read_threads, int write_threads, bool force_recovery)
@@ -2681,7 +2711,8 @@ vy_env_new(const char *path, size_t memory,
 	if (vy_lsm_env_create(&e->lsm_env, e->path,
 			      &e->scheduler.generation,
 			      e->stmt_env.key_format,
-			      vy_squash_schedule, e) != 0)
+			      vy_squash_schedule, e,
+			      vy_env_compaction_trigger, e) != 0)
 		goto error_lsm_env;
 
 	vy_quota_create(&e->quota, memory, vy_env_quota_exceeded_cb);

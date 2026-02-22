@@ -788,7 +788,6 @@ end
 --
 g.test_bloat_below_threshold = function(cg)
     cg.server:exec(function()
-        local fiber = require('fiber')
         local s = box.schema.space.create('test', {engine = 'vinyl'})
         s:create_index('pk', {
             run_count_per_level = 100,
@@ -832,9 +831,9 @@ g.test_bloat_below_threshold = function(cg)
         local compaction_after =
             s.index.pk:stat().disk.compaction.count
 
-        -- Wait and verify no additional compaction fires.
-        -- The shared run's waste is below the threshold.
-        fiber.sleep(1)
+        -- Verify no additional compaction fires.  The retrying
+        -- above confirmed the scheduler is idle, so no new
+        -- compaction can start without a fresh trigger.
         t.assert_equals(s.index.pk:stat().disk.compaction.count,
                         compaction_after,
                         'no bloat compaction below threshold')
@@ -1014,5 +1013,554 @@ g.test_bloat_compaction_prunes_tombstones = function(cg)
                         'tombstones pruned by bloat is_last_level')
         -- 4 groups × 150 + 25 remaining REPLACEs from shared dump.
         t.assert_equals(s:count(), 625)
+    end)
+end
+
+--
+-- Read amplification compaction: when tombstones in a newer run
+-- shadow inserts in an older run, range scans accumulate wasted
+-- disk reads (bytes decompressed only to be discarded).  Once the
+-- cumulative waste exceeds the range's data size, a compaction is
+-- triggered that merges the runs and removes the tombstones.
+--
+g.test_read_amp_compaction = function(cg)
+    cg.server:exec(function()
+        -- Disable the vinyl cache so range scans always reach
+        -- disk and the waste counters accumulate on every scan.
+        local old_cache = box.cfg.vinyl_cache
+        box.cfg{vinyl_cache = 0}
+
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 100,
+            page_size = 256,
+        })
+
+        -- Step 1: Insert 10 keys (~1KB each) and snapshot → run R1.
+        for i = 1, 10 do s:replace{i, string.rep('x', 1000)} end
+        box.snapshot()
+        t.assert_equals(s.index.pk:stat().run_count, 1)
+
+        -- Step 2: Delete all 10 keys and snapshot → run R2
+        -- (tombstones).  Now the range has 2 runs.  Shape-based
+        -- compaction doesn't fire (run_count_per_level = 100).
+        for i = 1, 10 do s:delete{i} end
+        box.snapshot()
+        t.assert_equals(s.index.pk:stat().run_count, 2)
+
+        -- Step 3: Full-range scans.  For each of the 10 keys
+        -- the merge iterator reads both INSERT (from R1) and
+        -- DELETE (from R2) off disk, only to discard the result.
+        -- bytes_read grows while bytes_useful stays 0.  After
+        -- ~5 scans the waste exceeds VY_READ_AMP_THRESHOLD *
+        -- range->count.bytes (threshold is 4x), which triggers
+        -- compaction automatically via the read-amp callback.
+        for _ = 1, 10 do s:select() end
+
+        -- Wait for the read-amp-triggered compaction to complete.
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_ge(s.index.pk:stat().disk.compaction.count, 1)
+        end)
+
+        -- After compaction the tombstones are gone (last-level
+        -- compaction drops DELETEs).  The space is empty.
+        t.assert_equals(s:select(), {})
+
+        s:drop()
+        box.cfg{vinyl_cache = old_cache}
+    end)
+end
+
+--
+-- Read amplification compaction triggered by point lookups.
+-- Same setup as test_read_amp_compaction (tombstones shadowing
+-- inserts), but uses get() instead of select().
+--
+-- Point lookups charge tuple_size per disk statement — the same
+-- metric as range scans.  This captures redundancy (tombstones,
+-- shadowed versions) without inflating waste with the inherent
+-- page-read cost that compaction cannot eliminate.
+--
+-- With small DELETE tuples (~60 bytes each), each get() on a
+-- deleted key charges only tuple_size(DELETE) as waste.  We use
+-- 100 keys so that the per-round waste (100 × ~60 = ~6 KB)
+-- accumulates to exceed VY_READ_AMP_THRESHOLD *
+-- range->count.bytes (4 × ~10 KB = ~40 KB) in ~7 rounds.
+--
+g.test_read_amp_point_lookup = function(cg)
+    cg.server:exec(function()
+        local old_cache = box.cfg.vinyl_cache
+        box.cfg{vinyl_cache = 0}
+
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 100,
+        })
+
+        -- Step 1: Insert 100 keys (~100B each) and snapshot → R1.
+        for i = 1, 100 do s:replace{i, string.rep('x', 100)} end
+        box.snapshot()
+
+        -- Step 2: Delete all 100 keys and snapshot → R2.
+        for i = 1, 100 do s:delete{i} end
+        box.snapshot()
+        t.assert_equals(s.index.pk:stat().run_count, 2)
+
+        -- Step 3: Point lookups on deleted keys.  Each get()
+        -- finds a DELETE in R2 (terminal) and returns nil.
+        -- Waste per get = tuple_size(DELETE) ≈ 60 bytes.
+        -- Per round: 100 × 60 = ~6 KB.
+        -- range->count.bytes ≈ 10 KB. Threshold is 4x = 40 KB.
+        -- ~7 rounds should exceed the threshold; use 60 for
+        -- margin.  Compaction is triggered automatically via
+        -- the read-amp callback.
+        for _ = 1, 60 do
+            for i = 1, 100 do s:get{i} end
+        end
+
+        -- Wait for read-amp-triggered compaction.
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_ge(s.index.pk:stat().disk.compaction.count, 1)
+        end)
+
+        -- After compaction: tombstones gone, space is empty.
+        t.assert_equals(s:select(), {})
+
+        s:drop()
+        box.cfg{vinyl_cache = old_cache}
+    end)
+end
+
+--
+-- Deferred delete read-amp: range scans on a secondary index
+-- return orphaned entries (the primary was updated but hasn't
+-- compacted to produce deferred deletes yet).  Each orphan
+-- charges tuple_size to the primary's read-amp, eventually
+-- triggering primary compaction.
+--
+-- Tests each DML type independently:
+--   REPLACE: old SK entry stays on disk (deferred delete) → orphan.
+--   DELETE:  old SK entry stays on disk (deferred delete) → orphan.
+--   UPDATE:  vy_perform_update generates immediate SK DELETE →
+--            no orphan, no PK compaction.
+--
+g.test_read_amp_deferred_delete_scan = function(cg)
+    cg.server:exec(function()
+        local old_cache = box.cfg.vinyl_cache
+        box.cfg{vinyl_cache = 0}
+
+        local n = 100
+        local pad = string.rep('x', 500)
+
+        local dml_types = {
+            {
+                name = 'replace',
+                apply = function(s)
+                    for i = 1, n do
+                        s:replace{i, i + 10000, pad}
+                    end
+                end,
+                expect_compaction = true,
+                expect_count = n,
+            },
+            {
+                name = 'delete',
+                apply = function(s)
+                    for i = 1, n do s:delete{i} end
+                end,
+                expect_compaction = true,
+                expect_count = 0,
+            },
+            {
+                name = 'update',
+                apply = function(s)
+                    for i = 1, n do
+                        s:update(i, {{'=', 2, i + 10000}})
+                    end
+                end,
+                expect_compaction = false,
+                expect_count = n,
+            },
+        }
+
+        for _, dml in ipairs(dml_types) do
+            local s = box.schema.space.create('test', {
+                engine = 'vinyl', defer_deletes = true,
+            })
+            s:create_index('pk', {run_count_per_level = 100})
+            s:create_index('sk', {
+                parts = {2, 'unsigned'}, unique = false,
+                run_count_per_level = 100,
+            })
+
+            for i = 1, n do s:replace{i, i, pad} end
+            box.snapshot()
+
+            dml.apply(s)
+            box.snapshot()
+
+            for _ = 1, 50 do s.index.sk:select() end
+
+            if dml.expect_compaction then
+                t.helpers.retrying({timeout = 5}, function()
+                    t.assert_ge(
+                        s.index.pk:stat().disk.compaction.count, 1,
+                        dml.name .. ': expected PK compaction')
+                end)
+            else
+                t.assert_equals(
+                    s.index.pk:stat().disk.compaction.count, 0,
+                    dml.name .. ': no PK compaction expected')
+            end
+
+            t.assert_equals(s:count(), dml.expect_count,
+                            dml.name .. ': row count')
+            s:drop()
+        end
+
+        box.cfg{vinyl_cache = old_cache}
+    end)
+end
+
+--
+-- Deferred delete read-amp with point lookups on a secondary
+-- index.  Uses select(key, {limit=1}) on old SK values to
+-- trigger orphan detection and charge waste to the primary.
+-- (get() doesn't support non-unique indexes.)
+--
+-- Tests each DML type independently (same rationale as
+-- test_read_amp_deferred_delete_scan).
+--
+g.test_read_amp_deferred_delete_get = function(cg)
+    cg.server:exec(function()
+        local old_cache = box.cfg.vinyl_cache
+        box.cfg{vinyl_cache = 0}
+
+        local n = 100
+        local pad = string.rep('x', 500)
+
+        local dml_types = {
+            {
+                name = 'replace',
+                apply = function(s)
+                    for i = 1, n do
+                        s:replace{i, i + 10000, pad}
+                    end
+                end,
+                expect_compaction = true,
+                expect_count = n,
+            },
+            {
+                name = 'delete',
+                apply = function(s)
+                    for i = 1, n do s:delete{i} end
+                end,
+                expect_compaction = true,
+                expect_count = 0,
+            },
+            {
+                name = 'update',
+                apply = function(s)
+                    for i = 1, n do
+                        s:update(i, {{'=', 2, i + 10000}})
+                    end
+                end,
+                expect_compaction = false,
+                expect_count = n,
+            },
+        }
+
+        for _, dml in ipairs(dml_types) do
+            local s = box.schema.space.create('test', {
+                engine = 'vinyl', defer_deletes = true,
+            })
+            s:create_index('pk', {run_count_per_level = 100})
+            s:create_index('sk', {
+                parts = {2, 'unsigned'}, unique = false,
+                run_count_per_level = 100,
+            })
+
+            for i = 1, n do s:replace{i, i, pad} end
+            box.snapshot()
+
+            dml.apply(s)
+            box.snapshot()
+
+            -- Point-like lookups on old SK values.  For REPLACE
+            -- and DELETE, each finds an orphaned SK entry.  For
+            -- UPDATE, old SK entries are cancelled by immediate
+            -- DELETEs in SK run 2.
+            for _ = 1, 50 do
+                for i = 1, n do
+                    s.index.sk:select({i}, {limit = 1})
+                end
+            end
+
+            if dml.expect_compaction then
+                t.helpers.retrying({timeout = 5}, function()
+                    t.assert_ge(
+                        s.index.pk:stat().disk.compaction.count, 1,
+                        dml.name .. ': expected PK compaction')
+                end)
+            else
+                t.assert_equals(
+                    s.index.pk:stat().disk.compaction.count, 0,
+                    dml.name .. ': no PK compaction expected')
+            end
+
+            t.assert_equals(s:count(), dml.expect_count,
+                            dml.name .. ': row count')
+            s:drop()
+        end
+
+        box.cfg{vinyl_cache = old_cache}
+    end)
+end
+
+--
+-- Deferred delete read-amp from multiple secondary indexes.
+-- Each secondary individually contributes below the primary's
+-- waste threshold, but together they cross it.
+--
+-- Tests each DML type independently (same rationale as
+-- test_read_amp_deferred_delete_scan).
+--
+g.test_read_amp_deferred_delete_multiple_sk = function(cg)
+    cg.server:exec(function()
+        local old_cache = box.cfg.vinyl_cache
+        box.cfg{vinyl_cache = 0}
+
+        local n = 100
+        local pad = string.rep('x', 500)
+
+        local dml_types = {
+            {
+                name = 'replace',
+                apply = function(s)
+                    for i = 1, n do
+                        s:replace{i, i + 10000, i + 20000, pad}
+                    end
+                end,
+                expect_compaction = true,
+                expect_count = n,
+            },
+            {
+                name = 'delete',
+                apply = function(s)
+                    for i = 1, n do s:delete{i} end
+                end,
+                expect_compaction = true,
+                expect_count = 0,
+            },
+            {
+                name = 'update',
+                apply = function(s)
+                    for i = 1, n do
+                        s:update(i, {{'=', 2, i + 10000},
+                                     {'=', 3, i + 20000}})
+                    end
+                end,
+                expect_compaction = false,
+                expect_count = n,
+            },
+        }
+
+        for _, dml in ipairs(dml_types) do
+            local s = box.schema.space.create('test', {
+                engine = 'vinyl', defer_deletes = true,
+            })
+            s:create_index('pk', {run_count_per_level = 100})
+            s:create_index('sk1', {
+                parts = {2, 'unsigned'}, unique = false,
+                run_count_per_level = 100,
+            })
+            s:create_index('sk2', {
+                parts = {3, 'unsigned'}, unique = false,
+                run_count_per_level = 100,
+            })
+
+            for i = 1, n do s:replace{i, i, i, pad} end
+            box.snapshot()
+
+            dml.apply(s)
+            box.snapshot()
+
+            -- Scan each secondary.  Each individually contributes
+            -- below the primary's waste threshold, but together
+            -- they cross it.
+            for _ = 1, 25 do s.index.sk1:select() end
+            for _ = 1, 25 do s.index.sk2:select() end
+
+            if dml.expect_compaction then
+                t.helpers.retrying({timeout = 5}, function()
+                    t.assert_ge(
+                        s.index.pk:stat().disk.compaction.count, 1,
+                        dml.name .. ': expected PK compaction')
+                end)
+            else
+                t.assert_equals(
+                    s.index.pk:stat().disk.compaction.count, 0,
+                    dml.name .. ': no PK compaction expected')
+            end
+
+            t.assert_equals(s:count(), dml.expect_count,
+                            dml.name .. ': row count')
+            s:drop()
+        end
+
+        box.cfg{vinyl_cache = old_cache}
+    end)
+end
+
+--
+-- Read-amp compaction suppression: after compaction resets the
+-- stats, further scans should NOT re-trigger compaction until
+-- the range's slice structure changes (version bumps).
+--
+g.test_read_amp_suppression_after_compaction = function(cg)
+    cg.server:exec(function()
+        local old_cache = box.cfg.vinyl_cache
+        box.cfg{vinyl_cache = 0}
+
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 100,
+            page_size = 256,
+        })
+
+        -- Same setup: 10 inserts + 10 tombstones in 2 runs.
+        for i = 1, 10 do s:replace{i, string.rep('x', 1000)} end
+        box.snapshot()
+        for i = 1, 10 do s:delete{i} end
+        box.snapshot()
+
+        -- Accumulate waste and trigger compaction.
+        -- With 4x threshold, need ~5+ scans for the all-tombstone
+        -- workload to exceed the threshold.
+        for _ = 1, 10 do s:select() end
+        s:replace{5, 'alive'}
+        box.snapshot()
+
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_ge(s.index.pk:stat().disk.compaction.count, 1)
+        end)
+        local compaction_count = s.index.pk:stat().disk.compaction.count
+
+        -- More scans after compaction.  Since threshold_version ==
+        -- version (slices haven't changed since compaction reset
+        -- the stats), compaction must NOT re-trigger.
+        for _ = 1, 5 do s:select() end
+        -- Insert + snapshot: this snapshot creates a new dump
+        -- which bumps the range version, but the range now has
+        -- only 2 runs with tombstones already removed, so waste
+        -- should be minimal.
+        s:replace{6, 'another'}
+        box.snapshot()
+        -- The snapshot yields, giving the scheduler a chance to
+        -- run.  No compaction should trigger — waste is minimal.
+        t.assert_equals(s.index.pk:stat().disk.compaction.count,
+                        compaction_count,
+                        'no re-trigger after compaction')
+
+        s:drop()
+        box.cfg{vinyl_cache = old_cache}
+    end)
+end
+
+--
+-- Verify that reading a no-garbage range (multiple runs, non-
+-- overlapping keys, no tombstones) does NOT accumulate waste and
+-- does NOT trigger read-amp compaction.
+--
+g.test_read_amp_no_garbage = function(cg)
+    cg.server:exec(function()
+        local old_cache = box.cfg.vinyl_cache
+        box.cfg{vinyl_cache = 0}
+
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 100,  -- suppress shape compaction
+        })
+
+        -- Create two runs with non-overlapping keys.
+        -- Run 1: keys 1..50
+        for i = 1, 50 do
+            s:replace{i, string.rep('x', 100)}
+        end
+        box.snapshot()
+
+        -- Run 2: keys 51..100
+        for i = 51, 100 do
+            s:replace{i, string.rep('y', 100)}
+        end
+        box.snapshot()
+
+        -- Confirm we have 2 runs, no compaction yet.
+        -- With 2 equal-size runs: both land at level 1,
+        -- level_count=1, so the "last level > 1 run" rule
+        -- doesn't fire.  And 2 < run_count_per_level=100.
+        -- The read-amp check IS reachable: slice_count=2 >= 2,
+        -- version=2, reset_version=0 (never compacted).
+        t.assert_equals(s.index.pk:stat().run_count, 2)
+        t.assert_equals(s.index.pk:stat().disk.compaction.count, 0)
+
+        -- Heavy reads: range scans and point lookups.
+        -- Each key exists in exactly one run (non-overlapping),
+        -- so every disk read produces exactly one statement
+        -- that becomes the result.  bytes_read == bytes_useful,
+        -- waste == 0.
+        for _ = 1, 30 do
+            s:select()
+            for i = 1, 100 do
+                s:get{i}
+            end
+        end
+
+        -- No compaction should have triggered — waste is ~0.
+        -- The reads above yield many times (disk I/O), giving
+        -- the scheduler fiber ample opportunity to run.
+        t.assert_equals(s.index.pk:stat().disk.compaction.count, 0,
+                        'no compaction in a no-garbage range')
+
+        s:drop()
+
+        -- SK with defer_deletes: verify that SK reads on a clean
+        -- space (no orphans) don't produce false positive waste
+        -- charges on the primary.
+        s = box.schema.space.create('test', {
+            engine = 'vinyl', defer_deletes = true,
+        })
+        s:create_index('pk', {
+            run_count_per_level = 100,
+        })
+        s:create_index('sk', {
+            parts = {2, 'unsigned'},
+            unique = false,
+            run_count_per_level = 100,
+        })
+
+        local pad = string.rep('x', 100)
+        -- Run 1: keys 1..50 (sk = i).
+        for i = 1, 50 do s:replace{i, i, pad} end
+        box.snapshot()
+        -- Run 2: keys 51..100 (sk = i).
+        for i = 51, 100 do s:replace{i, i, pad} end
+        box.snapshot()
+
+        -- Non-overlapping PKs → every SK entry has a valid PK
+        -- match → no orphans → no waste charged to the primary.
+        -- SK range scans + SK point lookups.
+        for _ = 1, 30 do
+            s.index.sk:select()
+            for i = 1, 100 do
+                s.index.sk:select({i}, {limit = 1})
+            end
+        end
+
+        t.assert_equals(s.index.pk:stat().disk.compaction.count, 0,
+                        'no compaction in a no-garbage SK range')
+
+        s:drop()
+        box.cfg{vinyl_cache = old_cache}
     end)
 end

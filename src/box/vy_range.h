@@ -44,6 +44,7 @@
 #include "trivia/util.h"
 #include "vy_entry.h"
 #include "vy_stat.h"
+#include "vy_stmt.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -53,6 +54,82 @@ struct index_opts;
 struct key_def;
 struct vy_run;
 struct vy_slice;
+
+/**
+ * Read-to-write exchange rate for compaction decisions.
+ *
+ * Compaction rewrites the entire range, so its cost is dominated
+ * by disk writes.  On SSDs, writes are 3-5x more expensive than
+ * reads (in IOPS and wear).  This multiplier converts read waste
+ * into write-equivalent units: compaction is only worthwhile when
+ * the cumulative read waste exceeds the write cost of rewriting
+ * the range by this factor.
+ */
+enum { VY_READ_AMP_THRESHOLD = 4 };
+
+/**
+ * Per-range read amplification statistics.
+ *
+ * Tracks disk bytes consumed vs. useful bytes returned during
+ * read iterator merges.  The difference (bytes_read - bytes_useful)
+ * is the cumulative read waste from tombstones, version squashing,
+ * or shadowing by newer sources.  When this waste exceeds
+ * VY_READ_AMP_THRESHOLD * range->count.bytes, the range is
+ * scheduled for compaction.
+ *
+ * Accumulated since the last compaction; reset by
+ * vy_read_amp_stat_reset() after compaction completes.
+ */
+struct vy_read_amp_stat {
+	/** Total bytes fetched from disk slices. */
+	int64_t bytes_read;
+	/**
+	 * Bytes of result tuples yielded to the user for
+	 * iterations that involved disk I/O.  Cache-only and
+	 * mem-only reads are excluded so that the metric
+	 * reflects disk-specific waste.
+	 */
+	int64_t bytes_useful;
+	/**
+	 * Range version at which the read-amp threshold was
+	 * last crossed and compaction was triggered.  Once set,
+	 * further read-amp compaction triggers are suppressed
+	 * while range->version equals this value, because
+	 * re-compacting unchanged slices cannot reduce the
+	 * waste.  When a dump or compaction changes the range's
+	 * slice set (bumping version), the guard expires and
+	 * waste is re-evaluated against the new structure.
+	 *
+	 * Not reset by compaction completion -- only set when
+	 * the threshold is actually crossed.
+	 */
+	uint32_t threshold_version;
+};
+
+/** Reset read-amp counters after compaction. */
+static inline void
+vy_read_amp_stat_reset(struct vy_read_amp_stat *stat)
+{
+	stat->bytes_read = 0;
+	stat->bytes_useful = 0;
+}
+
+/**
+ * Account a read operation in the read-amp statistics.
+ * @param stat        Read-amp counters to update.
+ * @param disk_bytes  Total bytes read from disk for this operation.
+ * @param result      The useful result tuple, or NULL if the read
+ *                    produced no useful output (e.g. a tombstone
+ *                    or an orphaned secondary index entry).
+ */
+static inline void
+vy_read_amp_stat_acct(struct vy_read_amp_stat *stat,
+		      int64_t disk_bytes, struct tuple *result)
+{
+	stat->bytes_read += disk_bytes;
+	if (result != NULL)
+		stat->bytes_useful += tuple_size(result);
+}
 
 /**
  * A pre-computed compaction plan for a range.
@@ -183,6 +260,8 @@ struct vy_range {
 	bool needs_compaction;
 	/** Number of times the range was compacted. */
 	int n_compactions;
+	/** Read amplification tracking, see struct vy_read_amp_stat. */
+	struct vy_read_amp_stat read_amp;
 	/**
 	 * Number of dumps it takes to trigger major compaction in
 	 * this range, see vy_run::dump_count for more details.
@@ -198,6 +277,23 @@ struct vy_range {
 	 */
 	uint32_t version;
 };
+
+/**
+ * Account a read operation against the read-amp statistics of @a range.
+ * A DELETE with VY_STMT_DEFERRED_DELETE is not counted as useful: the
+ * primary hasn't compacted to produce deferred deletes for secondary
+ * indexes yet, so the entire disk I/O is waste from that backlog.
+ */
+static inline void
+vy_range_acct_read_amp(struct vy_range *range, int64_t disk_bytes,
+		       struct tuple *result)
+{
+	if (result != NULL &&
+	    vy_stmt_type(result) == IPROTO_DELETE &&
+	    (vy_stmt_flags(result) & VY_STMT_DEFERRED_DELETE) != 0)
+		result = NULL;
+	vy_read_amp_stat_acct(&range->read_amp, disk_bytes, result);
+}
 
 /**
  * When looking for the best range split point, this structure

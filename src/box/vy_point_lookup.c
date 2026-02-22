@@ -187,6 +187,7 @@ vy_point_lookup_scan_slices(struct vy_lsm *lsm, const struct vy_read_view **rv,
 	struct vy_range *range = vy_range_tree_find_by_key(&lsm->range_tree,
 							   ITER_EQ, key);
 	assert(range != NULL);
+	lsm->last_range = range;
 	int slice_count = range->slice_count;
 	size_t region_svp = region_used(&fiber()->gc);
 	if (slice_count == 0)
@@ -225,6 +226,7 @@ vy_point_lookup(struct vy_lsm *lsm, struct vy_tx *tx,
 
 	*ret = vy_entry_none();
 	int rc = 0;
+	int64_t disk_bytes = 0;
 
 	/* History list */
 	struct vy_history history, mem_history, disk_history;
@@ -296,6 +298,17 @@ restart:
 			vy_history_cleanup(&disk_history);
 	}
 
+	/*
+	 * Before the splice consumes disk_history, sum the
+	 * tuple sizes for read-amp tracking.  This is the same
+	 * metric as range scans (tuple_size per disk statement):
+	 * it captures redundancy (tombstones, shadowed versions)
+	 * without conflating it with the inherent page-read cost
+	 * that compaction cannot eliminate.
+	 */
+	struct vy_history_node *node;
+	rlist_foreach_entry(node, &disk_history.stmts, link)
+		disk_bytes += tuple_size(node->entry.stmt);
 done:
 	vy_history_splice(&history, &mem_history);
 	vy_history_splice(&history, &disk_history);
@@ -305,6 +318,8 @@ done:
 		rc = vy_history_apply(&history, lsm->cmp_def,
 				      keep_delete, &upserts_applied, ret);
 		lsm->stat.upsert.applied += upserts_applied;
+		vy_lsm_acct_read_amp(lsm, lsm->last_range,
+				     disk_bytes, ret->stmt);
 	}
 	vy_history_cleanup(&history);
 

@@ -236,6 +236,15 @@ vy_scheduler_force_compaction(struct vy_scheduler *scheduler,
 			      struct vy_lsm *lsm);
 
 /**
+ * Update the position of @a lsm in the dump and compaction heaps.
+ * Call after changing the compaction priority of a range or
+ * the dump priority of the LSM tree.
+ */
+void
+vy_scheduler_update_lsm(struct vy_scheduler *scheduler,
+			struct vy_lsm *lsm);
+
+/**
  * Schedule a checkpoint. Please call vy_scheduler_wait_checkpoint()
  * after that.
  */

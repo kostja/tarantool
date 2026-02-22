@@ -60,9 +60,18 @@ struct vy_mem_env;
 struct vy_recovery;
 struct vy_run;
 struct vy_run_env;
-
 typedef void
 (*vy_upsert_thresh_cb)(struct vy_lsm *lsm, struct vy_entry entry, void *arg);
+
+/**
+ * Callback invoked when read-amp waste in a range crosses the
+ * compaction threshold.  The callback should recompute the
+ * compaction priority for the range (e.g. via
+ * vy_lsm_update_range) and reschedule the LSM tree.
+ */
+typedef void
+(*vy_compaction_trigger_cb)(struct vy_lsm *lsm, struct vy_range *range,
+			    void *arg);
 
 /** Common LSM tree environment. */
 struct vy_lsm_env {
@@ -126,6 +135,13 @@ struct vy_lsm_env {
 	int64_t compaction_queue_size;
 	/** Memory pool for vy_history_node allocations. */
 	struct mempool history_node_pool;
+	/**
+	 * Callback invoked when read-amp waste crosses the
+	 * compaction threshold, see vy_compaction_trigger_cb.
+	 */
+	vy_compaction_trigger_cb compaction_trigger_cb;
+	/** Argument passed to compaction_trigger_cb. */
+	void *compaction_trigger_arg;
 };
 
 /** Create a common LSM tree environment. */
@@ -133,7 +149,9 @@ int
 vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 		  int64_t *p_generation, struct tuple_format *key_format,
 		  vy_upsert_thresh_cb upsert_thresh_cb,
-		  void *upsert_thresh_arg);
+		  void *upsert_thresh_arg,
+		  vy_compaction_trigger_cb compaction_trigger_cb,
+		  void *compaction_trigger_arg);
 
 /** Destroy a common LSM tree environment. */
 void
@@ -244,6 +262,8 @@ struct vy_lsm {
 	 * vy_range->tree_node, ordered by vy_range->begin.
 	 */
 	vy_range_tree_t range_tree;
+	/** The range used by the most recent point lookup. */
+	struct vy_range *last_range;
 	/** Number of ranges in this LSM tree. */
 	int range_count;
 	/** Sum dumps_per_compaction across all ranges. */
@@ -469,6 +489,19 @@ vy_lsm_compaction_priority(struct vy_lsm *lsm);
 /** Return the target size of a range in an LSM tree. */
 int64_t
 vy_lsm_range_size(struct vy_lsm *lsm);
+
+/**
+ * Account a read operation against @a range's read-amp statistics
+ * and, if the cumulative waste crosses the compaction threshold,
+ * recompute the range's compaction priority and notify the
+ * scheduler.
+ *
+ * This is the main entry point for read-amp tracking from the
+ * read iterator and point lookup paths.
+ */
+void
+vy_lsm_acct_read_amp(struct vy_lsm *lsm, struct vy_range *range,
+		     int64_t disk_bytes, struct tuple *result);
 
 /** Add a run to the list of runs of an LSM tree. */
 void

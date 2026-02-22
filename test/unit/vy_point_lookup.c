@@ -70,7 +70,7 @@ test_basic()
 	int rc;
 	struct vy_lsm_env lsm_env;
 	rc = vy_lsm_env_create(&lsm_env, ".", &generation,
-			       stmt_env.key_format, NULL, NULL);
+			       stmt_env.key_format, NULL, NULL, NULL, NULL);
 	is(rc, 0, "vy_lsm_env_create");
 
 	struct vy_run_env run_env;

@@ -74,7 +74,9 @@ int
 vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 		  int64_t *p_generation, struct tuple_format *key_format,
 		  vy_upsert_thresh_cb upsert_thresh_cb,
-		  void *upsert_thresh_arg)
+		  void *upsert_thresh_arg,
+		  vy_compaction_trigger_cb compaction_trigger_cb,
+		  void *compaction_trigger_arg)
 {
 	env->empty_key.hint = HINT_NONE;
 	env->empty_key.stmt = vy_key_new(key_format, NULL, 0);
@@ -86,6 +88,8 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 	tuple_format_ref(key_format);
 	env->upsert_thresh_cb = upsert_thresh_cb;
 	env->upsert_thresh_arg = upsert_thresh_arg;
+	env->compaction_trigger_cb = compaction_trigger_cb;
+	env->compaction_trigger_arg = compaction_trigger_arg;
 	env->too_long_threshold = TIMEOUT_INFINITY;
 	env->lsm_count = 0;
 	mempool_create(&env->history_node_pool, cord_slab_cache(),
@@ -792,6 +796,8 @@ vy_lsm_remove_range(struct vy_lsm *lsm, struct vy_range *range)
 	assert(! heap_node_is_stray(&range->heap_node));
 	vy_range_heap_delete(&lsm->range_heap, range);
 	vy_range_tree_remove(&lsm->range_tree, range);
+	if (lsm->last_range == range)
+		lsm->last_range = NULL;
 	lsm->range_count--;
 }
 
@@ -829,6 +835,49 @@ vy_lsm_unacct_range(struct vy_lsm *lsm, struct vy_range *range)
 		if (lsm->index_id == 0)
 			lsm->env->compacted_data_size -= slice->count.bytes;
 	}
+}
+
+void
+vy_lsm_acct_read_amp(struct vy_lsm *lsm, struct vy_range *range,
+		     int64_t disk_bytes, struct tuple *result)
+{
+	if (disk_bytes == 0 || range == NULL)
+		return;
+	/*
+	 * Skip both accumulation and the threshold check if we
+	 * already triggered compaction for this range version.
+	 * Re-compacting unchanged slices cannot reduce the waste,
+	 * and continuing to accumulate stale bytes_read would
+	 * inflate the waste counter, causing a spurious re-trigger
+	 * after the next version bump (e.g. a dump).
+	 */
+	if (range->read_amp.threshold_version == range->version)
+		return;
+	vy_range_acct_read_amp(range, disk_bytes, result);
+	int64_t waste = range->read_amp.bytes_read -
+			range->read_amp.bytes_useful;
+	if (waste <= range->count.bytes * VY_READ_AMP_THRESHOLD)
+		return;
+	/*
+	 * The waste has crossed the threshold.  Invoke the
+	 * callback to recompute the compaction priority and
+	 * reschedule the LSM tree.
+	 *
+	 * The callback calls vy_lsm_update_range ->
+	 * vy_compaction_plan_check_read_amp, which resets
+	 * the stats and sets threshold_version to suppress
+	 * further triggers until the slice set changes.
+	 *
+	 * Zero the counters again after the callback as a
+	 * safety net: if compaction completes during a scan
+	 * yield and reduces the range to <= 1 slice,
+	 * check_read_amp returns early without resetting.
+	 * The redundant reset for the normal path is harmless.
+	 */
+	if (lsm->env->compaction_trigger_cb != NULL)
+		lsm->env->compaction_trigger_cb(lsm, range,
+				lsm->env->compaction_trigger_arg);
+	vy_read_amp_stat_reset(&range->read_amp);
 }
 
 void

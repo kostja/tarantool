@@ -833,6 +833,56 @@ vy_compaction_plan_check_shape(struct vy_range *range,
 }
 
 /**
+ * Check for read amplification from tombstones, version churn,
+ * and cross-slice shadowing.
+ *
+ * The read iterator tracks bytes_read (total bytes fetched from
+ * disk slices) and bytes_useful (bytes of results yielded to the
+ * user from disk-involving reads).  The difference is cumulative
+ * waste: bytes decompressed from pages only to be discarded.
+ *
+ * When the waste exceeds VY_READ_AMP_THRESHOLD times the range's
+ * data size, the cumulative read cost has justified the write
+ * cost of rewriting the range, so compaction is worthwhile.
+ *
+ * We schedule a full major compaction (all slices) and then let
+ * vy_compaction_plan_trim() reduce it to the overlapping cluster
+ * that is most likely the source of the waste.
+ *
+ * Once the threshold is crossed, we reset the counters and set
+ * threshold_version to suppress re-triggering while the range's
+ * slice set remains unchanged.  When compaction (or a dump)
+ * later bumps range->version, the guard expires and fresh
+ * accumulation starts on zeroed counters.
+ */
+static void
+vy_compaction_plan_check_read_amp(struct vy_range *range,
+				  const struct index_opts *opts)
+{
+	if (range->slice_count <= 1)
+		return;
+	if (range->version == range->read_amp.threshold_version)
+		return;
+	int64_t waste = range->read_amp.bytes_read -
+			range->read_amp.bytes_useful;
+	if (waste <= range->count.bytes * VY_READ_AMP_THRESHOLD)
+		return;
+	vy_read_amp_stat_reset(&range->read_amp);
+	range->read_amp.threshold_version = range->version;
+	struct vy_slice *slice;
+	rlist_foreach_entry(slice, &range->slices, in_range)
+		vy_compaction_plan_add(&range->compaction_plan, slice);
+	/*
+	 * is_last_level is true because all slices are in the plan.
+	 * Trim can only remove slices whose key ranges are disjoint
+	 * from the selected cluster, so the flag survives the trim
+	 * (same reasoning as in vy_compaction_plan_check_shape).
+	 */
+	range->compaction_plan.is_last_level = true;
+	vy_compaction_plan_trim(range, opts);
+}
+
+/**
  * Check for space amplification from unfair range splits.
  *
  * After a range split (or a dump that spans many ranges) several
@@ -986,6 +1036,17 @@ vy_range_update_compaction_priority(struct vy_range *range,
 		} else if (range->slice_count >= 2) {
 			vy_compaction_plan_check_shape(range, opts);
 		}
+		/*
+		 * Priority order: shape > read-amp > bloat.
+		 * Shape-based compaction reduces run count (read
+		 * amplification from the LSM structure).  Read-amp
+		 * compaction removes tombstones and shadowed versions
+		 * detected by actual reads.  Bloat compaction reclaims
+		 * space from oversized shared run files -- lowest
+		 * priority since it only saves disk space.
+		 */
+		if (vy_compaction_plan_is_empty(&range->compaction_plan))
+			vy_compaction_plan_check_read_amp(range, opts);
 		if (vy_compaction_plan_is_empty(&range->compaction_plan))
 			vy_compaction_plan_check_bloat(range);
 		if (range->compaction_plan.count > 0 &&

@@ -973,6 +973,27 @@ vy_read_iterator_track_read(struct vy_read_iterator *itr, struct vy_entry entry)
 	return rc;
 }
 
+/**
+ * Count bytes contributed by disk sources that participated in the
+ * current merge step.  Must be called before apply_history splices
+ * the per-source histories.
+ */
+static int64_t
+vy_read_iterator_disk_bytes(struct vy_read_iterator *itr)
+{
+	int64_t disk_bytes = 0;
+	for (uint32_t i = itr->disk_src; i < itr->src_count; i++) {
+		struct vy_read_src *src = &itr->src[i];
+		if (src->front_id == itr->front_id) {
+			struct vy_entry e =
+				vy_history_last_stmt(&src->history);
+			if (e.stmt != NULL)
+				disk_bytes += tuple_size(e.stmt);
+		}
+	}
+	return disk_bytes;
+}
+
 NODISCARD int
 vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result)
 {
@@ -982,6 +1003,7 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result)
 next_key:
 	if (vy_read_iterator_advance(itr) != 0)
 		return -1;
+	int64_t disk_bytes = vy_read_iterator_disk_bytes(itr);
 	if (vy_read_iterator_apply_history(itr, &entry) != 0)
 		return -1;
 	if (vy_read_iterator_track_read(itr, entry) != 0)
@@ -994,11 +1016,14 @@ next_key:
 	if (entry.stmt != NULL && vy_stmt_type(entry.stmt) == IPROTO_DELETE) {
 		/*
 		 * We don't return DELETEs so skip to the next key.
+		 * Charge disk bytes as pure waste (no useful result).
 		 * If the DELETE was read from TX write set, there
 		 * is a good chance that the space actually has
 		 * the deleted key and hence we must not consider
 		 * previous + current tuple as an unbroken chain.
 		 */
+		vy_lsm_acct_read_amp(itr->lsm, itr->curr_range,
+				     disk_bytes, NULL);
 		if (vy_stmt_lsn(entry.stmt) == INT64_MAX) {
 			if (itr->last_cached.stmt != NULL)
 				tuple_unref(itr->last_cached.stmt);
@@ -1014,6 +1039,8 @@ next_key:
 	assert(entry.stmt == NULL ||
 	       vy_stmt_type(entry.stmt) == IPROTO_INSERT ||
 	       vy_stmt_type(entry.stmt) == IPROTO_REPLACE);
+
+	vy_lsm_acct_read_amp(itr->lsm, itr->curr_range, disk_bytes, entry.stmt);
 
 	itr->check_exact_match = false;
 	*result = entry;
