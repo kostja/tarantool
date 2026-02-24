@@ -3,7 +3,7 @@ fiber = require('fiber')
 digest = require('digest')
 
 s = box.schema.space.create('test', {engine = 'vinyl'})
-_ = s:create_index('pk', {run_count_per_level = 100, page_size = 128, range_size = 1024})
+_ = s:create_index('pk', {run_count_per_level = 100, page_size = 128, range_size = 8192})
 
 test_run:cmd("setopt delimiter ';'")
 function dump(big)
@@ -20,12 +20,13 @@ end;
 -- number of completed tasks.
 --
 function compact(tasks_expected)
-    local scheduler = box.stat.vinyl().scheduler
-    local tasks_completed = scheduler.tasks_completed
+    local tasks_completed = box.stat.vinyl().scheduler.tasks_completed
     s.index.pk:compact()
-    repeat
-        fiber.sleep(0.001)
-    until box.stat.vinyl().scheduler.tasks_completed >= tasks_completed + tasks_expected
+    test_run:wait_cond(function()
+        local stat = box.stat.vinyl().scheduler
+        return stat.idle == 1
+            and stat.tasks_completed >= tasks_completed + tasks_expected
+    end, 10)
 end;
 test_run:cmd("setopt delimiter ''");
 
@@ -39,22 +40,22 @@ assert(s.index.pk:stat().range_count == 1)
 assert(s.index.pk:stat().run_count == 2)
 
 compact(1)
-assert(s.index.pk:stat().range_count == 1)
+assert(s.index.pk:stat().range_count == 2)
 assert(s.index.pk:stat().run_count == 1)
 
 dump()
-assert(s.index.pk:stat().range_count == 1)
+assert(s.index.pk:stat().range_count == 2)
 assert(s.index.pk:stat().run_count == 2)
 
 errinj = box.error.injection
 errinj.set('ERRINJ_VY_STMT_ALLOC_COUNTDOWN', 0)
 -- Should finish successfully despite vy_stmt_alloc() failure.
--- Still split_range() fails, as a result we get one range
--- instead two.
+-- One of the compaction tasks fails immediately, is re-scheduled,
+-- and then finishes at the second attempt.
 --
-compact(1)
-assert(s.index.pk:stat().range_count == 1)
-assert(s.index.pk:stat().run_count == 1)
+compact(2)
+assert(s.index.pk:stat().range_count == 2)
+assert(s.index.pk:stat().run_count == 2)
 assert(errinj.get('ERRINJ_VY_STMT_ALLOC_COUNTDOWN') == -1)
 errinj.set('ERRINJ_VY_STMT_ALLOC_COUNTDOWN', -1)
 
@@ -64,7 +65,7 @@ s:drop()
 -- Re-create space for the sake of test purity.
 --
 s = box.schema.space.create('test', {engine = 'vinyl'})
-_ = s:create_index('pk', {run_count_per_level = 100, page_size = 128, range_size = 1024})
+_ = s:create_index('pk', {run_count_per_level = 100, page_size = 128, range_size = 8192})
 
 dump(true)
 dump()
@@ -93,7 +94,7 @@ s:drop()
 -- vy_read_view_merge() fails.
 --
 s = box.schema.space.create('test', {engine = 'vinyl'})
-_ = s:create_index('pk', {run_count_per_level = 100, page_size = 128, range_size = 1024})
+_ = s:create_index('pk', {run_count_per_level = 100, page_size = 128, range_size = 8192})
 
 dump(true)
 dump()
@@ -118,7 +119,7 @@ s:drop()
 -- tuple.
 --
 s = box.schema.space.create('test', {engine = 'vinyl'})
-_ = s:create_index('pk', {run_count_per_level = 100, page_size = 128, range_size = 1024})
+_ = s:create_index('pk', {run_count_per_level = 100, page_size = 128, range_size = 8192})
 
 dump(true)
 dump()
@@ -126,7 +127,7 @@ dump()
 compact(1)
 
 dump()
-assert(s.index.pk:stat().range_count == 1)
+assert(s.index.pk:stat().range_count == 2)
 assert(s.index.pk:stat().run_count == 2)
 
 errinj.set('ERRINJ_VY_WRITE_ITERATOR_START_FAIL', true)

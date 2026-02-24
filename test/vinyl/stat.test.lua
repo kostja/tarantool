@@ -96,10 +96,13 @@ function gstat()
     return st
 end;
 
--- Wait until a stat counter changes.
+-- Wait until a stat counter changes and the scheduler settles.
 function wait(stat_func, stat, path, diff)
     while (stat_diff(stat_func(), stat, path) or 0) < diff do
         fiber.sleep(0.01)
+    end
+    while box.stat.vinyl().scheduler.idle ~= 1 do
+        fiber.sleep(0.001)
     end
 end;
 
@@ -190,10 +193,10 @@ st = istat()
 box.snapshot()
 wait(istat, st, 'disk.compaction.count', 2)
 st = istat()
-st.range_count -- 2
+st.range_count -- 4
 st.run_count -- 2
-st.run_avg -- 1
-st.run_histogram -- [1]:2
+st.run_avg -- 0
+st.run_histogram -- [1]:4
 
 -- range lookup
 for i = 1, 100 do put(i) end

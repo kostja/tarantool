@@ -112,10 +112,9 @@ function info()
 end
 function compact()
     s.index.pk:compact()
-    repeat
-        fiber.sleep(0.001)
-        local info = s.index.pk:stat()
-    until info.range_count == info.run_count
+    test_run:wait_cond(function()
+        return box.stat.vinyl().scheduler.idle == 1
+    end, 10)
 end;
 ---
 ...
@@ -143,10 +142,10 @@ info() -- 1 range, 3 runs
 compact()
 ---
 ...
-info() -- 1 range, 1 run
+info() -- 2 ranges, 1 run
 ---
 - run_count: 1
-  range_count: 1
+  range_count: 2
 ...
 compact() -- no-op
 ---
@@ -160,18 +159,18 @@ dump()
 dump()
 ---
 ...
-info() -- 1 range, 4 runs
+info() -- 2 ranges, 4 runs
 ---
 - run_count: 4
-  range_count: 1
+  range_count: 2
 ...
 compact()
 ---
 ...
-info() -- 2 ranges, 2 runs
+info() -- 4 ranges, 2 runs
 ---
 - run_count: 2
-  range_count: 2
+  range_count: 4
 ...
 compact() -- no-op
 ---
@@ -185,18 +184,18 @@ dump()
 dump()
 ---
 ...
-info() -- 2 ranges, 5 runs
+info() -- 4 ranges, 5 runs
 ---
 - run_count: 5
-  range_count: 2
+  range_count: 4
 ...
 compact()
 ---
 ...
-info() -- 4 ranges, 4 runs
+info() -- 8 ranges, 4 runs
 ---
 - run_count: 4
-  range_count: 4
+  range_count: 8
 ...
 s:drop()
 ---

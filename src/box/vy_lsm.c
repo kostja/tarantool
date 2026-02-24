@@ -1134,14 +1134,10 @@ vy_lsm_find_range_intersection(struct vy_lsm *lsm,
 }
 
 bool
-vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
+vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
+		   const char *split_key_raw)
 {
 	struct tuple_format *key_format = lsm->env->key_format;
-
-	const char *split_key_raw;
-	if (!vy_range_needs_split(range, vy_lsm_range_size(lsm),
-				  &split_key_raw))
-		return false;
 
 	/* Split a range in two parts. */
 	const int n_parts = 2;

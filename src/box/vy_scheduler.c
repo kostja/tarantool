@@ -635,6 +635,22 @@ vy_scheduler_force_compaction(struct vy_scheduler *scheduler,
 	fiber_cond_signal(&scheduler->scheduler_cond);
 }
 
+bool
+vy_scheduler_is_idle(struct vy_scheduler *scheduler)
+{
+	if (scheduler->stat.tasks_inprogress > 0)
+		return false;
+	if (!stailq_empty(&scheduler->processed_tasks))
+		return false;
+	if (vy_scheduler_dump_in_progress(scheduler))
+		return false;
+	struct vy_lsm *lsm =
+		vy_compaction_heap_top(&scheduler->compaction_heap);
+	if (lsm != NULL && vy_lsm_compaction_priority(lsm) > 0)
+		return false;
+	return true;
+}
+
 /**
  * Check whether the current dump round is complete.
  * If it is, free memory and proceed to the next dump round.
@@ -1623,12 +1639,6 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	assert(range != NULL);
 	assert(range->compaction_plan.count > 1);
 
-	if (vy_lsm_split_range(lsm, range) ||
-	    vy_lsm_coalesce_range(lsm, range)) {
-		vy_scheduler_update_lsm(scheduler, lsm);
-		return 0;
-	}
-
 	struct vy_task *task = vy_task_new(scheduler, worker, lsm,
 					   &compaction_ops);
 	if (task == NULL)
@@ -1892,13 +1902,44 @@ retry:
 	struct vy_lsm *lsm = vy_compaction_heap_top(&scheduler->compaction_heap);
 	if (lsm == NULL)
 		goto no_task; /* nothing to do */
-	if (vy_lsm_compaction_priority(lsm) <= 1)
+	if (vy_lsm_compaction_priority(lsm) == 0)
 		goto no_task; /* nothing to do */
 	/*
 	 * The code below may yield. Take a reference to the LSM tree
 	 * to make sure it isn't deleted in the meantime.
 	 */
 	vy_lsm_ref(lsm);
+	struct vy_range *range = vy_range_heap_top(&lsm->range_heap);
+	assert(range != NULL);
+	/*
+	 * Try to coalesce the range with a neighbor.
+	 * This handles both empty ranges (priority 1, count 0)
+	 * and non-empty small ranges.
+	 */
+	if (vy_lsm_coalesce_range(lsm, range)) {
+		vy_scheduler_update_lsm(scheduler, lsm);
+		vy_lsm_unref(lsm);
+		goto retry;
+	}
+	/*
+	 * Split the range if the plan says it is oversized.
+	 * The original range disappears; restart scheduling.
+	 */
+	if (range->compaction_plan.split_key != NULL &&
+	    vy_lsm_split_range(lsm, range,
+			       range->compaction_plan.split_key)) {
+		vy_scheduler_update_lsm(scheduler, lsm);
+		vy_lsm_unref(lsm);
+		goto retry;
+	}
+	/*
+	 * No compaction work (e.g. an empty range whose neighbors
+	 * are all scheduled, or a split that failed due to OOM).
+	 */
+	if (range->compaction_plan.count == 0) {
+		vy_lsm_unref(lsm);
+		goto no_task;
+	}
 	if (worker == NULL) {
 		worker = vy_worker_pool_get(&scheduler->compaction_pool);
 		if (worker == NULL) {
@@ -1912,8 +1953,6 @@ retry:
 		return -1;
 	}
 	vy_lsm_unref(lsm);
-	if (*ptask == NULL)
-		goto retry; /* LSM tree dropped or range split/coalesced */
 	return 0; /* new task */
 no_task:
 	if (worker != NULL)
@@ -1954,7 +1993,6 @@ vy_task_complete(struct vy_task *task)
 	struct vy_scheduler *scheduler = task->scheduler;
 
 	assert(scheduler->stat.tasks_inprogress > 0);
-	scheduler->stat.tasks_inprogress--;
 
 	struct diag *diag = &task->diag;
 	if (task->is_failed) {
@@ -1972,12 +2010,22 @@ vy_task_complete(struct vy_task *task)
 		diag_move(diag_get(), diag);
 		goto fail;
 	}
+	/*
+	 * Decrement tasks_inprogress after the completion callback,
+	 * not before.  The callback may yield (e.g. at
+	 * vy_log_tx_commit), and during that yield an observer
+	 * polling vy_scheduler_is_idle() must see tasks_inprogress > 0
+	 * to avoid concluding the scheduler is idle while the task
+	 * is still being finalized.
+	 */
+	scheduler->stat.tasks_inprogress--;
 	scheduler->stat.tasks_completed++;
 	return 0;
 fail:
 	if (task->ops->abort)
 		task->ops->abort(task);
 	diag_move(diag, &scheduler->diag);
+	scheduler->stat.tasks_inprogress--;
 	scheduler->stat.tasks_failed++;
 	return -1;
 }

@@ -248,6 +248,7 @@ vy_info_append_scheduler(struct vy_env *env, struct info_handler *h)
 	info_append_int(h, "compaction_output", stat->compaction_output);
 	info_append_int(h, "compaction_queue",
 			env->lsm_env.compaction_queue_size);
+	info_append_int(h, "idle", vy_scheduler_is_idle(&env->scheduler));
 	info_table_end(h); /* scheduler */
 }
 

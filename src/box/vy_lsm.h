@@ -592,7 +592,8 @@ vy_lsm_find_range_intersection(struct vy_lsm *lsm,
  * operations, like writing a run file, and is done immediately.
  */
 bool
-vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range);
+vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
+		   const char *split_key_raw);
 
 /**
  * Coalesce a range with one or more its neighbors if it is too small,

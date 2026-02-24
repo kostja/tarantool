@@ -173,6 +173,14 @@ vy_scheduler_dump_in_progress(struct vy_scheduler *scheduler)
 }
 
 /**
+ * Return true if the scheduler has no pending work: no tasks
+ * in progress, no completed tasks to process, no dumps or
+ * compactions to schedule.
+ */
+bool
+vy_scheduler_is_idle(struct vy_scheduler *scheduler);
+
+/**
  * Create a scheduler instance.
  */
 void

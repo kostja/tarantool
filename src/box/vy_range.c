@@ -185,6 +185,7 @@ vy_compaction_plan_reset(struct vy_compaction_plan *plan, int slice_count)
 	plan->count = 0;
 	plan->priority = 0;
 	plan->is_last_level = false;
+	plan->split_key = NULL;
 	if (plan->slices == NULL || slice_count > plan->capacity) {
 		plan->slices = xrealloc(plan->slices, (slice_count + 1) *
 					sizeof(*plan->slices));
@@ -212,7 +213,22 @@ vy_compaction_plan_seal(struct vy_range *range)
 	struct vy_compaction_plan *plan = &range->compaction_plan;
 	assert(plan->slices != NULL);
 	vy_disk_stmt_counter_reset(&range->compaction_queue);
-	if (plan->count > 0) {
+	if (range->slice_count == 0) {
+		/*
+		 * Empty range: schedule for coalescing with a
+		 * neighbor.  Skip the range if it spans the entire
+		 * key space (begin == NULL && end == NULL), because
+		 * that means it is the only range in the LSM tree
+		 * and there is nobody to coalesce with.
+		 */
+		assert(plan->count == 0);
+		if (range->begin.stmt != NULL || range->end.stmt != NULL)
+			plan->priority = 1;
+	} else if (plan->split_key != NULL) {
+		/* Oversized range: schedule for splitting. */
+		assert(plan->count == 0);
+		plan->priority = range->slice_count;
+	} else if (plan->count > 0) {
 		for (int i = 0; i < plan->count; i++)
 			vy_disk_stmt_counter_add(&range->compaction_queue,
 						 &plan->slices[i]->count);
@@ -242,6 +258,7 @@ vy_compaction_plan_move(struct vy_compaction_plan *dst,
 	src->capacity = 0;
 	src->priority = 0;
 	src->is_last_level = false;
+	src->split_key = NULL;
 }
 
 struct vy_range *
@@ -650,13 +667,25 @@ vy_range_update_compaction_priority(struct vy_range *range,
 {
 	assert(opts->run_count_per_level > 0);
 	assert(opts->run_size_ratio > 1);
-	(void)range_size;
+
 	vy_range_update_dumps_per_compaction(range);
 
 	vy_compaction_plan_reset(&range->compaction_plan, range->slice_count);
 	vy_disk_stmt_counter_reset(&range->compaction_queue);
-	if (range->slice_count >= 2) {
-		vy_compaction_plan_check_shape(range, opts);
+	if (range->slice_count >= 1) {
+		/*
+		 * Check if the range needs splitting before developing
+		 * the compaction plan.  Split is cheap (runs in the
+		 * scheduler fiber) and takes priority over compaction:
+		 * after the split, children inherit needs_compaction
+		 * and get their own compaction plans.
+		 */
+		const char *split_key;
+		if (vy_range_needs_split(range, range_size, &split_key)) {
+			range->compaction_plan.split_key = split_key;
+		} else if (range->slice_count >= 2) {
+			vy_compaction_plan_check_shape(range, opts);
+		}
 	}
 	vy_compaction_plan_seal(range);
 }
@@ -1067,6 +1096,26 @@ vy_range_needs_coalesce(struct vy_range *range, vy_range_tree_t *tree,
 	 * a worker thread.
 	 */
 	assert(!vy_range_is_scheduled(range));
+
+	/*
+	 * An empty range (no slices) should be unconditionally
+	 * coalesced with any unscheduled neighbor, regardless
+	 * of size.  Try right neighbor first, then left.
+	 */
+	if (range->slice_count == 0) {
+		*p_first = *p_last = range;
+		it = vy_range_tree_next(tree, range);
+		if (it != NULL && !vy_range_is_scheduled(it)) {
+			*p_last = it;
+			return true;
+		}
+		it = vy_range_tree_prev(tree, range);
+		if (it != NULL && !vy_range_is_scheduled(it)) {
+			*p_first = it;
+			return true;
+		}
+		return false;
+	}
 
 	*p_first = *p_last = range;
 	for (it = vy_range_tree_next(tree, range);

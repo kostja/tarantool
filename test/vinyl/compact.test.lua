@@ -56,10 +56,9 @@ function info()
 end
 function compact()
     s.index.pk:compact()
-    repeat
-        fiber.sleep(0.001)
-        local info = s.index.pk:stat()
-    until info.range_count == info.run_count
+    test_run:wait_cond(function()
+        return box.stat.vinyl().scheduler.idle == 1
+    end, 10)
 end;
 test_run:cmd("setopt delimiter ''");
 
@@ -73,26 +72,26 @@ dump()
 info() -- 1 range, 3 runs
 
 compact()
-info() -- 1 range, 1 run
+info() -- 2 ranges, 1 run
 
 compact() -- no-op
 
 dump()
 dump()
 dump()
-info() -- 1 range, 4 runs
+info() -- 2 ranges, 4 runs
 
 compact()
-info() -- 2 ranges, 2 runs
+info() -- 4 ranges, 2 runs
 
 compact() -- no-op
 
 dump()
 dump()
 dump()
-info() -- 2 ranges, 5 runs
+info() -- 4 ranges, 5 runs
 
 compact()
-info() -- 4 ranges, 4 runs
+info() -- 8 ranges, 4 runs
 
 s:drop()
