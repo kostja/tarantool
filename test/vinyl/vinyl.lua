@@ -1,15 +1,9 @@
 #!/usr/bin/env tarantool
---
--- The compaction scheduler sometimes randomly pessimises
--- the compaction rules based on slice->seed, which is generated
--- using rand() for each slice. Set the random seed to ensure the
--- randomness kicks in exactly the same slices from run to run.
--- Run *before* box.cfg{} to ensure slice->rand is correct
--- even after server restart.
---
+-- Fix the cord-local seed to make compaction randomization
+-- deterministic across runs. Must be called before box.cfg{}.
 local ffi = require('ffi')
-ffi.cdef('void srand(unsigned int seed);')
-ffi.C.srand(1)
+ffi.cdef('void cord_set_seed(unsigned int seed);')
+ffi.C.cord_set_seed(43948017)
 
 box.cfg {
     listen            = os.getenv("LISTEN"),

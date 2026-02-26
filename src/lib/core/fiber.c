@@ -2199,6 +2199,12 @@ cord_costart(struct cord *cord, const char *name, fiber_func f, void *arg)
 }
 
 void
+cord_set_seed(unsigned int seed)
+{
+	cord()->seed = seed;
+}
+
+void
 cord_set_name(const char *name)
 {
 	snprintf(cord()->name, sizeof(cord()->name), "%s", name);

@@ -190,6 +190,7 @@ cord_ibuf_put
 cord_ibuf_take
 cord_is_main
 cord_is_main_dont_create
+cord_set_seed
 cord_slab_cache
 crc32_calc
 crypto_ERR_error_string

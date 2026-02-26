@@ -9,8 +9,8 @@ g.before_all(function(cg)
         env = {
             TARANTOOL_RUN_BEFORE_BOX_CFG = [[
 local ffi = require('ffi')
-ffi.cdef('void srand(unsigned int seed);')
-ffi.C.srand(1)
+ffi.cdef('void cord_set_seed(unsigned int seed);')
+ffi.C.cord_set_seed(43948017)
 math.randomseed(1)
             ]]
         }

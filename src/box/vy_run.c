@@ -187,7 +187,8 @@ vy_run_env_create(struct vy_run_env *env, struct tuple_format *key_format,
 	tt_pthread_key_create(&env->zdctx_key, vy_free_zdctx);
 	mempool_create(&env->read_task_pool, cord_slab_cache(),
 		       sizeof(struct vy_page_read_task));
-	env->seed = rand();
+	/* Use cord-local seed, immune to background thread races. */
+	env->seed = rand_r(&cord()->seed);
 	env->initial_join = false;
 }
 

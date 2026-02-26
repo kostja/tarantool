@@ -967,6 +967,10 @@ cord_join(struct cord *cord);
 void
 cord_set_name(const char *name);
 
+/** Set the cord-local random seed used by rand_r(). */
+API_EXPORT void
+cord_set_seed(unsigned int seed);
+
 static inline const char *
 cord_name(struct cord *cord)
 {
