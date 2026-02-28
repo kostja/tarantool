@@ -822,6 +822,10 @@ vy_compaction_plan_check_shape(struct vy_range *range,
 	 * removes the oldest slice the remaining cluster still has
 	 * no older versions outside: the flag correctly survives the
 	 * trim.
+	 *
+	 * When not all slices are selected, check_last_level may
+	 * upgrade the flag later if the plan's key range is
+	 * disjoint from all older slices.
 	 */
 	range->compaction_plan.is_last_level =
 		range->compaction_plan.count == range->slice_count;
@@ -887,6 +891,75 @@ vy_compaction_plan_check_bloat(struct vy_range *range)
 	}
 }
 
+/**
+ * Check whether the plan covers a key range disjoint from all
+ * older slices in the range.  If so, there are no older versions
+ * of any key in the plan below it, and we can set is_last_level
+ * to true so that tombstones are pruned during compaction.
+ *
+ * For each slice, the data range is
+ *   [slice->begin,  slice->end_bound]
+ * slice->begin already incorporates max(range->begin, min_key)
+ * (see vy_range_init_slice).  end_bound is the tightest upper
+ * bound: INCLUSIVE(max_key) or EXCLUSIVE(range boundary).
+ *
+ * The plan cluster is the union of all plan slices' data ranges.
+ * If no older slice's data range overlaps this cluster, we set
+ * is_last_level to true.
+ */
+static void
+vy_compaction_plan_check_last_level(struct vy_range *range)
+{
+	struct vy_compaction_plan *plan = &range->compaction_plan;
+	struct key_def *cmp_def = range->cmp_def;
+	assert(plan->count > 0);
+	assert(!plan->is_last_level);
+
+	/*
+	 * Compute the plan's data range [cluster_min, cluster_max].
+	 */
+	struct vy_entry cluster_min = plan->slices[0]->begin;
+	struct vy_entry cluster_max = plan->slices[0]->end_bound;
+	for (int i = 1; i < plan->count; i++) {
+		if (vy_entry_compare(plan->slices[i]->begin,
+				     cluster_min, cmp_def) < 0)
+			cluster_min = plan->slices[i]->begin;
+		if (vy_bound_cmp(plan->slices[i]->end_bound,
+				 cluster_max, cmp_def) > 0)
+			cluster_max = plan->slices[i]->end_bound;
+	}
+
+	/*
+	 * Find the oldest plan slice in the range's slice list,
+	 * then walk past it through the remaining (older) slices.
+	 */
+	struct vy_slice *oldest_plan = plan->slices[plan->count - 1];
+	struct rlist *pos;
+	for (pos = oldest_plan->in_range.next;
+	     pos != &range->slices; pos = pos->next) {
+		struct vy_slice *slice =
+			rlist_entry(pos, struct vy_slice, in_range);
+		/*
+		 * Two intervals [a_min, a_max] and [b_min, b_max]
+		 * overlap iff a_min <= b_max AND a_max >= b_min.
+		 */
+		if (vy_bound_cmp(cluster_max, slice->begin,
+				 cmp_def) >= 0 &&
+		    vy_bound_cmp(slice->end_bound, cluster_min,
+				 cmp_def) >= 0) {
+			/* Overlap found: not last level. */
+			return;
+		}
+	}
+
+	/* No older slice overlaps -- this is the last level. */
+	say_verbose("compaction plan for range %s: is_last_level "
+		    "upgraded (plan cluster disjoint from %d older slices)",
+		    vy_range_str(range),
+		    range->slice_count - plan->count);
+	plan->is_last_level = true;
+}
+
 void
 vy_range_update_compaction_priority(struct vy_range *range,
 				    const struct index_opts *opts,
@@ -915,6 +988,9 @@ vy_range_update_compaction_priority(struct vy_range *range,
 		}
 		if (vy_compaction_plan_is_empty(&range->compaction_plan))
 			vy_compaction_plan_check_bloat(range);
+		if (range->compaction_plan.count > 0 &&
+		    !range->compaction_plan.is_last_level)
+			vy_compaction_plan_check_last_level(range);
 	}
 	vy_compaction_plan_seal(range);
 }

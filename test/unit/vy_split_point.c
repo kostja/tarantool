@@ -1140,7 +1140,7 @@ test_bloat_guard_with_split(void)
 int
 main(void)
 {
-	plan(5);
+	plan(6);
 	header();
 
 	vy_iterator_C_test_init(128 * 1024);

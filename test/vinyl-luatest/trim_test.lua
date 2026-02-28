@@ -840,3 +840,179 @@ g.test_bloat_below_threshold = function(cg)
                         'no bloat compaction below threshold')
     end)
 end
+
+--
+-- When shape compaction selects only the top slices (the oldest
+-- sits at a deeper level), check_last_level detects that the
+-- plan's key range doesn't overlap the older slice and sets
+-- is_last_level = true.  Tombstones are pruned.
+--
+-- Data layout (4 slices in a single range):
+--   S0 (newest): REPLACE keys 26-50                     (~5 KB)
+--   S1:          DEL keys 1-25, REPLACE keys 26-50      (~6 KB)
+--   S2:          REPLACE keys 1-50                      (~11 KB)
+--   S3 (oldest): REPLACE keys 200-1199                  (~210 KB)
+--
+-- S3 is deliberately large (1000 keys) so that
+-- target_run_size ~= 210K / 3.5^2 ~= 17 KB, which is bigger
+-- than any of S0, S1, S2.  This puts all three at level 0
+-- (level_run_count = 3).  Even with randomization (+1),
+-- 3 > rcpl + 1 = 2, so shape compaction always fires and
+-- selects S0 + S1 + S2, leaving S3 at a deeper level.
+--
+-- check_last_level: plan cluster covers keys 1-50 (from
+-- run min/max keys).  S3 covers keys 200-1199.  Disjoint →
+-- is_last_level = true → DELETEs for keys 1-25 are pruned.
+--
+g.test_trim_compaction_prunes_tombstones = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 1,
+            page_size = 512,
+            range_size = 1000000,
+        })
+
+        local pad = string.rep('x', 200)
+
+        -- S3 (oldest): 1000 keys at 200-1199.  ~210 KB, sits at
+        -- a deep level.  Makes target_run_size at level 0 ~17 KB
+        -- so that S0/S1/S2 all fit there.
+        for k = 200, 1199 do s:replace{k, pad} end
+        box.snapshot()
+
+        -- S2: 50 keys at 1-50.  ~11 KB, level 0.
+        for k = 1, 50 do s:replace{k, pad} end
+        box.snapshot()
+
+        -- S1: DELETE keys 1-25, REPLACE keys 26-50.  ~6 KB.
+        for k = 1, 25 do s:delete{k} end
+        for k = 26, 50 do s:replace{k, pad} end
+        box.snapshot()
+
+        -- S0 (newest): REPLACE keys 26-50.  ~5 KB.
+        -- After this dump we have 4 runs with level_run_count = 3
+        -- at level 0 (S0 + S1 + S2), which exceeds rcpl + 1 = 2
+        -- even with randomization.  Shape compaction selects
+        -- S0 + S1 + S2.
+        for k = 26, 50 do s:replace{k, pad} end
+        box.snapshot()
+
+        -- Wait for shape compaction to complete.
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+            t.assert_equals(s.index.pk:stat().run_count, 2)
+        end)
+
+        -- After compaction: 2 runs remain (compacted S0+S1+S2,
+        -- and S3).  Tombstones for keys 1-25 should be pruned
+        -- (is_last_level = true via check_last_level).
+        local stat = s.index.pk:stat()
+        t.assert_equals(stat.disk.statement.deletes, 0,
+                        'tombstones pruned by is_last_level')
+        -- 25 keys (26-50) + 1000 keys (200-1199) = 1025.
+        t.assert_equals(s:count(), 1025)
+    end)
+end
+
+--
+-- Bloat compaction with check_last_level: a shared dump puts
+-- data into a gap region of range 1 (beyond its older run's
+-- max_key).  Bloat compaction picks the shared slice; since it
+-- is disjoint from the older run, check_last_level sets
+-- is_last_level = true and tombstones are pruned.
+--
+-- Reuses the 4-range setup from test_bloat_propagation_across_ranges.
+-- Range 1 (leftmost, keys 1-150) has an older run with max_key ≈ 150.
+-- The shared dump writes to keys 500-549 in range 1's gap region
+-- (between its data and the range boundary).  25 DELETEs + 25
+-- REPLACEs.  Bloat compaction picks the shared slice.  The shared
+-- run's global min_key = 500, max_key ≈ 3020.  Older run's
+-- min_key = 1, max_key = 150.  150 < 500 → disjoint →
+-- is_last_level = true → tombstones pruned.
+--
+g.test_bloat_compaction_prunes_tombstones = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {
+            run_count_per_level = 100,
+            page_size = 128,
+            range_size = 33000,
+        })
+
+        local pad = string.rep('x', 200)
+
+        -- Phase 1: Create 4 disjoint data ranges (same as
+        -- test_bloat_propagation_across_ranges).
+        for group = 0, 3 do
+            for k = group * 1000 + 1, group * 1000 + 150 do
+                s:replace{k, pad}
+            end
+            box.snapshot()
+        end
+        t.helpers.retrying({timeout = 30}, function()
+            t.assert_equals(s.index.pk:stat().range_count, 4)
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+        end)
+        s.index.pk:alter({range_size = 100000})
+
+        -- Phase 2: Shared dump.
+        -- Range 1 (group 0): write to gap region (keys 500-549).
+        -- First replace keys 500-549, then delete keys 500-524.
+        -- In the memtable, deletes supersede replaces for 500-524.
+        -- The dump run has: DEL 500-524, REPL 525-549.
+        -- DELETEs are preserved in the dump.
+        for k = 500, 549 do s:replace{k, pad} end
+        for k = 500, 524 do s:delete{k} end
+        -- Ranges 2-4: 20 overlapping keys each (same as propagation).
+        for group = 1, 3 do
+            for k = group * 1000 + 1, group * 1000 + 20 do
+                s:replace{k, pad}
+            end
+        end
+        box.snapshot()
+
+        t.helpers.retrying({timeout = 10}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+        end)
+
+        -- Phase 3: Trigger shape compaction → debloat wave.
+        s.index.pk:alter({run_count_per_level = 2})
+        local compaction_before =
+            s.index.pk:stat().disk.compaction.count
+
+        -- Trigger compaction in range 4 (group 3).
+        for _ = 1, 10 do
+            for k = 3001, 3150 do s:replace{k, pad} end
+            box.snapshot()
+            t.helpers.retrying({timeout = 5}, function()
+                t.assert_equals(
+                    box.stat.vinyl().scheduler.idle, 1)
+            end)
+            if s.index.pk:stat().disk.compaction.count
+                    > compaction_before then
+                break
+            end
+        end
+
+        -- Wait for the full debloat chain: range 4 → 3 → 2 → 1.
+        t.helpers.retrying({timeout = 30}, function()
+            t.assert_equals(
+                box.stat.vinyl().scheduler.idle, 1)
+            t.assert_ge(s.index.pk:stat().disk.compaction.count
+                        - compaction_before, 4)
+        end)
+        t.assert_equals(box.stat.vinyl().scheduler.tasks_failed, 0)
+
+        -- In range 1, bloat compaction picked the shared slice
+        -- (keys 500-549).  Older run (keys 1-150, max_key=150)
+        -- is disjoint → is_last_level → tombstones pruned.
+        t.assert_equals(s.index.pk:stat().disk.statement.deletes, 0,
+                        'tombstones pruned by bloat is_last_level')
+        -- 4 groups × 150 + 25 remaining REPLACEs from shared dump.
+        t.assert_equals(s:count(), 625)
+    end)
+end
