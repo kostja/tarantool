@@ -632,6 +632,76 @@ vy_compaction_plan_trim(struct vy_range *range,
 }
 
 /**
+ * Helper for verbose logging of level disposition in
+ * vy_range_compaction_slice_count().  Builds a string like
+ *   1: [108,106*,104] (33900), 2: [99,65] (22826)
+ * where '*' marks slices with randomized compaction deferral.
+ */
+struct vy_shape_log {
+	/** Output buffer (tt_static_buf), NULL if not verbose. */
+	char *buf;
+	/** Current write position in @a buf. */
+	int pos;
+	/** Level number of the last appended slice (0 = none). */
+	uint32_t level;
+	/** Accumulated byte size of the current level. */
+	uint64_t level_bytes;
+};
+
+static void
+vy_shape_log_create(struct vy_shape_log *log)
+{
+	log->pos = 0;
+	log->level = 0;
+	log->level_bytes = 0;
+	if (say_log_level_is_enabled(S_VERBOSE))
+		log->buf = tt_static_buf();
+	else
+		log->buf = NULL;
+}
+
+/** Append a slice to the shape log string. */
+static int
+vy_shape_log_append(struct vy_shape_log *log, uint32_t level,
+		    struct vy_slice *slice)
+{
+	if (log->buf == NULL)
+		return 0;
+	char *buf = log->buf + log->pos;
+	int size = TT_STATIC_BUF_LEN - log->pos;
+	int total = 0;
+	if (level != log->level) {
+		if (log->level > 0)
+			SNPRINT(total, snprintf, buf, size,
+				"] (%" PRIu64 "), ", log->level_bytes);
+		log->level_bytes = 0;
+		SNPRINT(total, snprintf, buf, size, "%u: [", level);
+		log->level = level;
+	} else {
+		SNPRINT(total, snprintf, buf, size, ",");
+	}
+	SNPRINT(total, snprintf, buf, size, "%" PRId64, slice->id);
+	if (slice->seed < RAND_MAX / 10)
+		SNPRINT(total, snprintf, buf, size, "*");
+	log->level_bytes += slice->count.bytes;
+	log->pos += total;
+	return total;
+}
+
+/** Close the last level bracket and emit the shape log message. */
+static void
+vy_shape_log_emit(struct vy_shape_log *log, struct vy_range *range,
+		  uint32_t levels, int compact)
+{
+	if (log->buf == NULL || log->level == 0)
+		return;
+	snprintf(log->buf + log->pos, TT_STATIC_BUF_LEN - log->pos,
+		 "] (%" PRIu64 ")", log->level_bytes);
+	say_verbose("range %s shape: levels=%u compact=%d %s",
+		    vy_range_str(range), levels, compact, log->buf);
+}
+
+/**
  * To reduce write amplification caused by compaction, we follow
  * the LSM tree design. Runs in each range are divided into groups
  * called levels:
@@ -711,6 +781,10 @@ vy_range_compaction_slice_count(struct vy_range *range,
 		size = DIV_ROUND_UP(target_run_size, opts->run_size_ratio);
 	} while (size > (uint64_t)MAX(slice->count.bytes, 1));
 
+	uint32_t current_level = 1;
+	struct vy_shape_log shape_log;
+	vy_shape_log_create(&shape_log);
+
 	rlist_foreach_entry(slice, &range->slices, in_range) {
 		size = slice->count.bytes;
 		level_run_count++;
@@ -724,6 +798,7 @@ vy_range_compaction_slice_count(struct vy_range *range,
 			 * current level and reset the level run
 			 * count.
 			 */
+			current_level++;
 			level_run_count = 1;
 			/*
 			 * If we have already scheduled
@@ -761,11 +836,9 @@ vy_range_compaction_slice_count(struct vy_range *range,
 		 * value of rand() from the slice creation time.
 		 */
 		uint32_t max_run_count = opts->run_count_per_level;
-		if (slice->seed < RAND_MAX / 10) {
+		if (slice->seed < RAND_MAX / 10)
 			max_run_count++;
-			say_verbose("Randomizing compaction of slice %" PRId64
-				    " with seed %u", slice->id, slice->seed);
-		}
+		vy_shape_log_append(&shape_log, current_level, slice);
 		if (level_run_count > max_run_count) {
 			/*
 			 * The number of runs at the current level
@@ -785,6 +858,9 @@ vy_range_compaction_slice_count(struct vy_range *range,
 		 */
 		compact_slice_count = total_run_count;
 	}
+
+	vy_shape_log_emit(&shape_log, range, current_level,
+			  compact_slice_count);
 
 	return compact_slice_count;
 }
