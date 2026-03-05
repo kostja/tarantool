@@ -98,14 +98,57 @@ Example of what gets stored for `by_token` index:
  secondary key  primary key  TTL (auto-appended)
 ```
 
+### Block-Level Metadata
+
+The page index groups pages into blocks (currently 64 pages per block).
+Each block directory entry stores:
+
+- **`min_expires_at` / `max_expires_at`**: the range of expiration
+  timestamps across all tuples in the block. This enables block-level
+  skip decisions during reads:
+  - `max_expires_at < now`: entire block is fully expired, skip without
+    decompressing any pages.
+  - `min_expires_at > now`: no expired tuples in this block, no per-tuple
+    TTL checks needed.
+  - Otherwise: check individual tuples.
+
+- **`min_lsn` / `max_lsn`**: the range of LSN (Log Sequence Number)
+  values across all tuples in the block. This is useful for:
+  - Incremental backup: skip blocks whose `max_lsn` is below the backup
+    checkpoint LSN.
+  - Compaction priority: blocks with low `max_lsn` contain old data that
+    is more likely to be overwritten or expired.
+  - MVCC read filtering: skip blocks whose `min_lsn` is above the
+    reader's snapshot LSN (all statements are invisible).
+
 ### Run-Level Metadata
 
-Each run file's index (`.index`) stores the minimum and maximum
-`expires_at` values across all tuples in that run. This enables
-fast decisions without reading tuple data:
+Each run file's index (`.index`) stores:
 
-- `max_expires_at < now`: entire run is fully expired
-- `min_expires_at > now`: no expired tuples in this run
+- **`min_expires_at` / `max_expires_at`**: the range of expiration
+  timestamps across all tuples in the run. This enables fast decisions
+  without reading tuple data:
+  - `max_expires_at < now`: entire run is fully expired.
+  - `min_expires_at > now`: no expired tuples in this run.
+
+- **TTL histogram**: a fixed-bucket histogram of `expires_at` values
+  across the run. Bucket boundaries are chosen at build time to cover
+  the range `[min_expires_at, max_expires_at]` with ~64 buckets (e.g.
+  equal-width or quantile-based). Each bucket stores a count of tuples
+  whose `expires_at` falls within that interval.
+
+  The histogram enables:
+  - **Compaction priority estimation**: estimate the fraction of expired
+    tuples in a run without reading pages. A run where 80% of the
+    histogram mass is below `now` is a high-value compaction candidate.
+  - **Space reclamation forecasting**: predict how much disk space will
+    become reclaimable at a future time T by summing buckets below T.
+  - **Adaptive GC scheduling**: the scheduler can estimate the "expiry
+    velocity" -- how fast tuples are expiring -- and trigger compaction
+    proactively when a burst of expirations is imminent.
+
+  Similar to ScyllaDB's `estimated_tombstone_drop_time` streaming
+  histogram, which tracks when tombstones become eligible for GC.
 
 ## Read-Time Filtering
 
@@ -179,5 +222,6 @@ is maintained.
 | Compaction (non-last level) | Expired tuples preserved (suppress older versions) |
 | Compaction (last level) | Expired tuples dropped |
 | Whole-run drop | At last level when `max_expires_at < now` |
-| Run metadata | min/max `expires_at` per run for fast filtering |
+| Block metadata | min/max `expires_at` and min/max LSN per block for skip decisions |
+| Run metadata | min/max `expires_at` + TTL histogram per run for compaction priority |
 | DML changes | None -- standard INSERT/REPLACE/DELETE |
