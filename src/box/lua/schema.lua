@@ -710,6 +710,7 @@ box.schema.space.create = function(name, options)
         defer_deletes = 'boolean',
         constraint = 'string, table',
         foreign_key = 'table',
+        ttl = 'table, boolean',
     }
     local options_defaults = {
         engine = 'memtx',
@@ -753,6 +754,27 @@ box.schema.space.create = function(name, options)
     local constraint = normalize_constraint(options.constraint, '')
     local foreign_key = normalize_foreign_key(id, name, options.foreign_key, '',
                                               true)
+    -- Resolve TTL option: {field = 'name'} -> 0-based field number.
+    local ttl_field_no = nil
+    if options.ttl ~= nil and options.ttl ~= false then
+        if type(options.ttl) ~= 'table' or options.ttl.field == nil then
+            box.error(box.error.ILLEGAL_PARAMS,
+                      "ttl must be {field = <field_name>} or false")
+        end
+        local field_name = options.ttl.field
+        local found = false
+        for i, f in ipairs(format) do
+            if f.name == field_name then
+                ttl_field_no = i - 1  -- 0-based
+                found = true
+                break
+            end
+        end
+        if not found then
+            box.error(box.error.ILLEGAL_PARAMS,
+                      "ttl field '" .. field_name .. "' is not in the format")
+        end
+    end
     -- filter out global parameters from the options array
     local space_options = setmap({
         group_id = options.is_local and 1 or nil,
@@ -762,6 +784,7 @@ box.schema.space.create = function(name, options)
         defer_deletes = options.defer_deletes and true or nil,
         constraint = constraint,
         foreign_key = foreign_key,
+        ttl = ttl_field_no,
     })
     _space:insert{id, uid, name, options.engine, options.field_count,
         space_options, format}
@@ -870,6 +893,7 @@ local alter_space_template = {
     name = 'string',
     constraint = 'string, table',
     foreign_key = 'table',
+    ttl = 'table, boolean',
 }
 
 box.schema.space.alter = function(space_id, options)
@@ -934,6 +958,31 @@ box.schema.space.alter = function(space_id, options)
         end
         flags.foreign_key = normalize_foreign_key(space_id, name,
                                                   options.foreign_key, '', true)
+    end
+
+    if options.ttl ~= nil then
+        if options.ttl == false then
+            flags.ttl = nil
+        else
+            if type(options.ttl) ~= 'table' or options.ttl.field == nil then
+                box.error(box.error.ILLEGAL_PARAMS,
+                          "ttl must be {field = <field_name>} or false")
+            end
+            local field_name = options.ttl.field
+            local found = false
+            for i, f in ipairs(format) do
+                if f.name == field_name then
+                    flags.ttl = i - 1  -- 0-based
+                    found = true
+                    break
+                end
+            end
+            if not found then
+                box.error(box.error.ILLEGAL_PARAMS,
+                          "ttl field '" .. field_name ..
+                          "' is not in the format")
+            end
+        end
     end
 
     tuple = tuple:totable()

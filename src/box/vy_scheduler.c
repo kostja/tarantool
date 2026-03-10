@@ -30,6 +30,7 @@
  */
 #include "vy_scheduler.h"
 
+#include "clock.h"
 #include <assert.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -204,6 +205,13 @@ struct vy_task {
 	 * from another thread.
 	 */
 	struct index_opts index_opts;
+	/**
+	 * 0-based field index of the expires_at field, or -1
+	 * if TTL is disabled. Copied from disk_format at task
+	 * creation time to avoid accessing format from the
+	 * worker thread.
+	 */
+	int32_t ttl_field_no;
 	/**
 	 * Deferred DELETE handler passed to the write iterator.
 	 * It sends deferred DELETE statements generated during
@@ -1087,10 +1095,19 @@ vy_task_write_run(struct vy_task *task)
 	ERROR_INJECT_SLEEP(ERRINJ_VY_RUN_WRITE_DELAY);
 
 	struct vy_run_writer writer;
+	/*
+	 * Use primary-style encoding (full tuples) for the primary
+	 * index and for secondary indexes with TTL.
+	 */
+	bool is_primary_encoding =
+		lsm->index_id == 0 ||
+		task->ttl_field_no >= 0;
 	if (vy_run_writer_create(&writer, task->new_run, lsm->env->path,
 				 lsm->space_id, lsm->index_id,
 				 task->cmp_def, task->key_def,
-				 &task->index_opts) != 0)
+				 &task->index_opts,
+				 is_primary_encoding,
+				 task->ttl_field_no) != 0)
 		goto fail;
 
 	if (wi->iface->start(wi) != 0)
@@ -1405,6 +1422,7 @@ vy_task_dump_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	struct vy_task *task = vy_task_new(scheduler, worker, lsm, &dump_ops);
 	if (task == NULL)
 		goto err;
+	task->ttl_field_no = lsm->disk_format->ttl_field_no;
 
 	struct vy_run *new_run = vy_run_prepare(scheduler->run_env, lsm);
 	if (new_run == NULL)
@@ -1422,7 +1440,10 @@ vy_task_dump_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	struct vy_stmt_stream *wi;
 	bool is_last_level = (lsm->run_count == 0);
 	wi = vy_write_iterator_new(task->cmp_def, lsm->index_id == 0,
-				   is_last_level, scheduler->read_views, NULL);
+				   is_last_level, scheduler->read_views,
+				   NULL, clock_realtime(),
+				   task->ttl_field_no,
+				   &lsm->stat.ttl.rows_skipped);
 	if (wi == NULL)
 		goto err_wi;
 	rlist_foreach_entry(mem, &lsm->sealed, in_sealed) {
@@ -1701,6 +1722,7 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 					   &compaction_ops);
 	if (task == NULL)
 		goto err_task;
+	task->ttl_field_no = lsm->disk_format->ttl_field_no;
 
 	struct vy_run *new_run = vy_run_prepare(scheduler->run_env, lsm);
 	if (new_run == NULL)
@@ -1712,17 +1734,49 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 				   plan->is_last_level,
 				   scheduler->read_views,
 				   lsm->index_id > 0 ? NULL :
-				   &task->deferred_delete_handler);
+				   &task->deferred_delete_handler,
+				   clock_realtime(),
+				   task->ttl_field_no,
+				   &lsm->stat.ttl.rows_skipped);
 	if (wi == NULL)
 		goto err_wi;
 
 	struct vy_slice *slice;
 	int32_t dump_count = 0;
+	double now = clock_realtime();
+	/*
+	 * On last-level compaction, we can skip fully expired runs
+	 * to save I/O.  However, it is only safe to skip a run if
+	 * there are no older runs beneath it: an expired run may
+	 * shadow alive versions of the same keys in older runs,
+	 * and skipping it would resurrect those versions.
+	 *
+	 * Walk from the oldest slice to find a contiguous suffix
+	 * of fully expired runs that can be safely dropped.
+	 * Slices are ordered newest-first, so the oldest is last.
+	 */
+	int skip_start = plan->count; /* nothing to skip by default */
+	if (plan->is_last_level) {
+		for (int i = plan->count - 1; i >= 0; i--) {
+			struct vy_run_info *ri = &plan->slices[i]->run->info;
+			if (ri->max_expires_at != 0 &&
+			    ri->max_expires_at < now)
+				skip_start = i;
+			else
+				break;
+		}
+	}
 	for (int i = 0; i < plan->count; i++) {
 		slice = plan->slices[i];
-		if (vy_write_iterator_new_slice(wi, slice,
-						lsm->disk_format) != 0)
-			goto err_wi_sub;
+		if (i >= skip_start) {
+			say_verbose("%s: skipping fully expired run %lld",
+				    vy_lsm_name(lsm),
+				    (long long)slice->run->id);
+		} else {
+			if (vy_write_iterator_new_slice(wi, slice,
+							lsm->disk_format) != 0)
+				goto err_wi_sub;
+		}
 		new_run->dump_lsn = MAX(new_run->dump_lsn,
 					slice->run->dump_lsn);
 		dump_count += slice->run->dump_count;

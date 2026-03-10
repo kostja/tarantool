@@ -27,7 +27,8 @@ write_run(struct vy_run *run, const char *dir_name,
 	if (vy_run_writer_create(&writer, run, dir_name,
 				 lsm->space_id, lsm->index_id,
 				 lsm->cmp_def, lsm->key_def,
-				 &index_opts) != 0)
+				 &index_opts,
+				 lsm->index_id == 0, -1) != 0)
 		goto fail;
 
 	if (wi->iface->start(wi) != 0)
@@ -197,7 +198,7 @@ test_basic()
 	}
 	struct vy_stmt_stream *write_stream;
 	write_stream = vy_write_iterator_new(pk->cmp_def, true, true,
-					     &read_views, NULL);
+					     &read_views, NULL, 0, -1, NULL);
 	vy_write_iterator_new_mem(write_stream, run_mem);
 	struct vy_run *run = vy_run_new(&run_env, 1);
 	isnt(run, NULL, "vy_run_new");
@@ -227,7 +228,7 @@ test_basic()
 		vy_mem_insert_template(run_mem, &tmpl_val);
 	}
 	write_stream = vy_write_iterator_new(pk->cmp_def, true, true,
-					     &read_views, NULL);
+					     &read_views, NULL, 0, -1, NULL);
 	vy_write_iterator_new_mem(write_stream, run_mem);
 	run = vy_run_new(&run_env, 2);
 	isnt(run, NULL, "vy_run_new");

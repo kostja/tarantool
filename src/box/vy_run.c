@@ -46,6 +46,7 @@
 #include "errinj.h"
 #include "xrow.h"
 #include "vy_history.h"
+#include "vy_stmt.h"
 
 static const uint64_t vy_page_info_key_map = (1 << VY_PAGE_INFO_OFFSET) |
 					     (1 << VY_PAGE_INFO_SIZE) |
@@ -291,6 +292,10 @@ vy_page_info_create(struct vy_page_info *page_info, uint64_t offset,
 	memset(page_info, 0, sizeof(*page_info));
 	page_info->offset = offset;
 	page_info->unpacked_size = 0;
+	page_info->min_expires_at = 0;
+	page_info->max_expires_at = 0;
+	page_info->min_lsn = INT64_MAX;
+	page_info->max_lsn = 0;
 	page_info->min_key = mp_dup(min_key);
 	uint32_t part_count = mp_decode_array(&min_key);
 	page_info->min_key_hint = key_hint(min_key, part_count, cmp_def);
@@ -653,6 +658,18 @@ vy_page_info_decode(struct vy_page_info *page, const struct xrow_header *xrow,
 		case VY_PAGE_INFO_ROW_INDEX_OFFSET:
 			page->row_index_offset = mp_decode_uint(&pos);
 			break;
+		case VY_PAGE_INFO_MIN_EXPIRES_AT:
+			page->min_expires_at = mp_decode_double(&pos);
+			break;
+		case VY_PAGE_INFO_MAX_EXPIRES_AT:
+			page->max_expires_at = mp_decode_double(&pos);
+			break;
+		case VY_PAGE_INFO_MIN_LSN:
+			page->min_lsn = mp_decode_uint(&pos);
+			break;
+		case VY_PAGE_INFO_MAX_LSN:
+			page->max_lsn = mp_decode_uint(&pos);
+			break;
 		default:
 			mp_next(&pos); /* unknown key, ignore */
 			break;
@@ -782,6 +799,12 @@ vy_run_info_decode(struct vy_run_info *run_info,
 			break;
 		case VY_RUN_INFO_STMT_STAT:
 			vy_stmt_stat_decode(&run_info->stmt_stat, &pos);
+			break;
+		case VY_RUN_INFO_MIN_EXPIRES_AT:
+			run_info->min_expires_at = mp_decode_double(&pos);
+			break;
+		case VY_RUN_INFO_MAX_EXPIRES_AT:
+			run_info->max_expires_at = mp_decode_double(&pos);
 			break;
 		default:
 			mp_next(&pos); /* unknown key, ignore */
@@ -2073,7 +2096,8 @@ vy_run_iterator_seek(struct vy_run_iterator *itr, struct vy_entry last,
 		goto not_found;
 
 	/* Skip statements invisible from the iterator read view. */
-	return vy_run_iterator_find_lsn(itr, ret);
+	rc = vy_run_iterator_find_lsn(itr, ret);
+	return rc;
 
 not_found:
 	if (check_bloom)
@@ -2330,8 +2354,21 @@ vy_block_dir_decode(struct vy_run *run, const char **data,
 		run->block_dir[b].page_count = mp_decode_uint(data);
 		run->block_dir[b].first_page_no = page_no;
 		page_no += run->block_dir[b].page_count;
+		/* Decode optional TTL/LSN fields (positions 2..5). */
+		if (arr_size > 2)
+			run->block_dir[b].min_expires_at =
+				mp_decode_double(data);
+		if (arr_size > 3)
+			run->block_dir[b].max_expires_at =
+				mp_decode_double(data);
+		if (arr_size > 4)
+			run->block_dir[b].min_lsn =
+				(int64_t)mp_decode_uint(data);
+		if (arr_size > 5)
+			run->block_dir[b].max_lsn =
+				(int64_t)mp_decode_uint(data);
 		/* Skip unknown fields for forward compatibility. */
-		for (uint32_t j = 2; j < arr_size; j++)
+		for (uint32_t j = 6; j < arr_size; j++)
 			mp_next(data);
 	}
 	return 0;
@@ -2811,16 +2848,34 @@ vy_run_info_encode_v2(const struct vy_run *run, struct xrow_header *xrow)
 	uint32_t block_count = (run_info->page_count +
 				VY_INDEX_BLOCK_SIZE - 1) / VY_INDEX_BLOCK_SIZE;
 
-	/* Compute sizes of boundary keys. */
+	/*
+	 * Compute sizes of boundary keys and per-block
+	 * TTL/LSN aggregates.
+	 */
 	size_t *bkey_sizes = NULL;
+	double *block_min_expires = NULL;
+	double *block_max_expires = NULL;
+	int64_t *block_min_lsn = NULL;
+	int64_t *block_max_lsn = NULL;
 	if (block_count > 0) {
-		bkey_sizes = region_alloc(&fiber()->gc,
-					  block_count * sizeof(size_t));
-		if (bkey_sizes == NULL) {
-			diag_set(OutOfMemory, block_count * sizeof(size_t),
+		size_t alloc_size = block_count * (sizeof(size_t) +
+				    2 * sizeof(double) +
+				    2 * sizeof(int64_t));
+		char *buf = region_alloc(&fiber()->gc, alloc_size);
+		if (buf == NULL) {
+			diag_set(OutOfMemory, alloc_size,
 				 "region", "bkey_sizes");
 			return -1;
 		}
+		bkey_sizes = (size_t *)buf;
+		buf += block_count * sizeof(size_t);
+		block_min_expires = (double *)buf;
+		buf += block_count * sizeof(double);
+		block_max_expires = (double *)buf;
+		buf += block_count * sizeof(double);
+		block_min_lsn = (int64_t *)buf;
+		buf += block_count * sizeof(int64_t);
+		block_max_lsn = (int64_t *)buf;
 	}
 
 	size_t block_dir_data_size = mp_sizeof_array(block_count);
@@ -2836,13 +2891,46 @@ vy_run_info_encode_v2(const struct vy_run *run, struct xrow_header *xrow)
 		else
 			pages_in_block = run_info->page_count -
 					 first_page;
-		block_dir_data_size += mp_sizeof_array(2) +
+		/*
+		 * Compute per-block TTL/LSN aggregates
+		 * from constituent pages.
+		 */
+		double bmin_exp = 0, bmax_exp = 0;
+		int64_t bmin_lsn = INT64_MAX, bmax_lsn = 0;
+		for (uint32_t p = 0; p < pages_in_block; p++) {
+			const struct vy_page_info *pp =
+				&run->page_info[first_page + p];
+			if (pp->min_expires_at != 0) {
+				if (bmin_exp == 0 ||
+				    pp->min_expires_at < bmin_exp)
+					bmin_exp = pp->min_expires_at;
+			}
+			if (pp->max_expires_at > bmax_exp)
+				bmax_exp = pp->max_expires_at;
+			if (pp->min_lsn < bmin_lsn)
+				bmin_lsn = pp->min_lsn;
+			if (pp->max_lsn > bmax_lsn)
+				bmax_lsn = pp->max_lsn;
+		}
+		block_min_expires[b] = bmin_exp;
+		block_max_expires[b] = bmax_exp;
+		block_min_lsn[b] = bmin_lsn;
+		block_max_lsn[b] = bmax_lsn;
+		block_dir_data_size += mp_sizeof_array(6) +
 				       bkey_sizes[b] +
-				       mp_sizeof_uint(pages_in_block);
+				       mp_sizeof_uint(pages_in_block) +
+				       mp_sizeof_double(bmin_exp) +
+				       mp_sizeof_double(bmax_exp) +
+				       mp_sizeof_uint(bmin_lsn) +
+				       mp_sizeof_uint(bmax_lsn);
 	}
 
 	uint32_t key_count = 9; /* 6 base + block_dir + run_count + page_index_size */
 	if (run_info->has_sketch)
+		key_count++;
+	if (run_info->min_expires_at != 0)
+		key_count++;
+	if (run_info->max_expires_at != 0)
 		key_count++;
 
 	/*
@@ -2872,6 +2960,12 @@ vy_run_info_encode_v2(const struct vy_run *run, struct xrow_header *xrow)
 	if (run_info->has_sketch)
 		size += mp_sizeof_uint(VY_RUN_INFO_SKETCH) +
 			mp_sizeof_bin(MINHASH_SIZE);
+	if (run_info->min_expires_at != 0)
+		size += mp_sizeof_uint(VY_RUN_INFO_MIN_EXPIRES_AT) +
+			mp_sizeof_double(run_info->min_expires_at);
+	if (run_info->max_expires_at != 0)
+		size += mp_sizeof_uint(VY_RUN_INFO_MAX_EXPIRES_AT) +
+			mp_sizeof_double(run_info->max_expires_at);
 
 	char *pos = region_alloc(&fiber()->gc, size);
 	if (pos == NULL) {
@@ -2915,10 +3009,14 @@ vy_run_info_encode_v2(const struct vy_run *run, struct xrow_header *xrow)
 			pages_in_block = VY_INDEX_BLOCK_SIZE;
 		else
 			pages_in_block = run_info->page_count - first_page;
-		pos = mp_encode_array(pos, 2);
+		pos = mp_encode_array(pos, 6);
 		memcpy(pos, pi->min_key, bkey_sizes[b]);
 		pos += bkey_sizes[b];
 		pos = mp_encode_uint(pos, pages_in_block);
+		pos = mp_encode_double(pos, block_min_expires[b]);
+		pos = mp_encode_double(pos, block_max_expires[b]);
+		pos = mp_encode_uint(pos, block_min_lsn[b]);
+		pos = mp_encode_uint(pos, block_max_lsn[b]);
 	}
 
 	/* Encode aggregate run count. */
@@ -2943,6 +3041,16 @@ vy_run_info_encode_v2(const struct vy_run *run, struct xrow_header *xrow)
 		pos = mp_encode_binl(pos, MINHASH_SIZE);
 		memcpy(pos, run_info->sketch.values, MINHASH_SIZE);
 		pos += MINHASH_SIZE;
+	}
+
+	/* Encode TTL metadata. */
+	if (run_info->min_expires_at != 0) {
+		pos = mp_encode_uint(pos, VY_RUN_INFO_MIN_EXPIRES_AT);
+		pos = mp_encode_double(pos, run_info->min_expires_at);
+	}
+	if (run_info->max_expires_at != 0) {
+		pos = mp_encode_uint(pos, VY_RUN_INFO_MAX_EXPIRES_AT);
+		pos = mp_encode_double(pos, run_info->max_expires_at);
 	}
 
 	xrow->body->iov_len = (void *)pos - xrow->body->iov_base;
@@ -2983,7 +3091,14 @@ vy_index_block_encode(struct vy_run *run, uint32_t first, uint32_t count,
 		const char *tmp = pi->min_key;
 		mp_next(&tmp);
 		size_t min_key_size = tmp - pi->min_key;
-		pages_size += mp_sizeof_map(6) +
+		uint32_t pi_map_keys = 6;
+		if (pi->min_expires_at != 0)
+			pi_map_keys++;
+		if (pi->max_expires_at != 0)
+			pi_map_keys++;
+		if (pi->max_lsn > 0)
+			pi_map_keys += 2; /* min_lsn + max_lsn */
+		pages_size += mp_sizeof_map(pi_map_keys) +
 			mp_sizeof_uint(VY_PAGE_INFO_OFFSET) +
 			mp_sizeof_uint(pi->offset) +
 			mp_sizeof_uint(VY_PAGE_INFO_SIZE) +
@@ -2996,6 +3111,21 @@ vy_index_block_encode(struct vy_run *run, uint32_t first, uint32_t count,
 			mp_sizeof_uint(pi->unpacked_size) +
 			mp_sizeof_uint(VY_PAGE_INFO_ROW_INDEX_OFFSET) +
 			mp_sizeof_uint(pi->row_index_offset);
+		if (pi->min_expires_at != 0)
+			pages_size +=
+				mp_sizeof_uint(VY_PAGE_INFO_MIN_EXPIRES_AT) +
+				mp_sizeof_double(pi->min_expires_at);
+		if (pi->max_expires_at != 0)
+			pages_size +=
+				mp_sizeof_uint(VY_PAGE_INFO_MAX_EXPIRES_AT) +
+				mp_sizeof_double(pi->max_expires_at);
+		if (pi->max_lsn > 0) {
+			pages_size +=
+				mp_sizeof_uint(VY_PAGE_INFO_MIN_LSN) +
+				mp_sizeof_uint(pi->min_lsn) +
+				mp_sizeof_uint(VY_PAGE_INFO_MAX_LSN) +
+				mp_sizeof_uint(pi->max_lsn);
+		}
 	}
 
 	/* Compute filter and sketch blob sizes. */
@@ -3041,7 +3171,14 @@ vy_index_block_encode(struct vy_run *run, uint32_t first, uint32_t count,
 		mp_next(&tmp);
 		size_t min_key_size = tmp - pi->min_key;
 
-		pos = mp_encode_map(pos, 6);
+		uint32_t pi_map_keys = 6;
+		if (pi->min_expires_at != 0)
+			pi_map_keys++;
+		if (pi->max_expires_at != 0)
+			pi_map_keys++;
+		if (pi->max_lsn > 0)
+			pi_map_keys += 2;
+		pos = mp_encode_map(pos, pi_map_keys);
 		pos = mp_encode_uint(pos, VY_PAGE_INFO_OFFSET);
 		pos = mp_encode_uint(pos, pi->offset);
 		pos = mp_encode_uint(pos, VY_PAGE_INFO_SIZE);
@@ -3055,6 +3192,20 @@ vy_index_block_encode(struct vy_run *run, uint32_t first, uint32_t count,
 		pos = mp_encode_uint(pos, pi->unpacked_size);
 		pos = mp_encode_uint(pos, VY_PAGE_INFO_ROW_INDEX_OFFSET);
 		pos = mp_encode_uint(pos, pi->row_index_offset);
+		if (pi->min_expires_at != 0) {
+			pos = mp_encode_uint(pos, VY_PAGE_INFO_MIN_EXPIRES_AT);
+			pos = mp_encode_double(pos, pi->min_expires_at);
+		}
+		if (pi->max_expires_at != 0) {
+			pos = mp_encode_uint(pos, VY_PAGE_INFO_MAX_EXPIRES_AT);
+			pos = mp_encode_double(pos, pi->max_expires_at);
+		}
+		if (pi->max_lsn > 0) {
+			pos = mp_encode_uint(pos, VY_PAGE_INFO_MIN_LSN);
+			pos = mp_encode_uint(pos, pi->min_lsn);
+			pos = mp_encode_uint(pos, VY_PAGE_INFO_MAX_LSN);
+			pos = mp_encode_uint(pos, pi->max_lsn);
+		}
 	}
 
 	/* Encode filter blob. */
@@ -3187,13 +3338,16 @@ int
 vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 		     const char *dirpath, uint32_t space_id, uint32_t iid,
 		     struct key_def *cmp_def, struct key_def *key_def,
-		     struct index_opts *index_opts)
+		     struct index_opts *index_opts,
+		     bool is_primary_encoding, int32_t ttl_field_no)
 {
 	memset(writer, 0, sizeof(*writer));
 	writer->run = run;
 	writer->dirpath = dirpath;
 	writer->space_id = space_id;
 	writer->iid = iid;
+	writer->is_primary_encoding = is_primary_encoding;
+	writer->ttl_field_no = ttl_field_no;
 	writer->cmp_def = cmp_def;
 	writer->key_def = key_def;
 	writer->index_opts = *index_opts;
@@ -3202,6 +3356,8 @@ vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 		    4096 * sizeof(uint32_t));
 	run->info.min_lsn = INT64_MAX;
 	run->info.max_lsn = -1;
+	run->info.min_expires_at = 0;
+	run->info.max_expires_at = 0;
 	assert(run->page_info == NULL);
 	/* Initialize per-block PDS accumulator. */
 	minhash_create(&writer->block_sketch);
@@ -3408,12 +3564,32 @@ vy_run_writer_write_to_page(struct vy_run_writer *writer, struct vy_entry entry)
 	}
 	*offset = page->unpacked_size;
 	if (vy_run_dump_stmt(entry, &writer->data_xlog, page,
-			     writer->cmp_def, writer->iid == 0) != 0)
+			     writer->cmp_def,
+			     writer->is_primary_encoding) != 0)
 		return -1;
 	int64_t lsn = vy_stmt_lsn(entry.stmt);
 	run->info.min_lsn = MIN(run->info.min_lsn, lsn);
 	run->info.max_lsn = MAX(run->info.max_lsn, lsn);
 	vy_stmt_stat_acct(&run->info.stmt_stat, vy_stmt_type(entry.stmt));
+
+	/* Accumulate per-page LSN. */
+	page->min_lsn = MIN(page->min_lsn, lsn);
+	page->max_lsn = MAX(page->max_lsn, lsn);
+
+	/* Accumulate per-page and per-run TTL metadata. */
+	double expires_at = tuple_expires_at(entry.stmt, writer->ttl_field_no);
+	if (expires_at != 0) {
+		if (page->min_expires_at == 0 ||
+		    expires_at < page->min_expires_at)
+			page->min_expires_at = expires_at;
+		if (expires_at > page->max_expires_at)
+			page->max_expires_at = expires_at;
+		if (run->info.min_expires_at == 0 ||
+		    expires_at < run->info.min_expires_at)
+			run->info.min_expires_at = expires_at;
+		if (expires_at > run->info.max_expires_at)
+			run->info.max_expires_at = expires_at;
+	}
 	return 0;
 }
 
@@ -3644,6 +3820,8 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	const char *key = NULL;
 	int64_t max_lsn = 0;
 	int64_t min_lsn = INT64_MAX;
+	double run_min_exp = 0;
+	double run_max_exp = 0;
 	struct tuple *prev_tuple = NULL;
 	char *page_min_key = NULL;
 
@@ -3660,6 +3838,10 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		uint64_t page_row_index_offset = 0;
 		uint64_t row_offset = xlog_cursor_tx_pos(&cursor);
 
+		int64_t page_min_lsn = INT64_MAX;
+		int64_t page_max_lsn = 0;
+		double page_min_exp = 0;
+		double page_max_exp = 0;
 		struct xrow_header xrow;
 		while ((rc = xlog_cursor_next_row(&cursor, &xrow)) == 0) {
 			if (xrow.type == VY_RUN_ROW_INDEX) {
@@ -3687,6 +3869,18 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 				max_lsn = xrow.lsn;
 			if (xrow.lsn < min_lsn)
 				min_lsn = xrow.lsn;
+			if (xrow.lsn < page_min_lsn)
+				page_min_lsn = xrow.lsn;
+			if (xrow.lsn > page_max_lsn)
+				page_max_lsn = xrow.lsn;
+			double exp = tuple_expires_at(tuple,
+						      format->ttl_field_no);
+			if (exp != 0) {
+				if (page_min_exp == 0 || exp < page_min_exp)
+					page_min_exp = exp;
+				if (exp > page_max_exp)
+					page_max_exp = exp;
+			}
 			row_offset = xlog_cursor_tx_pos(&cursor);
 		}
 		struct vy_page_info *info;
@@ -3696,6 +3890,16 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		info->size = next_page_offset - page_offset;
 		info->unpacked_size = xlog_cursor_tx_pos(&cursor);
 		info->row_index_offset = page_row_index_offset;
+		info->min_lsn = page_min_lsn;
+		info->max_lsn = page_max_lsn;
+		info->min_expires_at = page_min_exp;
+		info->max_expires_at = page_max_exp;
+		if (page_min_exp != 0) {
+			if (run_min_exp == 0 || page_min_exp < run_min_exp)
+				run_min_exp = page_min_exp;
+		}
+		if (page_max_exp > run_max_exp)
+			run_max_exp = page_max_exp;
 		++run->info.page_count;
 		vy_run_acct_page(run, info);
 
@@ -3707,6 +3911,8 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		run->info.max_key = mp_dup(key);
 	run->info.max_lsn = max_lsn;
 	run->info.min_lsn = min_lsn;
+	run->info.min_expires_at = run_min_exp;
+	run->info.max_expires_at = run_max_exp;
 
 	if (prev_tuple != NULL) {
 		tuple_unref(prev_tuple);

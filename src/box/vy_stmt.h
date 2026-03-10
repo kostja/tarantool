@@ -854,6 +854,63 @@ vy_bound_cmp_raw(struct vy_entry bound, const char *key,
  *
  * entry.stmt is set to src_stmt on each iteration.
  */
+/**
+ * Decode a numeric expires_at value from a msgpack field.
+ * Returns 0 if the field type is not numeric.
+ */
+static inline double
+vy_decode_expires_at(const char *field)
+{
+	if (mp_typeof(*field) == MP_DOUBLE)
+		return mp_decode_double(&field);
+	if (mp_typeof(*field) == MP_UINT)
+		return (double)mp_decode_uint(&field);
+	if (mp_typeof(*field) == MP_INT)
+		return (double)mp_decode_int(&field);
+	if (mp_typeof(*field) == MP_FLOAT)
+		return (double)mp_decode_float(&field);
+	return 0;
+}
+
+/**
+ * Check if a tuple is expired. Returns true if the tuple has a
+ * non-zero expires_at that is less than @a now.
+ *
+ * @a ttl_field_no is the 0-based field index of the expires_at
+ * field, or -1 if TTL is disabled. It is passed explicitly to
+ * avoid accessing tuple_format from background threads.
+ */
+static inline bool
+tuple_is_expired(struct tuple *stmt, int32_t ttl_field_no, double now)
+{
+	if (ttl_field_no < 0)
+		return false;
+	const char *field = tuple_field(stmt, ttl_field_no);
+	if (field == NULL || mp_typeof(*field) == MP_NIL)
+		return false;
+	double expires_at = vy_decode_expires_at(field);
+	return expires_at != 0 && expires_at < now;
+}
+
+/**
+ * Extract the expires_at value from a tuple. Returns 0 if the
+ * tuple has no TTL field or the field is nil.
+ *
+ * @a ttl_field_no is the 0-based field index of the expires_at
+ * field, or -1 if TTL is disabled. It is passed explicitly to
+ * avoid accessing tuple_format from background threads.
+ */
+static inline double
+tuple_expires_at(struct tuple *stmt, int32_t ttl_field_no)
+{
+	if (ttl_field_no < 0)
+		return 0;
+	const char *field = tuple_field(stmt, ttl_field_no);
+	if (field == NULL || mp_typeof(*field) == MP_NIL)
+		return 0;
+	return vy_decode_expires_at(field);
+}
+
 #define vy_stmt_foreach_entry(entry, src_stmt, key_def)			\
 	for (uint32_t multikey_idx = 0,					\
 	     multikey_count = !(key_def)->is_multikey ? 1 :		\

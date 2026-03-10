@@ -37,6 +37,7 @@
 #include <small/region.h>
 #include <small/rlist.h>
 
+#include "clock.h"
 #include "fiber.h"
 
 #include "vy_lsm.h"
@@ -46,6 +47,7 @@
 #include "vy_run.h"
 #include "vy_cache.h"
 #include "vy_history.h"
+#include "vy_stat.h"
 
 /**
  * Scan TX write set for given key.
@@ -317,6 +319,20 @@ done:
 		rc = vy_history_apply(&history, lsm->cmp_def,
 				      keep_delete, &upserts_applied, ret);
 		lsm->stat.upsert.applied += upserts_applied;
+		/*
+		 * Filter out expired tuples. An expired non-DELETE
+		 * tuple acts as a tombstone — return nothing.
+		 */
+		if (ret->stmt != NULL &&
+		    vy_stmt_type(ret->stmt) != IPROTO_DELETE &&
+		    tuple_is_expired(ret->stmt,
+				     lsm->disk_format->ttl_field_no,
+				     clock_realtime())) {
+			vy_stmt_counter_acct_tuple(
+				&lsm->stat.ttl.rows_expired, ret->stmt);
+			tuple_unref(ret->stmt);
+			*ret = vy_entry_none();
+		}
 		vy_lsm_acct_read_amp(lsm, lsm->last_range,
 				     disk_bytes, ret->stmt);
 	}

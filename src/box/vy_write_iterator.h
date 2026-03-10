@@ -247,10 +247,14 @@ struct vy_deferred_delete_handler {
  * this argument must be set to NULL.
  * @return the iterator or NULL on error (diag is set).
  */
+struct vy_stmt_counter;
+
 struct vy_stmt_stream *
 vy_write_iterator_new(struct key_def *cmp_def, bool is_primary,
 		      bool is_last_level, struct rlist *read_views,
-		      struct vy_deferred_delete_handler *handler);
+		      struct vy_deferred_delete_handler *handler,
+		      double now, int32_t ttl_field_no,
+		      struct vy_stmt_counter *ttl_rows_skipped);
 
 /**
  * Add a mem as a source to the iterator.

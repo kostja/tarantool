@@ -120,6 +120,12 @@ struct vy_run_info {
 	struct minhash sketch;
 	/** True if the run-level sketch is available. */
 	bool has_sketch;
+	/**
+	 * Min/max expires_at over all TTL tuples in the run.
+	 * 0 if no TTL tuples are present.
+	 */
+	double min_expires_at;
+	double max_expires_at;
 };
 
 /**
@@ -140,6 +146,12 @@ struct vy_page_info {
 	uint32_t row_count;
 	/** Offset of the row index in the page. */
 	uint32_t row_index_offset;
+	/** Min/max expires_at in the page (0 if no TTL tuples). */
+	double min_expires_at;
+	double max_expires_at;
+	/** Min/max LSN in the page. */
+	int64_t min_lsn;
+	int64_t max_lsn;
 };
 
 /**
@@ -191,6 +203,12 @@ struct vy_index_block_dir {
 	binary_fuse8_t filter;
 	/** True if @a filter was successfully loaded. */
 	bool has_filter;
+	/** Min/max expires_at across all pages in this block. */
+	double min_expires_at;
+	double max_expires_at;
+	/** Min/max LSN across all pages in this block. */
+	int64_t min_lsn;
+	int64_t max_lsn;
 };
 
 /**
@@ -851,6 +869,19 @@ struct vy_run_writer {
 	/** Identifier of an index owning the run. */
 	uint32_t iid;
 	/**
+	 * True if run statements store full tuples (primary
+	 * index encoding). False for secondary indexes that
+	 * store only key parts.
+	 */
+	bool is_primary_encoding;
+	/**
+	 * 0-based field index of the expires_at field, or -1
+	 * if TTL is disabled. Copied from tuple_format at task
+	 * creation time to avoid accessing format from background
+	 * threads.
+	 */
+	int32_t ttl_field_no;
+	/**
 	 * Key definition to extract from tuple and store as page
 	 * min key, run min/max keys, and secondary index
 	 * statements.
@@ -901,12 +932,18 @@ struct vy_run_writer {
 	uint32_t block_pds_cap;
 };
 
-/** Create a run writer to fill a run with statements. */
+/**
+ * Create a run writer to fill a run with statements.
+ * @param is_primary_encoding If true, statements are encoded as
+ *        full tuples (primary index style). If false, statements
+ *        are encoded as extracted keys (secondary index style).
+ */
 int
 vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 		     const char *dirpath, uint32_t space_id, uint32_t iid,
 		     struct key_def *cmp_def, struct key_def *key_def,
-		     struct index_opts *index_opts);
+		     struct index_opts *index_opts,
+		     bool is_primary_encoding, int32_t ttl_field_no);
 
 /**
  * Write a specified statement into a run.

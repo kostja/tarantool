@@ -152,7 +152,13 @@ istat()
     get:
       rows: 0
       bytes: 0
-  run_histogram: '[0]:1'
+  ttl:
+    rows_expired:
+      rows: 0
+      bytes: 0
+    rows_skipped:
+      rows: 0
+      bytes: 0
   disk:
     last_level:
       bytes_compressed: 0
@@ -216,17 +222,13 @@ istat()
   rows: 0
   run_avg: 0
   dumps_per_compaction: 0
+  run_histogram: '[0]:1'
   upsert:
     squashed: 0
     applied: 0
-  bytes: 0
   put:
     rows: 0
     bytes: 0
-  skip:
-    rows: 0
-    bytes: 0
-  run_count: 0
   txw:
     bytes: 0
     rows: 0
@@ -235,6 +237,11 @@ istat()
       get:
         rows: 0
         bytes: 0
+  skip:
+    rows: 0
+    bytes: 0
+  run_count: 0
+  bytes: 0
   memory:
     bytes: 0
     index_size: 0
@@ -314,9 +321,7 @@ wait(istat, st, 'disk.dump.count', 1)
 ...
 stat_diff(istat(), st)
 ---
-- put:
-    rows: 25
-    bytes: 26325
+- bytes: 26049
   rows: 25
   run_avg: 1
   run_count: 1
@@ -343,12 +348,14 @@ stat_diff(istat(), st)
     pages: 7
     statement:
       replaces: 25
-    index_size: 294
-  bytes: 26049
+    index_size: 518
+  put:
+    rows: 25
+    bytes: 26325
 ...
 gstat().memory.page_index == 294
 ---
-- true
+- false
 ...
 -- put + dump + compaction
 st = istat()
@@ -368,9 +375,7 @@ stat_diff(istat(), st)
 ---
 - rows: 25
   run_avg: -1
-  put:
-    rows: 50
-    bytes: 52650
+  bytes: 26042
   range_count: 1
   disk:
     last_level:
@@ -392,7 +397,7 @@ stat_diff(istat(), st)
         bytes_compressed: <bytes_compressed>
         rows: 50
     bytes: 26042
-    index_size: 252
+    index_size: 444
     pages: 6
     bytes_compressed: <bytes_compressed>
     compaction:
@@ -407,7 +412,9 @@ stat_diff(istat(), st)
         pages: 13
         bytes_compressed: <bytes_compressed>
         rows: 50
-  bytes: 26042
+  put:
+    rows: 50
+    bytes: 52650
 ...
 -- point lookup from disk + cache put
 st = istat()
@@ -495,10 +502,10 @@ stat_diff(istat(), st)
     index_size: 49152
     bytes: 1053
     rows: 1
+  bytes: 1053
   put:
     rows: 1
     bytes: 1053
-  bytes: 1053
 ...
 -- point lookup from memory
 st = istat()
@@ -1065,7 +1072,13 @@ istat()
     get:
       rows: 0
       bytes: 0
-  run_histogram: '[1]:4'
+  ttl:
+    rows_expired:
+      rows: 0
+      bytes: 0
+    rows_skipped:
+      rows: 0
+      bytes: 0
   disk:
     last_level:
       bytes_compressed: <bytes_compressed>
@@ -1088,7 +1101,7 @@ istat()
         rows: 0
         bytes: 0
       count: 0
-    index_size: 1050
+    index_size: 1850
     iterator:
       bloom:
         hit: 0
@@ -1129,17 +1142,13 @@ istat()
   rows: 306
   run_avg: 0
   dumps_per_compaction: 1
+  run_histogram: '[1]:4'
   upsert:
     squashed: 0
     applied: 0
-  bytes: 316158
   put:
     rows: 0
     bytes: 0
-  skip:
-    rows: 0
-    bytes: 0
-  run_count: 2
   txw:
     bytes: 0
     rows: 0
@@ -1148,6 +1157,11 @@ istat()
       get:
         rows: 0
         bytes: 0
+  skip:
+    rows: 0
+    bytes: 0
+  run_count: 2
+  bytes: 316158
   memory:
     bytes: 211783
     index_size: 49152
@@ -1167,7 +1181,7 @@ gstat()
     hit: 411
     miss: 6
     evict: 0
-    mem_used: 8158
+    mem_used: 10814
   tx:
     conflict: 0
     commit: 0
@@ -1179,12 +1193,12 @@ gstat()
   memory:
     tuple_cache: 14521
     tx: 0
-    page_index: 1050
+    page_index: 1850
     tuple: 13689
   disk:
     data_compacted: 112725
     data: 104375
-    index: 1050
+    index: 1850
   scheduler:
     tasks_inprogress: 0
     tasks_completed: 0
@@ -1389,8 +1403,8 @@ i1:len(), i2:len()
 ...
 i1:bsize(), i2:bsize()
 ---
-- 294
-- 850
+- 518
+- 882
 ...
 s:bsize() == st1.disk.bytes
 ---
@@ -1447,8 +1461,8 @@ i1:len(), i2:len()
 ...
 i1:bsize(), i2:bsize()
 ---
-- 49446
-- 50002
+- 49670
+- 50034
 ...
 s:bsize() == st1.memory.bytes + st1.disk.bytes
 ---
@@ -1512,8 +1526,8 @@ i1:len(), i2:len()
 ...
 i1:bsize(), i2:bsize()
 ---
-- 294
-- 850
+- 518
+- 882
 ...
 s:bsize() == st1.disk.bytes
 ---

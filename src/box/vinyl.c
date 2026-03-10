@@ -463,6 +463,11 @@ vinyl_index_stat(struct index *index, struct info_handler *h)
 	info_table_end(h); /* iterator */
 	info_table_end(h); /* txw */
 
+	info_table_begin(h, "ttl");
+	vy_info_append_stmt_counter(h, "rows_expired", &stat->ttl.rows_expired);
+	vy_info_append_stmt_counter(h, "rows_skipped", &stat->ttl.rows_skipped);
+	info_table_end(h); /* ttl */
+
 	info_append_int(h, "range_size", vy_lsm_range_size(lsm));
 	info_append_int(h, "range_count", lsm->range_count);
 	info_append_int(h, "run_count", lsm->run_count);
@@ -513,6 +518,10 @@ vinyl_index_reset_stat(struct index *index)
 	vy_stmt_counter_reset(&cache_stat->put);
 	vy_stmt_counter_reset(&cache_stat->invalidate);
 	vy_stmt_counter_reset(&cache_stat->evict);
+
+	/* TTL */
+	vy_stmt_counter_reset(&stat->ttl.rows_expired);
+	vy_stmt_counter_reset(&stat->ttl.rows_skipped);
 }
 
 static void

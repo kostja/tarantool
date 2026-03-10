@@ -189,6 +189,13 @@ struct vy_lsm_stat {
 		/** TX write set iterator statistics. */
 		struct vy_txw_iterator_stat iterator;
 	} txw;
+	/** TTL statistics. */
+	struct {
+		/** Tuples filtered out by TTL at read time. */
+		struct vy_stmt_counter rows_expired;
+		/** Tuples dropped by TTL during compaction. */
+		struct vy_stmt_counter rows_skipped;
+	} ttl;
 };
 
 /** Tuple cache statistics. */

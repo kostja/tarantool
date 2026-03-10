@@ -112,6 +112,11 @@ struct space_opts {
 	 * which should speed up writes, but may also slow down reads.
 	 */
 	bool defer_deletes;
+	/**
+	 * 0-based field number for the expires_at TTL field,
+	 * or -1 if TTL is disabled.
+	 */
+	int32_t ttl_field_no;
 	/** SQL statement that produced this space. */
 	char *sql;
 	/** Array of constraints. Can be NULL if constraints_count == 0. */

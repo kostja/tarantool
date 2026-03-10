@@ -31,6 +31,7 @@
 #include "vy_read_iterator.h"
 #include "vy_run.h"
 #include "vy_mem.h"
+#include "vy_stmt.h"
 #include "vy_cache.h"
 #include "vy_tx.h"
 #include "fiber.h"
@@ -829,6 +830,7 @@ vy_read_iterator_open_after(struct vy_read_iterator *itr, struct vy_lsm *lsm,
 		 iterator_type == ITER_GE || iterator_type == ITER_LE) &&
 		vy_stmt_is_exact_key(key.stmt, lsm->cmp_def, lsm->key_def,
 				     lsm->opts.is_unique);
+	itr->now = clock_realtime();
 }
 
 /**
@@ -1026,6 +1028,21 @@ next_key:
 			itr->cache_link_lsn = MAX(itr->cache_link_lsn,
 						  vy_stmt_lsn(entry.stmt));
 		}
+		goto next_key;
+	}
+	if (entry.stmt != NULL &&
+	    vy_stmt_type(entry.stmt) != IPROTO_DELETE &&
+	    tuple_is_expired(entry.stmt,
+			     itr->lsm->disk_format->ttl_field_no,
+			     itr->now)) {
+		/*
+		 * Expired tuple acts as a tombstone — skip this key.
+		 * Charge disk bytes as pure waste (no useful result).
+		 */
+		vy_stmt_counter_acct_tuple(&itr->lsm->stat.ttl.rows_expired,
+					   entry.stmt);
+		vy_lsm_acct_read_amp(itr->lsm, itr->curr_range,
+				     disk_bytes, NULL);
 		goto next_key;
 	}
 	assert(entry.stmt == NULL ||

@@ -45,6 +45,7 @@ const struct space_opts space_opts_default = {
 	/* .view = */ false,
 	/* .is_sync = */ false,
 	/* .defer_deletes = */ false,
+	/* .ttl_field_no = */ -1,
 	/* .sql        = */ NULL,
 	/* .constraint_def = */ NULL,
 	/* .constraint_count = */ 0,
@@ -90,6 +91,13 @@ space_opts_parse_temporary(const char **data, void *vopts,
 static int
 space_opts_parse_type(const char **data, void *vopts, struct region *region);
 
+/**
+ * Callback to parse a value with 'ttl' key in msgpack space opts
+ * definition. See function definition below.
+ */
+static int
+space_opts_parse_ttl(const char **data, void *vopts, struct region *region);
+
 const struct opt_def space_opts_reg[] = {
 	OPT_DEF_CUSTOM("type", space_opts_parse_type),
 	OPT_DEF("group_id", OPT_UINT32, struct space_opts, group_id),
@@ -101,6 +109,7 @@ const struct opt_def space_opts_reg[] = {
 	OPT_DEF_CUSTOM("constraint", space_opts_parse_constraint),
 	OPT_DEF_CUSTOM("foreign_key", space_opts_parse_foreign_key),
 	OPT_DEF_CUSTOM("upgrade", space_opts_parse_upgrade),
+	OPT_DEF_CUSTOM("ttl", space_opts_parse_ttl),
 	OPT_DEF_LEGACY("checks"),
 	OPT_END,
 };
@@ -110,13 +119,17 @@ space_tuple_format_new(struct tuple_format_vtab *vtab, void *engine,
 		       struct key_def *const *keys, uint16_t key_count,
 		       const struct space_def *def)
 {
-	return tuple_format_new(vtab, engine, keys, key_count,
-				def->fields, def->field_count,
-				def->exact_field_count, def->dict,
-				space_opts_is_data_temporary(&def->opts),
-				def->opts.is_ephemeral,
-				def->opts.constraint_def,
-				def->opts.constraint_count);
+	struct tuple_format *format =
+		tuple_format_new(vtab, engine, keys, key_count,
+				 def->fields, def->field_count,
+				 def->exact_field_count, def->dict,
+				 space_opts_is_data_temporary(&def->opts),
+				 def->opts.is_ephemeral,
+				 def->opts.constraint_def,
+				 def->opts.constraint_count);
+	if (format != NULL)
+		format->ttl_field_no = def->opts.ttl_field_no;
+	return format;
 }
 
 /**
@@ -310,6 +323,35 @@ space_opts_parse_type(const char **data, void *vopts, struct region *region)
 		return -1;
 	}
 	opts->type = space_type;
+	return 0;
+}
+
+static int
+space_opts_parse_ttl(const char **data, void *vopts, struct region *region)
+{
+	(void)region;
+	struct space_opts *opts = (struct space_opts *)vopts;
+	if (mp_typeof(**data) == MP_INT) {
+		int64_t val = mp_decode_int(data);
+		if (val != -1) {
+			diag_set(IllegalParams,
+				 "'ttl' must be a non-negative integer or -1");
+			return -1;
+		}
+		opts->ttl_field_no = -1;
+		return 0;
+	}
+	if (mp_typeof(**data) != MP_UINT) {
+		diag_set(IllegalParams,
+			 "'ttl' must be a non-negative integer or -1");
+		return -1;
+	}
+	uint64_t val = mp_decode_uint(data);
+	if (val > INT32_MAX) {
+		diag_set(IllegalParams, "'ttl' field number is too large");
+		return -1;
+	}
+	opts->ttl_field_no = (int32_t)val;
 	return 0;
 }
 
