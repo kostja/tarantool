@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 300" font-family="Consolas, monospace" font-size="11">
+  <defs>
+    <marker id="arr" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#555"/>
+    </marker>
+  </defs>
+
+  <!-- Column headers -->
+  <text x="110" y="20" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">До слияния</text>
+  <text x="350" y="20" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">Во время слияния</text>
+  <text x="570" y="20" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">После слияния</text>
+
+  <!-- Column 1: Before -->
+  <rect x="25" y="35" width="170" height="28" rx="3" fill="#e3f2fd" stroke="#1976d2"/>
+  <text x="110" y="54" text-anchor="middle" fill="#1565c0" font-size="10">slice A (L1, свежий)</text>
+
+  <rect x="25" y="68" width="170" height="28" rx="3" fill="#fff3e0" stroke="#ff9800"/>
+  <text x="110" y="87" text-anchor="middle" fill="#e65100" font-size="10">slice B (L2) ← first</text>
+
+  <rect x="25" y="101" width="170" height="28" rx="3" fill="#fff3e0" stroke="#ff9800"/>
+  <text x="110" y="120" text-anchor="middle" fill="#e65100" font-size="10">slice C (L3)</text>
+
+  <rect x="25" y="134" width="170" height="28" rx="3" fill="#fff3e0" stroke="#ff9800"/>
+  <text x="110" y="153" text-anchor="middle" fill="#e65100" font-size="10">slice D (L4) ← last</text>
+
+  <!-- Brace for compaction range -->
+  <text x="15" y="110" fill="#c62828" font-size="20">⎫</text>
+  <text x="15" y="87" fill="#c62828" font-size="20">⎫</text>
+  <text x="15" y="143" fill="#c62828" font-size="20">⎭</text>
+  <text x="3" y="118" fill="#c62828" font-size="9" transform="rotate(-90, 3, 118)">сливаем</text>
+
+  <!-- Arrow 1→2 -->
+  <line x1="200" y1="100" x2="240" y2="100" stroke="#555" stroke-width="1" marker-end="url(#arr)"/>
+
+  <!-- Column 2: During compaction (dump adds new slice) -->
+  <rect x="245" y="35" width="210" height="28" rx="3" fill="#c8e6c9" stroke="#4caf50" stroke-width="2"/>
+  <text x="350" y="54" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="bold">slice NEW (дамп!)</text>
+
+  <rect x="245" y="68" width="210" height="28" rx="3" fill="#e3f2fd" stroke="#1976d2"/>
+  <text x="350" y="87" text-anchor="middle" fill="#1565c0" font-size="10">slice A (L1)</text>
+
+  <rect x="245" y="101" width="210" height="28" rx="3" fill="#eee" stroke="#bbb" stroke-dasharray="4"/>
+  <text x="350" y="120" text-anchor="middle" fill="#999" font-size="10">slice B ← first (сливается...)</text>
+
+  <rect x="245" y="134" width="210" height="28" rx="3" fill="#eee" stroke="#bbb" stroke-dasharray="4"/>
+  <text x="350" y="153" text-anchor="middle" fill="#999" font-size="10">slice C            (сливается...)</text>
+
+  <rect x="245" y="167" width="210" height="28" rx="3" fill="#eee" stroke="#bbb" stroke-dasharray="4"/>
+  <text x="350" y="186" text-anchor="middle" fill="#999" font-size="10">slice D ← last  (сливается...)</text>
+
+  <!-- Arrow 2→3 -->
+  <line x1="460" y1="110" x2="480" y2="110" stroke="#555" stroke-width="1" marker-end="url(#arr)"/>
+
+  <!-- Column 3: After compaction -->
+  <rect x="485" y="35" width="175" height="28" rx="3" fill="#c8e6c9" stroke="#4caf50"/>
+  <text x="572" y="54" text-anchor="middle" fill="#2e7d32" font-size="10">slice NEW (дамп)</text>
+
+  <rect x="485" y="68" width="175" height="28" rx="3" fill="#e3f2fd" stroke="#1976d2"/>
+  <text x="572" y="87" text-anchor="middle" fill="#1565c0" font-size="10">slice A (L1)</text>
+
+  <rect x="485" y="101" width="175" height="28" rx="3" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="572" y="120" text-anchor="middle" fill="#1b5e20" font-size="10" font-weight="bold">slice BCD' (результат)</text>
+
+  <!-- Annotation -->
+  <rect x="245" y="220" width="210" height="60" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="350" y="240" text-anchor="middle" fill="#f57f17" font-size="10">add_slice_before(BCD', first=B)</text>
+  <text x="350" y="256" text-anchor="middle" fill="#f57f17" font-size="10">→ результат встаёт на место</text>
+  <text x="350" y="272" text-anchor="middle" fill="#f57f17" font-size="10">   B, C, D; дамп остаётся впереди</text>
+</svg>

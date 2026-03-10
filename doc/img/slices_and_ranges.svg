@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 340" font-family="Consolas, monospace" font-size="12">
+  <defs>
+    <pattern id="hatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#bbb" stroke-width="0.8"/>
+    </pattern>
+  </defs>
+
+  <!-- Title -->
+  <text x="300" y="20" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">Run-файл, slice и диапазоны</text>
+
+  <!-- Run file (full bar at top) -->
+  <rect x="40" y="40" width="520" height="32" rx="3" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+  <text x="300" y="61" text-anchor="middle" fill="#1565c0" font-weight="bold">run-файл R1 (отсортированные данные, один файл на диске)</text>
+
+  <!-- Dividers in run file showing pages -->
+  <line x1="220" y1="40" x2="220" y2="72" stroke="#90caf9" stroke-width="1" stroke-dasharray="3"/>
+  <line x1="400" y1="40" x2="400" y2="72" stroke="#90caf9" stroke-width="1" stroke-dasharray="3"/>
+  <text x="130" y="56" text-anchor="middle" fill="#1976d2" font-size="10">стр. 0–15</text>
+  <text x="310" y="56" text-anchor="middle" fill="#1976d2" font-size="10">стр. 16–31</text>
+  <text x="460" y="56" text-anchor="middle" fill="#1976d2" font-size="10">стр. 32–47</text>
+
+  <!-- Arrows from slices to run portions -->
+  <line x1="130" y1="140" x2="130" y2="76" stroke="#4caf50" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="310" y1="140" x2="310" y2="76" stroke="#ff9800" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="460" y1="140" x2="460" y2="76" stroke="#9c27b0" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#555"/>
+    </marker>
+  </defs>
+
+  <!-- Slice labels -->
+  <text x="130" y="130" text-anchor="middle" fill="#2e7d32" font-size="11" font-weight="bold">slice S1</text>
+  <text x="310" y="130" text-anchor="middle" fill="#e65100" font-size="11" font-weight="bold">slice S2</text>
+  <text x="460" y="130" text-anchor="middle" fill="#6a1b9a" font-size="11" font-weight="bold">slice S3</text>
+
+  <!-- Range 1 -->
+  <rect x="30" y="150" width="180" height="170" rx="5" fill="#e8f5e9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="120" y="172" text-anchor="middle" fill="#2e7d32" font-weight="bold">Диапазон 1</text>
+  <text x="120" y="188" text-anchor="middle" fill="#666" font-size="10">[A ... K)</text>
+
+  <!-- Slices in Range 1 -->
+  <rect x="45" y="200" width="150" height="22" rx="3" fill="#c8e6c9" stroke="#4caf50"/>
+  <text x="120" y="215" text-anchor="middle" fill="#2e7d32" font-size="10">slice S1 (R1, стр.0–15)</text>
+  <rect x="45" y="228" width="150" height="22" rx="3" fill="#dcedc8" stroke="#8bc34a"/>
+  <text x="120" y="243" text-anchor="middle" fill="#558b2f" font-size="10">slice S4 (R2)</text>
+  <rect x="45" y="256" width="150" height="22" rx="3" fill="#f1f8e9" stroke="#aed581"/>
+  <text x="120" y="271" text-anchor="middle" fill="#689f38" font-size="10">slice S7 (R3)</text>
+  <text x="120" y="300" text-anchor="middle" fill="#999" font-size="9">свежие ↑  старые ↓</text>
+
+  <!-- Range 2 -->
+  <rect x="220" y="150" width="160" height="170" rx="5" fill="#fff3e0" stroke="#ff9800" stroke-width="1.5"/>
+  <text x="300" y="172" text-anchor="middle" fill="#e65100" font-weight="bold">Диапазон 2</text>
+  <text x="300" y="188" text-anchor="middle" fill="#666" font-size="10">[K ... T)</text>
+
+  <!-- Slices in Range 2 -->
+  <rect x="235" y="200" width="130" height="22" rx="3" fill="#ffe0b2" stroke="#ff9800"/>
+  <text x="300" y="215" text-anchor="middle" fill="#e65100" font-size="10">slice S2 (R1, 16–31)</text>
+  <rect x="235" y="228" width="130" height="22" rx="3" fill="#ffecb3" stroke="#ffc107"/>
+  <text x="300" y="243" text-anchor="middle" fill="#f57f17" font-size="10">slice S5 (R2)</text>
+  <rect x="235" y="256" width="130" height="22" rx="3" fill="#fff8e1" stroke="#ffca28"/>
+  <text x="300" y="271" text-anchor="middle" fill="#f9a825" font-size="10">slice S8 (R3)</text>
+
+  <!-- Range 3 -->
+  <rect x="390" y="150" width="180" height="170" rx="5" fill="#f3e5f5" stroke="#9c27b0" stroke-width="1.5"/>
+  <text x="480" y="172" text-anchor="middle" fill="#6a1b9a" font-weight="bold">Диапазон 3</text>
+  <text x="480" y="188" text-anchor="middle" fill="#666" font-size="10">[T ... Z]</text>
+
+  <!-- Slices in Range 3 -->
+  <rect x="405" y="200" width="150" height="22" rx="3" fill="#e1bee7" stroke="#9c27b0"/>
+  <text x="480" y="215" text-anchor="middle" fill="#6a1b9a" font-size="10">slice S3 (R1, 32–47)</text>
+  <rect x="405" y="228" width="150" height="22" rx="3" fill="#e8d5ed" stroke="#ab47bc"/>
+  <text x="480" y="243" text-anchor="middle" fill="#7b1fa2" font-size="10">slice S6 (R2)</text>
+  <rect x="405" y="256" width="150" height="22" rx="3" fill="#f3e5f5" stroke="#ba68c8"/>
+  <text x="480" y="271" text-anchor="middle" fill="#8e24aa" font-size="10">slice S9 (R3)</text>
+</svg>
