@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "clock.h"
 #include "iterator_type.h"
 #include "trivia/util.h"
 #include "vy_entry.h"
@@ -139,6 +140,12 @@ struct vy_read_iterator {
 	 * front_id from the previous iteration.
 	 */
 	uint32_t prev_front_id;
+	/**
+	 * Current wall-clock time, captured once at iterator open.
+	 * Used for TTL filtering: tuples with expires_at < now
+	 * are treated as invisible (like DELETEs).
+	 */
+	double now;
 };
 
 /**

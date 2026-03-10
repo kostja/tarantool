@@ -604,6 +604,10 @@ request_replace_body_create(struct request_replace_body *body,
 	_(PAGE_INDEX_SIZE, 11)						\
 	/** MinHash sketch for the entire run (overlap estimation). */	\
 	_(SKETCH, 12)							\
+	/** Min expires_at over all TTL tuples in the run. */		\
+	_(MIN_EXPIRES_AT, 13)						\
+	/** Max expires_at over all TTL tuples in the run. */		\
+	_(MAX_EXPIRES_AT, 14)						\
 
 #define VY_RUN_INFO_KEY_MEMBER(s, v) VY_RUN_INFO_ ## s = v,
 
@@ -642,6 +646,14 @@ vy_run_info_key_name(enum vy_run_info_key key)
 	_(MIN_KEY, 5)							\
 	/** Offset of the row index in the page. */			\
 	_(ROW_INDEX_OFFSET, 6)						\
+	/** Min expires_at in the page. */				\
+	_(MIN_EXPIRES_AT, 7)						\
+	/** Max expires_at in the page. */				\
+	_(MAX_EXPIRES_AT, 8)						\
+	/** Min LSN in the page. */					\
+	_(MIN_LSN, 9)							\
+	/** Max LSN in the page. */					\
+	_(MAX_LSN, 10)							\
 
 #define VY_PAGE_INFO_KEY_MEMBER(s, v) VY_PAGE_INFO_ ## s = v,
 

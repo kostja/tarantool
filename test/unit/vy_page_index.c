@@ -562,9 +562,11 @@ test_forward_compat(void)
 	plan(4);
 
 	/*
-	 * Test 1: vy_block_dir_decode with an extra field in each
-	 * directory entry.  Current format is array(2, key, count).
-	 * Future format might be array(3, key, count, something).
+	 * Test 1: vy_block_dir_decode with extra fields in each
+	 * directory entry.  Current format is:
+	 *   array(6, key, count, min_expires_at, max_expires_at,
+	 *         min_lsn, max_lsn)
+	 * Future format might add more fields at positions 6+.
 	 */
 	struct vy_run *run = vy_run_new(&run_env, 100);
 	fail_if(run == NULL);
@@ -573,18 +575,27 @@ test_forward_compat(void)
 	char buf[512];
 	char *pos = buf;
 	pos = mp_encode_array(pos, 2);
-	/* Block 0: array(3, key=[10], page_count=4, unknown="future") */
-	pos = mp_encode_array(pos, 3);
-	pos = mp_encode_array(pos, 1);
+	/* Block 0: 6 known fields + 1 unknown string at position 6. */
+	pos = mp_encode_array(pos, 7);
+	pos = mp_encode_array(pos, 1);  /* key = [10] */
 	pos = mp_encode_uint(pos, 10);
-	pos = mp_encode_uint(pos, 4);
-	pos = mp_encode_str(pos, "future_data", 11);
-	/* Block 1: array(4, key=[20], page_count=3, unk1=42, unk2=true) */
-	pos = mp_encode_array(pos, 4);
-	pos = mp_encode_array(pos, 1);
+	pos = mp_encode_uint(pos, 4);   /* page_count */
+	pos = mp_encode_double(pos, 0); /* min_expires_at */
+	pos = mp_encode_double(pos, 0); /* max_expires_at */
+	pos = mp_encode_uint(pos, 1);   /* min_lsn */
+	pos = mp_encode_uint(pos, 10);  /* max_lsn */
+	pos = mp_encode_str(pos, "future_data", 11); /* unknown */
+	/* Block 1: 6 known fields + 2 unknown at positions 6,7. */
+	pos = mp_encode_array(pos, 8);
+	pos = mp_encode_array(pos, 1);  /* key = [20] */
 	pos = mp_encode_uint(pos, 20);
-	pos = mp_encode_uint(pos, 3);
-	pos = mp_encode_uint(pos, 42);
+	pos = mp_encode_uint(pos, 3);   /* page_count */
+	pos = mp_encode_double(pos, 0); /* min_expires_at */
+	pos = mp_encode_double(pos, 0); /* max_expires_at */
+	pos = mp_encode_uint(pos, 1);   /* min_lsn */
+	pos = mp_encode_uint(pos, 10);  /* max_lsn */
+	pos = mp_encode_uint(pos, 42);  /* unknown 1 */
+	pos = mp_encode_bool(pos, true); /* unknown 2 */
 
 	const char *data = buf;
 	int rc = vy_block_dir_decode(run, &data, cmp_def, "test");

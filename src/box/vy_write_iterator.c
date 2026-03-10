@@ -32,6 +32,8 @@
 #include "vy_mem.h"
 #include "vy_run.h"
 #include "vy_upsert.h"
+#include "vy_stat.h"
+#include "vy_stmt.h"
 #include "fiber.h"
 
 #define HEAP_FORWARD_DECLARATION
@@ -207,6 +209,24 @@ struct vy_write_iterator {
 	 */
 	struct vy_entry last;
 	/**
+	 * Current wall-clock time for TTL filtering.
+	 * Set at iterator creation from clock_realtime().
+	 */
+	double now;
+	/**
+	 * 0-based field index of the expires_at field, or -1
+	 * if TTL is disabled. Copied from tuple_format at task
+	 * creation time to avoid accessing format from background
+	 * threads.
+	 */
+	int32_t ttl_field_no;
+	/**
+	 * Counter for tuples dropped by TTL during compaction.
+	 * Points to vy_lsm_stat.ttl.rows_skipped. May be NULL
+	 * if stats are not needed (e.g. in unit tests).
+	 */
+	struct vy_stmt_counter *ttl_rows_skipped;
+	/**
 	 * Read views of the same key sorted by LSN in descending
 	 * order, starting from INT64_MAX.
 	 *
@@ -345,7 +365,9 @@ static const struct vy_stmt_stream_iface vy_slice_stream_iface;
 struct vy_stmt_stream *
 vy_write_iterator_new(struct key_def *cmp_def, bool is_primary,
 		      bool is_last_level, struct rlist *read_views,
-		      struct vy_deferred_delete_handler *handler)
+		      struct vy_deferred_delete_handler *handler,
+		      double now, int32_t ttl_field_no,
+		      struct vy_stmt_counter *ttl_rows_skipped)
 {
 	/*
 	 * Deferred DELETE statements can only be produced by
@@ -391,6 +413,9 @@ vy_write_iterator_new(struct key_def *cmp_def, bool is_primary,
 	stream->deferred_delete_handler = handler;
 	stream->deferred_delete = vy_entry_none();
 	stream->last = vy_entry_none();
+	stream->now = now;
+	stream->ttl_field_no = ttl_field_no;
+	stream->ttl_rows_skipped = ttl_rows_skipped;
 	return &stream->base;
 }
 
@@ -768,6 +793,23 @@ vy_write_iterator_build_history(struct vy_write_iterator *stream,
 		 */
 		if (vy_stmt_type(src->entry.stmt) == IPROTO_DELETE &&
 		    stream->is_last_level && merge_until_lsn < 0) {
+			current_rv_lsn = -1; /* Force skip */
+			goto next_lsn;
+		}
+
+		/*
+		 * TTL optimization: skip expired tuples on last level.
+		 * Same logic as for DELETEs above — the tuple is
+		 * invisible and there is nothing older to suppress.
+		 */
+		if (vy_stmt_type(src->entry.stmt) != IPROTO_DELETE &&
+		    stream->is_last_level && merge_until_lsn < 0 &&
+		    tuple_is_expired(src->entry.stmt, stream->ttl_field_no,
+				     stream->now)) {
+			if (stream->ttl_rows_skipped != NULL)
+				vy_stmt_counter_acct_tuple(
+					stream->ttl_rows_skipped,
+					src->entry.stmt);
 			current_rv_lsn = -1; /* Force skip */
 			goto next_lsn;
 		}

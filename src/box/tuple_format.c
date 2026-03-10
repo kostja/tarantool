@@ -743,6 +743,7 @@ tuple_format_alloc(struct key_def * const *keys, uint16_t key_count,
 	format->constraint_count = 0;
 	format->constraint = NULL;
 	format->default_field_count = 0;
+	format->ttl_field_no = -1;
 	return format;
 error:
 	tuple_format_destroy_fields(format);

@@ -181,6 +181,22 @@ vy_lsm_new(struct vy_lsm_env *lsm_env, struct vy_cache_env *cache_env,
 		 * definitions as well as space->format tuples.
 		 */
 		lsm->disk_format = format;
+	} else if (format->ttl_field_no >= 0) {
+		/*
+		 * When TTL is enabled, secondary index runs store
+		 * full tuples (like the primary index) so that
+		 * each entry carries its own expires_at field.
+		 * This allows independent read-time filtering
+		 * and last-level compaction GC without deferred
+		 * DELETEs.
+		 */
+		lsm->disk_format = format;
+
+		lsm->pk_in_cmp_def = key_def_find_pk_in_cmp_def(lsm->cmp_def,
+								pk->key_def,
+								&fiber()->gc);
+		if (lsm->pk_in_cmp_def == NULL)
+			goto fail_pk_in_cmp_def;
 	} else {
 		/*
 		 * To save disk space, we do not store full tuples

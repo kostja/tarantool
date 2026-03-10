@@ -298,6 +298,11 @@ struct tuple_format {
 	struct tuple_constraint *constraint;
 	/** Number of constraints. */
 	uint32_t constraint_count;
+	/**
+	 * 0-based field index of the expires_at field, or -1 if no TTL.
+	 * The field has an offset slot for O(1) access.
+	 */
+	int32_t ttl_field_no;
 };
 
 /**
