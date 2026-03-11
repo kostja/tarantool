@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 340" font-family="Consolas, monospace" font-size="11">
+  <defs>
+    <marker id="arr" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#555"/>
+    </marker>
+  </defs>
+
+  <text x="280" y="20" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">Shape-based compaction: форма дерева</text>
+
+  <!-- Level 0 (newest, up to run_count_per_level = 2 files) -->
+  <rect x="210" y="40" width="60" height="28" rx="3" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="240" y="58" text-anchor="middle" fill="#2e7d32" font-size="9">10 MB</text>
+
+  <rect x="290" y="40" width="60" height="28" rx="3" fill="#c8e6c9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="320" y="58" text-anchor="middle" fill="#2e7d32" font-size="9">10 MB</text>
+
+  <text x="145" y="58" text-anchor="end" fill="#666" font-size="10">Уровень 0</text>
+  <text x="380" y="58" fill="#888" font-size="9">run_count_per_level = 2</text>
+
+  <!-- Level 1 -->
+  <rect x="190" y="90" width="100" height="28" rx="3" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.5"/>
+  <text x="240" y="108" text-anchor="middle" fill="#1565c0" font-size="9">35 MB</text>
+
+  <rect x="300" y="90" width="100" height="28" rx="3" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.5"/>
+  <text x="350" y="108" text-anchor="middle" fill="#1565c0" font-size="9">35 MB</text>
+
+  <text x="145" y="108" text-anchor="end" fill="#666" font-size="10">Уровень 1</text>
+  <text x="430" y="108" fill="#888" font-size="9">× run_size_ratio (3.5)</text>
+
+  <!-- Level 2 (bottom, single file) -->
+  <rect x="150" y="140" width="260" height="28" rx="3" fill="#fff3e0" stroke="#e65100" stroke-width="1.5"/>
+  <text x="280" y="158" text-anchor="middle" fill="#bf360c" font-size="9">122 MB (единственный файл)</text>
+
+  <text x="145" y="158" text-anchor="end" fill="#666" font-size="10">Уровень 2</text>
+  <text x="440" y="158" fill="#c62828" font-size="9">← ровно 1</text>
+
+  <!-- Compaction trigger annotation -->
+  <rect x="35" y="195" width="240" height="55" rx="5" fill="#fce4ec" stroke="#c62828" stroke-width="1.2"/>
+  <text x="155" y="213" text-anchor="middle" fill="#c62828" font-size="10" font-weight="bold">Триггер compaction:</text>
+  <text x="155" y="230" text-anchor="middle" fill="#c62828" font-size="10">Если на уровне появится 3-й файл</text>
+  <text x="155" y="244" text-anchor="middle" fill="#c62828" font-size="10">→ слияние с нижним уровнем</text>
+
+  <!-- Size calculation -->
+  <rect x="295" y="195" width="240" height="55" rx="5" fill="#e8eaf6" stroke="#3f51b5" stroke-width="1.2"/>
+  <text x="415" y="213" text-anchor="middle" fill="#283593" font-size="10" font-weight="bold">Расчёт сверху вниз:</text>
+  <text x="415" y="230" text-anchor="middle" fill="#283593" font-size="10">bottom = 122 MB (факт)</text>
+  <text x="415" y="244" text-anchor="middle" fill="#283593" font-size="10">level 1 = ceil(122/3.5) = 35 MB</text>
+
+  <!-- Space amplification -->
+  <rect x="100" y="275" width="360" height="50" rx="5" fill="#f1f8e9" stroke="#689f38" stroke-width="1.2"/>
+  <text x="280" y="293" text-anchor="middle" fill="#33691e" font-size="10" font-weight="bold">Space amplification ≤ (run_count - 1)/(ratio - 1) + 1</text>
+  <text x="280" y="311" text-anchor="middle" fill="#33691e" font-size="10">= (2-1)/(3.5-1) + 1 = 1.4×</text>
+</svg>

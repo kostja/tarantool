@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 400" font-family="Consolas, monospace" font-size="12">
+  <!-- Triangle -->
+  <polygon points="250,40 60,340 440,340" fill="none" stroke="#555" stroke-width="2"/>
+
+  <!-- Vertices -->
+  <circle cx="250" cy="40" r="6" fill="#1976d2"/>
+  <text x="250" y="25" text-anchor="middle" font-weight="bold" fill="#1565c0" font-size="14">Read Amp</text>
+
+  <circle cx="60" cy="340" r="6" fill="#e65100"/>
+  <text x="60" y="365" text-anchor="middle" font-weight="bold" fill="#bf360c" font-size="14">Write Amp</text>
+
+  <circle cx="440" cy="340" r="6" fill="#2e7d32"/>
+  <text x="440" y="365" text-anchor="middle" font-weight="bold" fill="#1b5e20" font-size="14">Space Amp</text>
+
+  <!-- Edge labels -->
+  <text x="135" y="175" text-anchor="middle" fill="#c62828" font-size="10" transform="rotate(-60,135,175)">меньше слияний →</text>
+  <text x="135" y="195" text-anchor="middle" fill="#c62828" font-size="10" transform="rotate(-60,135,195)">дешевле запись,</text>
+  <text x="135" y="215" text-anchor="middle" fill="#c62828" font-size="10" transform="rotate(-60,135,215)">дороже чтение</text>
+
+  <text x="365" y="175" text-anchor="middle" fill="#2e7d32" font-size="10" transform="rotate(60,365,175)">← больше слияний</text>
+  <text x="365" y="195" text-anchor="middle" fill="#2e7d32" font-size="10" transform="rotate(60,365,195)">дешевле чтение,</text>
+  <text x="365" y="215" text-anchor="middle" fill="#2e7d32" font-size="10" transform="rotate(60,365,215)">больше мусора</text>
+
+  <text x="250" y="330" text-anchor="middle" fill="#e65100" font-size="10">← чаще GC = меньше мусора, дороже запись →</text>
+
+  <!-- Strategy dots -->
+  <circle cx="200" cy="280" r="10" fill="#ff9800" opacity="0.8"/>
+  <text x="200" y="284" text-anchor="middle" fill="white" font-size="9" font-weight="bold">S</text>
+  <text x="175" y="305" text-anchor="end" fill="#e65100" font-size="10">STCS</text>
+
+  <circle cx="310" cy="180" r="10" fill="#1976d2" opacity="0.8"/>
+  <text x="310" y="184" text-anchor="middle" fill="white" font-size="9" font-weight="bold">L</text>
+  <text x="335" y="180" fill="#1565c0" font-size="10">LCS</text>
+
+  <circle cx="260" cy="220" r="10" fill="#9c27b0" opacity="0.8"/>
+  <text x="260" y="224" text-anchor="middle" fill="white" font-size="9" font-weight="bold">V</text>
+  <text x="285" y="220" fill="#6a1b9a" font-size="10">Vinyl</text>
+</svg>

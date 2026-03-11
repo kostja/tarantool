@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 400" font-family="Consolas, monospace" font-size="11">
+  <defs>
+    <marker id="arr" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#555"/>
+    </marker>
+    <pattern id="dead" patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#ef5350" stroke-width="1.5" opacity="0.4"/>
+    </pattern>
+  </defs>
+
+  <text x="350" y="20" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">Time-series bloat при разбиении диапазонов</text>
+
+  <!-- Step 1: Before split -->
+  <text x="110" y="50" text-anchor="middle" font-size="12" font-weight="bold" fill="#1565c0">1. До разбиения</text>
+
+  <rect x="20" y="60" width="180" height="80" rx="4" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.5"/>
+  <text x="110" y="82" text-anchor="middle" fill="#1565c0" font-size="10" font-weight="bold">Диапазон [A..Z)</text>
+  <rect x="30" y="92" width="160" height="22" rx="3" fill="#bbdefb" stroke="#1976d2"/>
+  <text x="110" y="107" text-anchor="middle" fill="#1565c0" font-size="9">run R1: 192 MB (полный)</text>
+  <text x="110" y="132" text-anchor="middle" fill="#888" font-size="9">≥ 1.5× от 128 MB → split!</text>
+
+  <!-- Arrow -->
+  <line x1="210" y1="100" x2="240" y2="100" stroke="#555" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <!-- Step 2: After split -->
+  <text x="370" y="50" text-anchor="middle" font-size="12" font-weight="bold" fill="#e65100">2. После разбиения</text>
+
+  <!-- Bottom range -->
+  <rect x="250" y="60" width="120" height="80" rx="4" fill="#fff3e0" stroke="#ff9800" stroke-width="1.5"/>
+  <text x="310" y="78" text-anchor="middle" fill="#e65100" font-size="10" font-weight="bold">[A..M)</text>
+  <rect x="258" y="85" width="104" height="22" rx="3" fill="#ffe0b2" stroke="#ff9800"/>
+  <text x="310" y="100" text-anchor="middle" fill="#e65100" font-size="9">slice (R1, 0-96MB)</text>
+  <text x="310" y="125" text-anchor="middle" fill="#2e7d32" font-size="9">96 MB живых</text>
+
+  <!-- Top range (active) -->
+  <rect x="380" y="60" width="120" height="80" rx="4" fill="#e8f5e9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="440" y="78" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="bold">[M..Z)</text>
+  <rect x="388" y="85" width="104" height="22" rx="3" fill="#c8e6c9" stroke="#4caf50"/>
+  <text x="440" y="100" text-anchor="middle" fill="#2e7d32" font-size="9">slice (R1, 96-192MB)</text>
+  <text x="440" y="125" text-anchor="middle" fill="#2e7d32" font-size="9">← сюда пишем</text>
+
+  <!-- Step 3: After more writes + split of top range -->
+  <text x="350" y="170" text-anchor="middle" font-size="12" font-weight="bold" fill="#c62828">3. Через N дампов: ещё одно разбиение</text>
+
+  <!-- Range 1: cold, dead data growing -->
+  <rect x="20" y="190" width="140" height="100" rx="4" fill="#fff3e0" stroke="#ff9800" stroke-width="1.5"/>
+  <text x="90" y="208" text-anchor="middle" fill="#e65100" font-size="10" font-weight="bold">[A..M)</text>
+  <!-- The run file has dead data -->
+  <rect x="30" y="215" width="120" height="20" rx="3" fill="url(#dead)" stroke="#ef5350"/>
+  <text x="90" y="229" text-anchor="middle" fill="#c62828" font-size="8">R1: 50% мёртвых</text>
+  <text x="90" y="255" text-anchor="middle" fill="#c62828" font-size="9" font-weight="bold">shape OK →</text>
+  <text x="90" y="270" text-anchor="middle" fill="#c62828" font-size="9" font-weight="bold">нет compaction!</text>
+
+  <!-- Range 2 -->
+  <rect x="170" y="190" width="140" height="100" rx="4" fill="#fff3e0" stroke="#ff9800" stroke-width="1.5"/>
+  <text x="240" y="208" text-anchor="middle" fill="#e65100" font-size="10" font-weight="bold">[M..T)</text>
+  <rect x="180" y="215" width="120" height="20" rx="3" fill="url(#dead)" stroke="#ef5350"/>
+  <text x="240" y="229" text-anchor="middle" fill="#c62828" font-size="8">R2: 50% мёртвых</text>
+  <text x="240" y="255" text-anchor="middle" fill="#c62828" font-size="9" font-weight="bold">shape OK →</text>
+  <text x="240" y="270" text-anchor="middle" fill="#c62828" font-size="9" font-weight="bold">нет compaction!</text>
+
+  <!-- Range 3 -->
+  <rect x="320" y="190" width="140" height="100" rx="4" fill="#fff3e0" stroke="#ff9800" stroke-width="1.5"/>
+  <text x="390" y="208" text-anchor="middle" fill="#e65100" font-size="10" font-weight="bold">[T..W)</text>
+  <rect x="330" y="215" width="120" height="20" rx="3" fill="url(#dead)" stroke="#ef5350"/>
+  <text x="390" y="229" text-anchor="middle" fill="#c62828" font-size="8">R3: 50% мёртвых</text>
+  <text x="390" y="255" text-anchor="middle" fill="#c62828" font-size="9" font-weight="bold">shape OK →</text>
+  <text x="390" y="270" text-anchor="middle" fill="#c62828" font-size="9" font-weight="bold">нет compaction!</text>
+
+  <!-- Range 4: active -->
+  <rect x="470" y="190" width="140" height="100" rx="4" fill="#e8f5e9" stroke="#4caf50" stroke-width="1.5"/>
+  <text x="540" y="208" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="bold">[W..Z)</text>
+  <rect x="480" y="215" width="120" height="20" rx="3" fill="#c8e6c9" stroke="#4caf50"/>
+  <text x="540" y="229" text-anchor="middle" fill="#2e7d32" font-size="8">← пишем сюда</text>
+
+  <!-- Summary -->
+  <rect x="60" y="310" width="580" height="70" rx="6" fill="#fce4ec" stroke="#c62828" stroke-width="1.5" stroke-dasharray="4"/>
+  <text x="350" y="332" text-anchor="middle" fill="#c62828" font-size="11" font-weight="bold">Итог: space amplification > 2×</text>
+  <text x="350" y="350" text-anchor="middle" fill="#c62828" font-size="10">Каждый «холодный» диапазон хранит ~50% мёртвых данных.</text>
+  <text x="350" y="368" text-anchor="middle" fill="#c62828" font-size="10">Shape-based scheduler считает их «идеальными» — 1 файл, нечего сливать.</text>
+</svg>
