@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 340" font-family="Consolas, monospace" font-size="12">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 360" font-family="Consolas, monospace" font-size="12">
   <defs>
     <pattern id="hatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
       <line x1="0" y1="0" x2="0" y2="6" stroke="#ccc" stroke-width="0.8"/>
@@ -11,64 +11,64 @@
   <!-- Title -->
   <text x="300" y="20" text-anchor="middle" font-size="14" font-weight="bold" fill="#2B2D2C">Run-&#x0444;&#x0430;&#x0439;&#x043B;, slice &#x0438; &#x0434;&#x0438;&#x0430;&#x043F;&#x0430;&#x0437;&#x043E;&#x043D;&#x044B;</text>
 
-  <!-- Run file (full bar at top) -->
-  <rect x="40" y="40" width="520" height="32" rx="3" fill="#E8F0FE" stroke="#0C47B7" stroke-width="1.5"/>
-  <text x="300" y="61" text-anchor="middle" fill="#073DA4" font-weight="bold">run-&#x0444;&#x0430;&#x0439;&#x043B; R1 (&#x043E;&#x0442;&#x0441;&#x043E;&#x0440;&#x0442;&#x0438;&#x0440;&#x043E;&#x0432;&#x0430;&#x043D;&#x043D;&#x044B;&#x0435; &#x0434;&#x0430;&#x043D;&#x043D;&#x044B;&#x0435;, &#x043E;&#x0434;&#x0438;&#x043D; &#x0444;&#x0430;&#x0439;&#x043B; &#x043D;&#x0430; &#x0434;&#x0438;&#x0441;&#x043A;&#x0435;)</text>
+  <!-- Run file (full bar at top, taller to fit two rows) -->
+  <rect x="40" y="40" width="520" height="50" rx="3" fill="#E8F0FE" stroke="#0C47B7" stroke-width="1.5"/>
+  <text x="300" y="58" text-anchor="middle" fill="#073DA4" font-weight="bold" font-size="11">run-&#x0444;&#x0430;&#x0439;&#x043B; R1</text>
 
   <!-- Dividers in run file showing pages -->
-  <line x1="220" y1="40" x2="220" y2="72" stroke="#B3CBF7" stroke-width="1" stroke-dasharray="3"/>
-  <line x1="400" y1="40" x2="400" y2="72" stroke="#B3CBF7" stroke-width="1" stroke-dasharray="3"/>
-  <text x="130" y="56" text-anchor="middle" fill="#0C47B7" font-size="10">&#x0441;&#x0442;&#x0440;. 0&#x2013;15</text>
-  <text x="310" y="56" text-anchor="middle" fill="#0C47B7" font-size="10">&#x0441;&#x0442;&#x0440;. 16&#x2013;31</text>
-  <text x="460" y="56" text-anchor="middle" fill="#0C47B7" font-size="10">&#x0441;&#x0442;&#x0440;. 32&#x2013;47</text>
+  <line x1="220" y1="64" x2="220" y2="90" stroke="#B3CBF7" stroke-width="1" stroke-dasharray="3"/>
+  <line x1="400" y1="64" x2="400" y2="90" stroke="#B3CBF7" stroke-width="1" stroke-dasharray="3"/>
+  <text x="130" y="80" text-anchor="middle" fill="#0C47B7" font-size="10">&#x0441;&#x0442;&#x0440;. 0&#x2013;15</text>
+  <text x="310" y="80" text-anchor="middle" fill="#0C47B7" font-size="10">&#x0441;&#x0442;&#x0440;. 16&#x2013;31</text>
+  <text x="460" y="80" text-anchor="middle" fill="#0C47B7" font-size="10">&#x0441;&#x0442;&#x0440;. 32&#x2013;47</text>
 
   <!-- Arrows from slices to run portions -->
-  <line x1="130" y1="140" x2="130" y2="76" stroke="#00B36B" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <line x1="310" y1="140" x2="310" y2="76" stroke="#FF6900" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <line x1="460" y1="140" x2="460" y2="76" stroke="#9B51E0" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="130" y1="155" x2="130" y2="94" stroke="#00B36B" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="310" y1="155" x2="310" y2="94" stroke="#FF6900" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="460" y1="155" x2="460" y2="94" stroke="#9B51E0" stroke-width="1.2" marker-end="url(#arrow)"/>
 
   <!-- Slice labels -->
-  <text x="130" y="130" text-anchor="middle" fill="#008050" font-size="11" font-weight="bold">slice S1</text>
-  <text x="310" y="130" text-anchor="middle" fill="#CC5400" font-size="11" font-weight="bold">slice S2</text>
-  <text x="460" y="130" text-anchor="middle" fill="#7B3CB8" font-size="11" font-weight="bold">slice S3</text>
+  <text x="130" y="148" text-anchor="middle" fill="#008050" font-size="11" font-weight="bold">slice S1</text>
+  <text x="310" y="148" text-anchor="middle" fill="#CC5400" font-size="11" font-weight="bold">slice S2</text>
+  <text x="460" y="148" text-anchor="middle" fill="#7B3CB8" font-size="11" font-weight="bold">slice S3</text>
 
   <!-- Range 1 -->
-  <rect x="30" y="150" width="180" height="170" rx="5" fill="#E0F8ED" stroke="#00B36B" stroke-width="1.5"/>
-  <text x="120" y="172" text-anchor="middle" fill="#008050" font-weight="bold">&#x0414;&#x0438;&#x0430;&#x043F;&#x0430;&#x0437;&#x043E;&#x043D; 1</text>
-  <text x="120" y="188" text-anchor="middle" fill="#666" font-size="10">[A ... K)</text>
+  <rect x="30" y="168" width="180" height="170" rx="5" fill="#E0F8ED" stroke="#00B36B" stroke-width="1.5"/>
+  <text x="120" y="190" text-anchor="middle" fill="#008050" font-weight="bold">&#x0414;&#x0438;&#x0430;&#x043F;&#x0430;&#x0437;&#x043E;&#x043D; 1</text>
+  <text x="120" y="206" text-anchor="middle" fill="#666" font-size="10">[A ... K)</text>
 
   <!-- Slices in Range 1 -->
-  <rect x="45" y="200" width="150" height="22" rx="3" fill="#A3E8C8" stroke="#00B36B"/>
-  <text x="120" y="215" text-anchor="middle" fill="#008050" font-size="10">slice S1 (R1, &#x0441;&#x0442;&#x0440;.0&#x2013;15)</text>
-  <rect x="45" y="228" width="150" height="22" rx="3" fill="#C5F0DB" stroke="#00B36B"/>
-  <text x="120" y="243" text-anchor="middle" fill="#008050" font-size="10">slice S4 (R2)</text>
-  <rect x="45" y="256" width="150" height="22" rx="3" fill="#E0F8ED" stroke="#00B36B"/>
-  <text x="120" y="271" text-anchor="middle" fill="#008050" font-size="10">slice S7 (R3)</text>
-  <text x="120" y="300" text-anchor="middle" fill="#999" font-size="9">&#x0441;&#x0432;&#x0435;&#x0436;&#x0438;&#x0435; &#x2191;  &#x0441;&#x0442;&#x0430;&#x0440;&#x044B;&#x0435; &#x2193;</text>
+  <rect x="45" y="218" width="150" height="22" rx="3" fill="#A3E8C8" stroke="#00B36B"/>
+  <text x="120" y="233" text-anchor="middle" fill="#008050" font-size="10">slice S1 (R1, &#x0441;&#x0442;&#x0440;.0&#x2013;15)</text>
+  <rect x="45" y="246" width="150" height="22" rx="3" fill="#C5F0DB" stroke="#00B36B"/>
+  <text x="120" y="261" text-anchor="middle" fill="#008050" font-size="10">slice S4 (R2)</text>
+  <rect x="45" y="274" width="150" height="22" rx="3" fill="#E0F8ED" stroke="#00B36B"/>
+  <text x="120" y="289" text-anchor="middle" fill="#008050" font-size="10">slice S7 (R3)</text>
+  <text x="120" y="318" text-anchor="middle" fill="#999" font-size="9">&#x0441;&#x0432;&#x0435;&#x0436;&#x0438;&#x0435; &#x2191;  &#x0441;&#x0442;&#x0430;&#x0440;&#x044B;&#x0435; &#x2193;</text>
 
   <!-- Range 2 -->
-  <rect x="220" y="150" width="160" height="170" rx="5" fill="#FFF0E0" stroke="#FF6900" stroke-width="1.5"/>
-  <text x="300" y="172" text-anchor="middle" fill="#CC5400" font-weight="bold">&#x0414;&#x0438;&#x0430;&#x043F;&#x0430;&#x0437;&#x043E;&#x043D; 2</text>
-  <text x="300" y="188" text-anchor="middle" fill="#666" font-size="10">[K ... T)</text>
+  <rect x="220" y="168" width="160" height="170" rx="5" fill="#FFF0E0" stroke="#FF6900" stroke-width="1.5"/>
+  <text x="300" y="190" text-anchor="middle" fill="#CC5400" font-weight="bold">&#x0414;&#x0438;&#x0430;&#x043F;&#x0430;&#x0437;&#x043E;&#x043D; 2</text>
+  <text x="300" y="206" text-anchor="middle" fill="#666" font-size="10">[K ... T)</text>
 
   <!-- Slices in Range 2 -->
-  <rect x="235" y="200" width="130" height="22" rx="3" fill="#FFD4A8" stroke="#FF6900"/>
-  <text x="300" y="215" text-anchor="middle" fill="#CC5400" font-size="10">slice S2 (R1, 16&#x2013;31)</text>
-  <rect x="235" y="228" width="130" height="22" rx="3" fill="#FFE4C4" stroke="#FF6900"/>
-  <text x="300" y="243" text-anchor="middle" fill="#CC5400" font-size="10">slice S5 (R2)</text>
-  <rect x="235" y="256" width="130" height="22" rx="3" fill="#FFF0E0" stroke="#FF6900"/>
-  <text x="300" y="271" text-anchor="middle" fill="#CC5400" font-size="10">slice S8 (R3)</text>
+  <rect x="235" y="218" width="130" height="22" rx="3" fill="#FFD4A8" stroke="#FF6900"/>
+  <text x="300" y="233" text-anchor="middle" fill="#CC5400" font-size="10">slice S2 (R1, 16&#x2013;31)</text>
+  <rect x="235" y="246" width="130" height="22" rx="3" fill="#FFE4C4" stroke="#FF6900"/>
+  <text x="300" y="261" text-anchor="middle" fill="#CC5400" font-size="10">slice S5 (R2)</text>
+  <rect x="235" y="274" width="130" height="22" rx="3" fill="#FFF0E0" stroke="#FF6900"/>
+  <text x="300" y="289" text-anchor="middle" fill="#CC5400" font-size="10">slice S8 (R3)</text>
 
   <!-- Range 3 -->
-  <rect x="390" y="150" width="180" height="170" rx="5" fill="#F3E8FC" stroke="#9B51E0" stroke-width="1.5"/>
-  <text x="480" y="172" text-anchor="middle" fill="#7B3CB8" font-weight="bold">&#x0414;&#x0438;&#x0430;&#x043F;&#x0430;&#x0437;&#x043E;&#x043D; 3</text>
-  <text x="480" y="188" text-anchor="middle" fill="#666" font-size="10">[T ... Z]</text>
+  <rect x="390" y="168" width="180" height="170" rx="5" fill="#F3E8FC" stroke="#9B51E0" stroke-width="1.5"/>
+  <text x="480" y="190" text-anchor="middle" fill="#7B3CB8" font-weight="bold">&#x0414;&#x0438;&#x0430;&#x043F;&#x0430;&#x0437;&#x043E;&#x043D; 3</text>
+  <text x="480" y="206" text-anchor="middle" fill="#666" font-size="10">[T ... Z]</text>
 
   <!-- Slices in Range 3 -->
-  <rect x="405" y="200" width="150" height="22" rx="3" fill="#D4B3F0" stroke="#9B51E0"/>
-  <text x="480" y="215" text-anchor="middle" fill="#7B3CB8" font-size="10">slice S3 (R1, 32&#x2013;47)</text>
-  <rect x="405" y="228" width="150" height="22" rx="3" fill="#E3CFF5" stroke="#9B51E0"/>
-  <text x="480" y="243" text-anchor="middle" fill="#7B3CB8" font-size="10">slice S6 (R2)</text>
-  <rect x="405" y="256" width="150" height="22" rx="3" fill="#F3E8FC" stroke="#9B51E0"/>
-  <text x="480" y="271" text-anchor="middle" fill="#7B3CB8" font-size="10">slice S9 (R3)</text>
+  <rect x="405" y="218" width="150" height="22" rx="3" fill="#D4B3F0" stroke="#9B51E0"/>
+  <text x="480" y="233" text-anchor="middle" fill="#7B3CB8" font-size="10">slice S3 (R1, 32&#x2013;47)</text>
+  <rect x="405" y="246" width="150" height="22" rx="3" fill="#E3CFF5" stroke="#9B51E0"/>
+  <text x="480" y="261" text-anchor="middle" fill="#7B3CB8" font-size="10">slice S6 (R2)</text>
+  <rect x="405" y="274" width="150" height="22" rx="3" fill="#F3E8FC" stroke="#9B51E0"/>
+  <text x="480" y="289" text-anchor="middle" fill="#7B3CB8" font-size="10">slice S9 (R3)</text>
 </svg>

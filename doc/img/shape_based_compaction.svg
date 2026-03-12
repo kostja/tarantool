@@ -29,7 +29,7 @@
 
   <!-- Level 2 (bottom, single file) -->
   <rect x="150" y="140" width="260" height="28" rx="3" fill="#FFF0E0" stroke="#FF6900" stroke-width="1.5"/>
-  <text x="280" y="158" text-anchor="middle" fill="#CC5400" font-size="9">122 MB (&#x0435;&#x0434;&#x0438;&#x043D;&#x0441;&#x0442;&#x0432;&#x0435;&#x043D;&#x043D;&#x044B;&#x0439; &#x0444;&#x0430;&#x0439;&#x043B;)</text>
+  <text x="280" y="158" text-anchor="middle" fill="#CC5400" font-size="9">122 MB</text>
 
   <text x="145" y="158" text-anchor="end" fill="#666" font-size="10">&#x0423;&#x0440;&#x043E;&#x0432;&#x0435;&#x043D;&#x044C; 2</text>
   <text x="440" y="158" fill="#E23956" font-size="9">&#x2190; &#x0440;&#x043E;&#x0432;&#x043D;&#x043E; 1</text>

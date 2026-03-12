@@ -38,12 +38,12 @@
 
   <!-- New scheduler: bracket around overlapping cluster R3+R4+R5 -->
   <rect x="55" y="35" width="310" height="100" rx="6" fill="none" stroke="#00B36B" stroke-width="2" stroke-dasharray="6"/>
-  <text x="52" y="220" fill="#008050" font-size="11" font-weight="bold">&#x2714; merge (&#x043A;&#x043B;&#x0430;&#x0441;&#x0442;&#x0435;&#x0440; 3 &#x0444;&#x0430;&#x0439;&#x043B;&#x043E;&#x0432;)</text>
+  <text x="52" y="220" fill="#008050" font-size="11" font-weight="bold">&#x2714; merge</text>
 
   <!-- Skip annotation for R1+R2 -->
-  <text x="375" y="220" fill="#CC5400" font-size="11" font-weight="bold">&#x2718; skip (&#x043D;&#x0435; &#x043F;&#x0435;&#x0440;&#x0435;&#x0441;&#x0435;&#x043A;&#x0430;&#x044E;&#x0442;&#x0441;&#x044F;)</text>
+  <text x="375" y="220" fill="#CC5400" font-size="11" font-weight="bold">&#x2718; skip</text>
 
   <!-- Old scheduler annotation -->
   <line x1="55" y1="242" x2="565" y2="242" stroke="#E23956" stroke-width="1.5" stroke-dasharray="4"/>
-  <text x="310" y="255" text-anchor="middle" fill="#E23956" font-size="10">&#x0421;&#x0442;&#x0430;&#x0440;&#x044B;&#x0439; &#x043F;&#x043B;&#x0430;&#x043D;&#x0438;&#x0440;&#x043E;&#x0432;&#x0449;&#x0438;&#x043A;: merge &#x0432;&#x0441;&#x0435;&#x0445; 5 &#x2192; &#x043B;&#x0438;&#x0448;&#x043D;&#x044F;&#x044F; &#x0440;&#x0430;&#x0431;&#x043E;&#x0442;&#x0430;</text>
+  <text x="310" y="255" text-anchor="middle" fill="#E23956" font-size="10">&#x0421;&#x0442;&#x0430;&#x0440;&#x044B;&#x0439; &#x043F;&#x043B;&#x0430;&#x043D;&#x0438;&#x0440;&#x043E;&#x0432;&#x0449;&#x0438;&#x043A;: merge &#x0432;&#x0441;&#x0435;&#x0445; 5</text>
 </svg>
