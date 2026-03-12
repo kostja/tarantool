@@ -1,38 +1,38 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 400" font-family="Consolas, monospace" font-size="12">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 350" font-family="Consolas, monospace" font-size="12">
   <!-- Triangle -->
-  <polygon points="250,40 60,340 440,340" fill="none" stroke="#2B2D2C" stroke-width="2"/>
+  <polygon points="220,30 40,300 400,300" fill="none" stroke="#2B2D2C" stroke-width="2"/>
 
   <!-- Vertices -->
-  <circle cx="250" cy="40" r="6" fill="#0C47B7"/>
-  <text x="250" y="25" text-anchor="middle" font-weight="bold" fill="#073DA4" font-size="14">Read Amp</text>
+  <circle cx="220" cy="30" r="6" fill="#0C47B7"/>
+  <text x="220" y="18" text-anchor="middle" font-weight="bold" fill="#073DA4" font-size="13">Read Amp</text>
 
-  <circle cx="60" cy="340" r="6" fill="#FF6900"/>
-  <text x="60" y="365" text-anchor="middle" font-weight="bold" fill="#CC5400" font-size="14">Write Amp</text>
+  <circle cx="40" cy="300" r="6" fill="#FF6900"/>
+  <text x="40" y="322" text-anchor="middle" font-weight="bold" fill="#CC5400" font-size="13">Write Amp</text>
 
-  <circle cx="440" cy="340" r="6" fill="#00B36B"/>
-  <text x="440" y="365" text-anchor="middle" font-weight="bold" fill="#008050" font-size="14">Space Amp</text>
+  <circle cx="400" cy="300" r="6" fill="#00B36B"/>
+  <text x="400" y="322" text-anchor="middle" font-weight="bold" fill="#008050" font-size="13">Space Amp</text>
 
   <!-- Edge labels -->
-  <text x="135" y="175" text-anchor="middle" fill="#E23956" font-size="10" transform="rotate(-60,135,175)">&#x043C;&#x0435;&#x043D;&#x044C;&#x0448;&#x0435; &#x0441;&#x043B;&#x0438;&#x044F;&#x043D;&#x0438;&#x0439; &#x2192;</text>
-  <text x="135" y="195" text-anchor="middle" fill="#E23956" font-size="10" transform="rotate(-60,135,195)">&#x0434;&#x0435;&#x0448;&#x0435;&#x0432;&#x043B;&#x0435; &#x0437;&#x0430;&#x043F;&#x0438;&#x0441;&#x044C;,</text>
-  <text x="135" y="215" text-anchor="middle" fill="#E23956" font-size="10" transform="rotate(-60,135,215)">&#x0434;&#x043E;&#x0440;&#x043E;&#x0436;&#x0435; &#x0447;&#x0442;&#x0435;&#x043D;&#x0438;&#x0435;</text>
+  <text x="115" y="152" text-anchor="middle" fill="#E23956" font-size="10" transform="rotate(-56,115,152)">&#x043C;&#x0435;&#x043D;&#x044C;&#x0448;&#x0435; &#x0441;&#x043B;&#x0438;&#x044F;&#x043D;&#x0438;&#x0439; &#x2192;</text>
+  <text x="115" y="170" text-anchor="middle" fill="#E23956" font-size="10" transform="rotate(-56,115,170)">&#x0434;&#x0435;&#x0448;&#x0435;&#x0432;&#x043B;&#x0435; &#x0437;&#x0430;&#x043F;&#x0438;&#x0441;&#x044C;,</text>
+  <text x="115" y="188" text-anchor="middle" fill="#E23956" font-size="10" transform="rotate(-56,115,188)">&#x0434;&#x043E;&#x0440;&#x043E;&#x0436;&#x0435; &#x0447;&#x0442;&#x0435;&#x043D;&#x0438;&#x0435;</text>
 
-  <text x="365" y="175" text-anchor="middle" fill="#008050" font-size="10" transform="rotate(60,365,175)">&#x2190; &#x0431;&#x043E;&#x043B;&#x044C;&#x0448;&#x0435; &#x0441;&#x043B;&#x0438;&#x044F;&#x043D;&#x0438;&#x0439;</text>
-  <text x="365" y="195" text-anchor="middle" fill="#008050" font-size="10" transform="rotate(60,365,195)">&#x0434;&#x0435;&#x0448;&#x0435;&#x0432;&#x043B;&#x0435; &#x0447;&#x0442;&#x0435;&#x043D;&#x0438;&#x0435;,</text>
-  <text x="365" y="215" text-anchor="middle" fill="#008050" font-size="10" transform="rotate(60,365,215)">&#x0431;&#x043E;&#x043B;&#x044C;&#x0448;&#x0435; &#x043C;&#x0443;&#x0441;&#x043E;&#x0440;&#x0430;</text>
+  <text x="325" y="152" text-anchor="middle" fill="#008050" font-size="10" transform="rotate(56,325,152)">&#x2190; &#x0431;&#x043E;&#x043B;&#x044C;&#x0448;&#x0435; &#x0441;&#x043B;&#x0438;&#x044F;&#x043D;&#x0438;&#x0439;</text>
+  <text x="325" y="170" text-anchor="middle" fill="#008050" font-size="10" transform="rotate(56,325,170)">&#x0434;&#x0435;&#x0448;&#x0435;&#x0432;&#x043B;&#x0435; &#x0447;&#x0442;&#x0435;&#x043D;&#x0438;&#x0435;,</text>
+  <text x="325" y="188" text-anchor="middle" fill="#008050" font-size="10" transform="rotate(56,325,188)">&#x0431;&#x043E;&#x043B;&#x044C;&#x0448;&#x0435; &#x043C;&#x0443;&#x0441;&#x043E;&#x0440;&#x0430;</text>
 
-  <text x="250" y="330" text-anchor="middle" fill="#CC5400" font-size="10">&#x2190; &#x0447;&#x0430;&#x0449;&#x0435; GC = &#x043C;&#x0435;&#x043D;&#x044C;&#x0448;&#x0435; &#x043C;&#x0443;&#x0441;&#x043E;&#x0440;&#x0430;, &#x0434;&#x043E;&#x0440;&#x043E;&#x0436;&#x0435; &#x0437;&#x0430;&#x043F;&#x0438;&#x0441;&#x044C; &#x2192;</text>
+  <text x="220" y="292" text-anchor="middle" fill="#CC5400" font-size="10">&#x2190; &#x0447;&#x0430;&#x0449;&#x0435; GC = &#x043C;&#x0435;&#x043D;&#x044C;&#x0448;&#x0435; &#x043C;&#x0443;&#x0441;&#x043E;&#x0440;&#x0430;, &#x0434;&#x043E;&#x0440;&#x043E;&#x0436;&#x0435; &#x0437;&#x0430;&#x043F;&#x0438;&#x0441;&#x044C; &#x2192;</text>
 
   <!-- Strategy dots -->
-  <circle cx="200" cy="280" r="10" fill="#FF6900" opacity="0.8"/>
-  <text x="200" y="284" text-anchor="middle" fill="white" font-size="9" font-weight="bold">S</text>
-  <text x="175" y="305" text-anchor="end" fill="#CC5400" font-size="10">STCS</text>
+  <circle cx="155" cy="248" r="10" fill="#FF6900" opacity="0.8"/>
+  <text x="155" y="252" text-anchor="middle" fill="white" font-size="9" font-weight="bold">S</text>
+  <text x="140" y="270" text-anchor="end" fill="#CC5400" font-size="10">STCS</text>
 
-  <circle cx="310" cy="180" r="10" fill="#0C47B7" opacity="0.8"/>
-  <text x="310" y="184" text-anchor="middle" fill="white" font-size="9" font-weight="bold">L</text>
-  <text x="335" y="180" fill="#073DA4" font-size="10">LCS</text>
+  <circle cx="250" cy="150" r="10" fill="#0C47B7" opacity="0.8"/>
+  <text x="250" y="154" text-anchor="middle" fill="white" font-size="9" font-weight="bold">L</text>
+  <text x="237" y="143" text-anchor="end" fill="#073DA4" font-size="10">LCS</text>
 
-  <circle cx="260" cy="220" r="10" fill="#9B51E0" opacity="0.8"/>
-  <text x="260" y="224" text-anchor="middle" fill="white" font-size="9" font-weight="bold">V</text>
-  <text x="285" y="220" fill="#7B3CB8" font-size="10">Vinyl</text>
+  <circle cx="200" cy="195" r="10" fill="#9B51E0" opacity="0.8"/>
+  <text x="200" y="199" text-anchor="middle" fill="white" font-size="9" font-weight="bold">V</text>
+  <text x="187" y="188" text-anchor="end" fill="#7B3CB8" font-size="10">Vinyl</text>
 </svg>

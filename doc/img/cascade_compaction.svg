@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 310" font-family="Consolas, monospace" font-size="13">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 200" font-family="Consolas, monospace" font-size="13">
   <defs>
     <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
       <path d="M0,0 L8,3 L0,6" fill="#2B2D2C"/>
@@ -26,8 +26,4 @@
   <rect x="60" y="150" width="400" height="36" rx="4" fill="#FFF0E0" stroke="#FF6900" stroke-width="1.5"/>
   <text x="260" y="173" text-anchor="middle" font-weight="bold" fill="#CC5400">L2 (disk, ~100 MB)</text>
 
-  <!-- Summary -->
-  <rect x="40" y="220" width="440" height="70" rx="6" fill="#FCE4EA" stroke="#E23956" stroke-width="1.5" stroke-dasharray="4"/>
-  <text x="260" y="246" text-anchor="middle" fill="#E23956" font-size="12" font-weight="bold">1 INSERT &#x2192; &#x043A;&#x0430;&#x0441;&#x043A;&#x0430;&#x0434; &#x2192; &#x043F;&#x0435;&#x0440;&#x0435;&#x0437;&#x0430;&#x043F;&#x0438;&#x0441;&#x044C; &#x0434;&#x043E; 110 MB</text>
-  <text x="260" y="270" text-anchor="middle" fill="#E23956" font-size="11">(write amplification = T&#x207F;, T -- size ratio, n -- &#x0447;&#x0438;&#x0441;&#x043B;&#x043E; &#x0443;&#x0440;&#x043E;&#x0432;&#x043D;&#x0435;&#x0439;)</text>
 </svg>
