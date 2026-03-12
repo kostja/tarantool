@@ -16,7 +16,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100001,
       "version": 1,
@@ -24,11 +24,16 @@
       "isDeleted": false,
       "groupIds": [],
       "boundElements": [
-        { "type": "text", "id": "level0-text-left" }
+        {
+          "type": "text",
+          "id": "level0-text-left"
+        }
       ],
       "link": null,
       "locked": false,
-      "roundness": { "type": 3 }
+      "roundness": {
+        "type": 3
+      }
     },
     {
       "type": "text",
@@ -43,7 +48,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100002,
       "version": 1,
@@ -77,7 +82,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100003,
       "version": 1,
@@ -85,11 +90,16 @@
       "isDeleted": false,
       "groupIds": [],
       "boundElements": [
-        { "type": "text", "id": "level0-text-right" }
+        {
+          "type": "text",
+          "id": "level0-text-right"
+        }
       ],
       "link": null,
       "locked": false,
-      "roundness": { "type": 3 }
+      "roundness": {
+        "type": 3
+      }
     },
     {
       "type": "text",
@@ -104,7 +114,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100004,
       "version": 1,
@@ -138,7 +148,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100005,
       "version": 1,
@@ -146,11 +156,16 @@
       "isDeleted": false,
       "groupIds": [],
       "boundElements": [
-        { "type": "text", "id": "level1-text-left" }
+        {
+          "type": "text",
+          "id": "level1-text-left"
+        }
       ],
       "link": null,
       "locked": false,
-      "roundness": { "type": 3 }
+      "roundness": {
+        "type": 3
+      }
     },
     {
       "type": "text",
@@ -165,7 +180,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100006,
       "version": 1,
@@ -199,7 +214,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100007,
       "version": 1,
@@ -207,11 +222,16 @@
       "isDeleted": false,
       "groupIds": [],
       "boundElements": [
-        { "type": "text", "id": "level1-text-right" }
+        {
+          "type": "text",
+          "id": "level1-text-right"
+        }
       ],
       "link": null,
       "locked": false,
-      "roundness": { "type": 3 }
+      "roundness": {
+        "type": 3
+      }
     },
     {
       "type": "text",
@@ -226,7 +246,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100008,
       "version": 1,
@@ -260,7 +280,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100009,
       "version": 1,
@@ -268,11 +288,16 @@
       "isDeleted": false,
       "groupIds": [],
       "boundElements": [
-        { "type": "text", "id": "level2-text" }
+        {
+          "type": "text",
+          "id": "level2-text"
+        }
       ],
       "link": null,
       "locked": false,
-      "roundness": { "type": 3 }
+      "roundness": {
+        "type": 3
+      }
     },
     {
       "type": "text",
@@ -287,7 +312,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100010,
       "version": 1,
@@ -321,7 +346,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100011,
       "version": 1,
@@ -347,7 +372,7 @@
       "id": "label-level1",
       "x": 30,
       "y": 94,
-      "width": 160,
+      "width": 150,
       "height": 20,
       "angle": 0,
       "strokeColor": "#868e96",
@@ -355,7 +380,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100012,
       "version": 1,
@@ -381,7 +406,7 @@
       "id": "label-level2",
       "x": 30,
       "y": 144,
-      "width": 160,
+      "width": 110,
       "height": 20,
       "angle": 0,
       "strokeColor": "#868e96",
@@ -389,7 +414,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100013,
       "version": 1,
@@ -423,7 +448,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100014,
       "version": 1,
@@ -457,7 +482,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100015,
       "version": 1,
@@ -468,13 +493,13 @@
       "link": null,
       "locked": false,
       "roundness": null,
-      "text": "\u00d7 run_size_ratio (3.5)",
+      "text": "× run_size_ratio (3.5)",
       "fontSize": 14,
       "fontFamily": 3,
       "textAlign": "left",
       "verticalAlign": "top",
       "containerId": null,
-      "originalText": "\u00d7 run_size_ratio (3.5)",
+      "originalText": "× run_size_ratio (3.5)",
       "autoResize": true,
       "lineHeight": 1.25
     },
@@ -491,7 +516,7 @@
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100016,
       "version": 1,
@@ -502,13 +527,13 @@
       "link": null,
       "locked": false,
       "roundness": null,
-      "text": "\u2190 \u0440\u043e\u0432\u043d\u043e 1",
+      "text": "← ровно 1",
       "fontSize": 14,
       "fontFamily": 3,
       "textAlign": "left",
       "verticalAlign": "top",
       "containerId": null,
-      "originalText": "\u2190 \u0440\u043e\u0432\u043d\u043e 1",
+      "originalText": "← ровно 1",
       "autoResize": true,
       "lineHeight": 1.25
     },
@@ -517,15 +542,15 @@
       "id": "trigger-box",
       "x": 35,
       "y": 195,
-      "width": 240,
-      "height": 70,
+      "width": 300,
+      "height": 85,
       "angle": 0,
       "strokeColor": "#e03131",
       "backgroundColor": "#ffc9c9",
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100017,
       "version": 1,
@@ -533,26 +558,31 @@
       "isDeleted": false,
       "groupIds": [],
       "boundElements": [
-        { "type": "text", "id": "trigger-text" }
+        {
+          "type": "text",
+          "id": "trigger-text"
+        }
       ],
       "link": null,
       "locked": false,
-      "roundness": { "type": 3 }
+      "roundness": {
+        "type": 3
+      }
     },
     {
       "type": "text",
       "id": "trigger-text",
       "x": 40,
       "y": 200,
-      "width": 230,
-      "height": 60,
+      "width": 290,
+      "height": 75,
       "angle": 0,
       "strokeColor": "#e03131",
       "backgroundColor": "transparent",
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100018,
       "version": 1,
@@ -563,30 +593,30 @@
       "link": null,
       "locked": false,
       "roundness": null,
-      "text": "\u0422\u0440\u0438\u0433\u0433\u0435\u0440 compaction:\n\u0415\u0441\u043b\u0438 \u043d\u0430 \u0443\u0440\u043e\u0432\u043d\u0435 \u043f\u043e\u044f\u0432\u0438\u0442\u0441\u044f 3-\u0439 \u0444\u0430\u0439\u043b\n\u2192 \u0441\u043b\u0438\u044f\u043d\u0438\u0435 \u0441 \u043d\u0438\u0436\u043d\u0438\u043c \u0443\u0440\u043e\u0432\u043d\u0435\u043c",
+      "text": "Триггер compaction:\nЕсли на уровне появится 3-й файл\n→ слияние с нижним уровнем",
       "fontSize": 14,
       "fontFamily": 3,
       "textAlign": "center",
       "verticalAlign": "middle",
       "containerId": "trigger-box",
-      "originalText": "\u0422\u0440\u0438\u0433\u0433\u0435\u0440 compaction:\n\u0415\u0441\u043b\u0438 \u043d\u0430 \u0443\u0440\u043e\u0432\u043d\u0435 \u043f\u043e\u044f\u0432\u0438\u0442\u0441\u044f 3-\u0439 \u0444\u0430\u0439\u043b\n\u2192 \u0441\u043b\u0438\u044f\u043d\u0438\u0435 \u0441 \u043d\u0438\u0436\u043d\u0438\u043c \u0443\u0440\u043e\u0432\u043d\u0435\u043c",
+      "originalText": "Триггер compaction:\nЕсли на уровне появится 3-й файл\n→ слияние с нижним уровнем",
       "autoResize": true,
       "lineHeight": 1.25
     },
     {
       "type": "rectangle",
       "id": "calc-box",
-      "x": 295,
+      "x": 345,
       "y": 195,
-      "width": 240,
-      "height": 70,
+      "width": 340,
+      "height": 85,
       "angle": 0,
       "strokeColor": "#1971c2",
       "backgroundColor": "#dbe4ff",
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100019,
       "version": 1,
@@ -594,26 +624,31 @@
       "isDeleted": false,
       "groupIds": [],
       "boundElements": [
-        { "type": "text", "id": "calc-text" }
+        {
+          "type": "text",
+          "id": "calc-text"
+        }
       ],
       "link": null,
       "locked": false,
-      "roundness": { "type": 3 }
+      "roundness": {
+        "type": 3
+      }
     },
     {
       "type": "text",
       "id": "calc-text",
-      "x": 300,
+      "x": 350,
       "y": 200,
-      "width": 230,
-      "height": 60,
+      "width": 330,
+      "height": 75,
       "angle": 0,
       "strokeColor": "#1971c2",
       "backgroundColor": "transparent",
       "fillStyle": "solid",
       "strokeWidth": 1,
       "strokeStyle": "solid",
-      "roughness": 1,
+      "roughness": 2,
       "opacity": 100,
       "seed": 100020,
       "version": 1,
@@ -624,13 +659,13 @@
       "link": null,
       "locked": false,
       "roundness": null,
-      "text": "\u0420\u0430\u0441\u0447\u0451\u0442 \u0441\u043d\u0438\u0437\u0443 \u0432\u0432\u0435\u0440\u0445:\nbottom = 122 MB (\u0444\u0430\u043a\u0442)\nlevel 1 = ceil(122/3.5) = 35 MB",
+      "text": "Расчёт снизу вверх:\nbottom = 122 MB (факт)\nlevel 1 = ceil(122/3.5) = 35 MB",
       "fontSize": 14,
       "fontFamily": 3,
       "textAlign": "center",
       "verticalAlign": "middle",
       "containerId": "calc-box",
-      "originalText": "\u0420\u0430\u0441\u0447\u0451\u0442 \u0441\u043d\u0438\u0437\u0443 \u0432\u0432\u0435\u0440\u0445:\nbottom = 122 MB (\u0444\u0430\u043a\u0442)\nlevel 1 = ceil(122/3.5) = 35 MB",
+      "originalText": "Расчёт снизу вверх:\nbottom = 122 MB (факт)\nlevel 1 = ceil(122/3.5) = 35 MB",
       "autoResize": true,
       "lineHeight": 1.25
     }
