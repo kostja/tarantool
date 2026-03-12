@@ -1,36 +1,36 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 320" font-family="Consolas, monospace" font-size="11">
   <defs>
     <marker id="arr" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
-      <path d="M0,0 L7,2.5 L0,5" fill="#555"/>
+      <path d="M0,0 L7,2.5 L0,5" fill="#2B2D2C"/>
     </marker>
   </defs>
 
-  <text x="280" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">Приоритеты нового планировщика</text>
+  <text x="280" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#2B2D2C">&#x041F;&#x0440;&#x0438;&#x043E;&#x0440;&#x0438;&#x0442;&#x0435;&#x0442;&#x044B; &#x043D;&#x043E;&#x0432;&#x043E;&#x0433;&#x043E; &#x043F;&#x043B;&#x0430;&#x043D;&#x0438;&#x0440;&#x043E;&#x0432;&#x0449;&#x0438;&#x043A;&#x0430;</text>
 
   <!-- Priority 1 -->
-  <rect x="30" y="50" width="500" height="70" rx="6" fill="#e3f2fd" stroke="#1976d2" stroke-width="2"/>
-  <text x="50" y="72" fill="#1565c0" font-size="28" font-weight="bold">1</text>
-  <text x="85" y="72" fill="#1565c0" font-size="12" font-weight="bold">Shape-based compaction</text>
-  <text x="85" y="90" fill="#1565c0" font-size="10">Выбираем наибольший кластер пересекающихся run-файлов.</text>
-  <text x="85" y="106" fill="#1565c0" font-size="10">Непересекающиеся файлы НЕ сливаем — ключевое отличие от старого алгоритма.</text>
+  <rect x="30" y="50" width="500" height="70" rx="6" fill="#E8F0FE" stroke="#0C47B7" stroke-width="2"/>
+  <text x="50" y="72" fill="#0C47B7" font-size="28" font-weight="bold">1</text>
+  <text x="85" y="72" fill="#073DA4" font-size="12" font-weight="bold">Shape-based compaction</text>
+  <text x="85" y="90" fill="#073DA4" font-size="10">&#x0412;&#x044B;&#x0431;&#x0438;&#x0440;&#x0430;&#x0435;&#x043C; &#x043D;&#x0430;&#x0438;&#x0431;&#x043E;&#x043B;&#x044C;&#x0448;&#x0438;&#x0439; &#x043A;&#x043B;&#x0430;&#x0441;&#x0442;&#x0435;&#x0440; &#x043F;&#x0435;&#x0440;&#x0435;&#x0441;&#x0435;&#x043A;&#x0430;&#x044E;&#x0449;&#x0438;&#x0445;&#x0441;&#x044F; run-&#x0444;&#x0430;&#x0439;&#x043B;&#x043E;&#x0432;.</text>
+  <text x="85" y="106" fill="#073DA4" font-size="10">&#x041D;&#x0435;&#x043F;&#x0435;&#x0440;&#x0435;&#x0441;&#x0435;&#x043A;&#x0430;&#x044E;&#x0449;&#x0438;&#x0435;&#x0441;&#x044F; &#x0444;&#x0430;&#x0439;&#x043B;&#x044B; &#x041D;&#x0415; &#x0441;&#x043B;&#x0438;&#x0432;&#x0430;&#x0435;&#x043C; -- &#x043A;&#x043B;&#x044E;&#x0447;&#x0435;&#x0432;&#x043E;&#x0435; &#x043E;&#x0442;&#x043B;&#x0438;&#x0447;&#x0438;&#x0435; &#x043E;&#x0442; &#x0441;&#x0442;&#x0430;&#x0440;&#x043E;&#x0433;&#x043E; &#x0430;&#x043B;&#x0433;&#x043E;&#x0440;&#x0438;&#x0442;&#x043C;&#x0430;.</text>
 
   <!-- Arrow -->
-  <text x="280" y="135" text-anchor="middle" fill="#888" font-size="10">нет работы? ↓</text>
+  <text x="280" y="135" text-anchor="middle" fill="#999" font-size="10">&#x043D;&#x0435;&#x0442; &#x0440;&#x0430;&#x0431;&#x043E;&#x0442;&#x044B;? &#x2193;</text>
 
   <!-- Priority 2 -->
-  <rect x="30" y="145" width="500" height="70" rx="6" fill="#fff3e0" stroke="#e65100" stroke-width="2"/>
-  <text x="50" y="167" fill="#e65100" font-size="28" font-weight="bold">2</text>
-  <text x="85" y="167" fill="#e65100" font-size="12" font-weight="bold">Read amplification driver</text>
-  <text x="85" y="185" fill="#e65100" font-size="10">Если при чтении фильтруется слишком много мусора (tombstones,</text>
-  <text x="85" y="201" fill="#e65100" font-size="10">устаревшие версии) — запускаем compaction для этого диапазона.</text>
+  <rect x="30" y="145" width="500" height="70" rx="6" fill="#FFF0E0" stroke="#FF6900" stroke-width="2"/>
+  <text x="50" y="167" fill="#FF6900" font-size="28" font-weight="bold">2</text>
+  <text x="85" y="167" fill="#CC5400" font-size="12" font-weight="bold">Read amplification driver</text>
+  <text x="85" y="185" fill="#CC5400" font-size="10">&#x0415;&#x0441;&#x043B;&#x0438; &#x043F;&#x0440;&#x0438; &#x0447;&#x0442;&#x0435;&#x043D;&#x0438;&#x0438; &#x0444;&#x0438;&#x043B;&#x044C;&#x0442;&#x0440;&#x0443;&#x0435;&#x0442;&#x0441;&#x044F; &#x0441;&#x043B;&#x0438;&#x0448;&#x043A;&#x043E;&#x043C; &#x043C;&#x043D;&#x043E;&#x0433;&#x043E; &#x043C;&#x0443;&#x0441;&#x043E;&#x0440;&#x0430; (tombstones,</text>
+  <text x="85" y="201" fill="#CC5400" font-size="10">&#x0443;&#x0441;&#x0442;&#x0430;&#x0440;&#x0435;&#x0432;&#x0448;&#x0438;&#x0435; &#x0432;&#x0435;&#x0440;&#x0441;&#x0438;&#x0438;) -- &#x0437;&#x0430;&#x043F;&#x0443;&#x0441;&#x043A;&#x0430;&#x0435;&#x043C; compaction &#x0434;&#x043B;&#x044F; &#x044D;&#x0442;&#x043E;&#x0433;&#x043E; &#x0434;&#x0438;&#x0430;&#x043F;&#x0430;&#x0437;&#x043E;&#x043D;&#x0430;.</text>
 
   <!-- Arrow -->
-  <text x="280" y="230" text-anchor="middle" fill="#888" font-size="10">нет работы? ↓</text>
+  <text x="280" y="230" text-anchor="middle" fill="#999" font-size="10">&#x043D;&#x0435;&#x0442; &#x0440;&#x0430;&#x0431;&#x043E;&#x0442;&#x044B;? &#x2193;</text>
 
   <!-- Priority 3 -->
-  <rect x="30" y="240" width="500" height="70" rx="6" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
-  <text x="50" y="262" fill="#2e7d32" font-size="28" font-weight="bold">3</text>
-  <text x="85" y="262" fill="#2e7d32" font-size="12" font-weight="bold">Space amplification driver</text>
-  <text x="85" y="280" fill="#2e7d32" font-size="10">Если > 10% run-файла — неиспользуемый мусор (от split),</text>
-  <text x="85" y="296" fill="#2e7d32" font-size="10">переписываем файл, освобождая место на диске и в RAM.</text>
+  <rect x="30" y="240" width="500" height="70" rx="6" fill="#E0F8ED" stroke="#00B36B" stroke-width="2"/>
+  <text x="50" y="262" fill="#00B36B" font-size="28" font-weight="bold">3</text>
+  <text x="85" y="262" fill="#008050" font-size="12" font-weight="bold">Space amplification driver</text>
+  <text x="85" y="280" fill="#008050" font-size="10">&#x0415;&#x0441;&#x043B;&#x0438; > 10% run-&#x0444;&#x0430;&#x0439;&#x043B;&#x0430; -- &#x043D;&#x0435;&#x0438;&#x0441;&#x043F;&#x043E;&#x043B;&#x044C;&#x0437;&#x0443;&#x0435;&#x043C;&#x044B;&#x0439; &#x043C;&#x0443;&#x0441;&#x043E;&#x0440; (&#x043E;&#x0442; split),</text>
+  <text x="85" y="296" fill="#008050" font-size="10">&#x043F;&#x0435;&#x0440;&#x0435;&#x043F;&#x0438;&#x0441;&#x044B;&#x0432;&#x0430;&#x0435;&#x043C; &#x0444;&#x0430;&#x0439;&#x043B;, &#x043E;&#x0441;&#x0432;&#x043E;&#x0431;&#x043E;&#x0436;&#x0434;&#x0430;&#x044F; &#x043C;&#x0435;&#x0441;&#x0442;&#x043E; &#x043D;&#x0430; &#x0434;&#x0438;&#x0441;&#x043A;&#x0435; &#x0438; &#x0432; RAM.</text>
 </svg>
