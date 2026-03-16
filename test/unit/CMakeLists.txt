@@ -608,6 +608,11 @@ create_unit_test(PREFIX key_def
                  LIBRARIES unit box core
 )
 
+create_unit_test(PREFIX tuple_compare_bench
+                 SOURCES tuple_compare_bench.c box_test_utils.c
+                 LIBRARIES unit box core
+)
+
 create_unit_test(PREFIX tuple_builder
                  SOURCES tuple_builder.c box_test_utils.c
                  LIBRARIES unit box core

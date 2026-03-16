@@ -51,6 +51,68 @@
 inline __attribute__((always_inline)) int
 mp_compare_uint(const char **data_a, const char **data_b);
 
+/**
+ * Compare two packed unsigned integers and advance both pointers
+ * past the values.  This is a fused version of mp_compare_uint() +
+ * mp_next() + mp_next() that avoids re-reading the type byte.
+ */
+inline __attribute__((always_inline)) static int
+mp_compare_uint_and_next(const char **data_a, const char **data_b)
+{
+	uint8_t ca = mp_load_u8(data_a);
+	uint8_t cb = mp_load_u8(data_b);
+
+	int r = ca - cb;
+	if (r != 0) {
+		/*
+		 * Different type bytes means different encoding
+		 * widths.  The wider encoding always means a larger
+		 * value, and ca - cb gives the right sign.  Advance
+		 * each pointer according to its own encoding width.
+		 */
+		static const int8_t uint_sizes[] = {
+			/* 0xcc (uint8)  */ 1,
+			/* 0xcd (uint16) */ 2,
+			/* 0xce (uint32) */ 4,
+			/* 0xcf (uint64) */ 8,
+		};
+		if (ca > 0x7f)
+			*data_a += uint_sizes[ca & 0x3];
+		if (cb > 0x7f)
+			*data_b += uint_sizes[cb & 0x3];
+		return r;
+	}
+
+	/* Same type byte. */
+	if (ca <= 0x7f)
+		return 0;  /* fixint: value is the type byte itself */
+
+	uint64_t a, b;
+	switch (ca & 0x3) {
+	case 0xcc & 0x3:
+		a = mp_load_u8(data_a);
+		b = mp_load_u8(data_b);
+		break;
+	case 0xcd & 0x3:
+		a = mp_load_u16(data_a);
+		b = mp_load_u16(data_b);
+		break;
+	case 0xce & 0x3:
+		a = mp_load_u32(data_a);
+		b = mp_load_u32(data_b);
+		break;
+	case 0xcf & 0x3:
+		a = mp_load_u64(data_a);
+		b = mp_load_u64(data_b);
+		return a < b ? -1 : a > b;
+	default:
+		mp_unreachable();
+	}
+
+	int64_t v = (a - b);
+	return (v > 0) - (v < 0);
+}
+
 enum mp_class {
 	MP_CLASS_NIL = 0,
 	MP_CLASS_BOOL,
@@ -142,6 +204,91 @@ mp_compare_integer_with_type(const char *field_a, enum mp_type a_type,
 			return COMPARE_RESULT(a_val, b_val);
 		}
 	}
+}
+
+/**
+ * Compare two packed integers (FIELD_TYPE_INTEGER: may be mp_uint
+ * or mp_int) and advance both pointers past the values.
+ */
+inline __attribute__((always_inline)) static int
+mp_compare_integer_and_next(const char **data_a, const char **data_b)
+{
+	uint8_t ca = mp_load_u8(data_a);
+	uint8_t cb = mp_load_u8(data_b);
+	/*
+	 * Fast path: both values are positive fixints.
+	 * This is the most common case for small non-negative integers.
+	 */
+	if (ca <= 0x7f && cb <= 0x7f)
+		return (int)ca - (int)cb;
+	/*
+	 * Both are unsigned encodings (fixint or uint8/16/32/64).
+	 * Reuse the uint comparison logic, but we've already consumed
+	 * the type bytes, so inline the payload comparison.
+	 */
+	if (ca <= 0xcf && cb <= 0xcf) {
+		int r = ca - cb;
+		if (r != 0) {
+			static const int8_t uint_sizes[] = {1, 2, 4, 8};
+			if (ca > 0x7f)
+				*data_a += uint_sizes[ca & 0x3];
+			if (cb > 0x7f)
+				*data_b += uint_sizes[cb & 0x3];
+			return r;
+		}
+		/* Same type byte, both > 0x7f. */
+		uint64_t a, b;
+		switch (ca & 0x3) {
+		case 0xcc & 0x3:
+			a = mp_load_u8(data_a);
+			b = mp_load_u8(data_b);
+			break;
+		case 0xcd & 0x3:
+			a = mp_load_u16(data_a);
+			b = mp_load_u16(data_b);
+			break;
+		case 0xce & 0x3:
+			a = mp_load_u32(data_a);
+			b = mp_load_u32(data_b);
+			break;
+		case 0xcf & 0x3:
+			a = mp_load_u64(data_a);
+			b = mp_load_u64(data_b);
+			return a < b ? -1 : a > b;
+		default:
+			mp_unreachable();
+		}
+		int64_t v = (a - b);
+		return (v > 0) - (v < 0);
+	}
+	/*
+	 * At least one value is negative (0xd0-0xd3 or 0xe0-0xff).
+	 * Any unsigned value > any negative value.
+	 */
+	if (ca <= 0xcf) {
+		/* a is unsigned, b is negative → a > b. */
+		mp_next(data_a);
+		mp_next(data_b);
+		return 1;
+	}
+	if (cb <= 0xcf) {
+		/* a is negative, b is unsigned → a < b. */
+		mp_next(data_a);
+		mp_next(data_b);
+		return -1;
+	}
+	/*
+	 * Both are negative. Decode and compare.
+	 * We've already consumed the type bytes, so we need to
+	 * back up and use the standard decoder.
+	 */
+	(*data_a)--;
+	(*data_b)--;
+	int r = mp_compare_integer_with_type(*data_a, mp_typeof(**data_a),
+					     *data_b, mp_typeof(**data_b));
+	mp_next(data_a);
+	mp_next(data_b);
+	return r;
 }
 
 static int
@@ -1043,6 +1190,22 @@ field_compare<FIELD_TYPE_UNSIGNED>(const char **field_a, const char **field_b)
 
 template <>
 inline int
+field_compare<FIELD_TYPE_INTEGER>(const char **field_a, const char **field_b)
+{
+	uint8_t ca = (uint8_t)**field_a;
+	uint8_t cb = (uint8_t)**field_b;
+	/* Fast path: both positive fixints (0-127). */
+	if (ca <= 0x7f && cb <= 0x7f)
+		return (int)ca - (int)cb;
+	/* Both unsigned: use the existing uint comparator. */
+	if (ca <= 0xcf && cb <= 0xcf)
+		return mp_compare_uint(*field_a, *field_b);
+	return mp_compare_integer_with_type(*field_a, mp_typeof(**field_a),
+					    *field_b, mp_typeof(**field_b));
+}
+
+template <>
+inline int
 field_compare<FIELD_TYPE_STRING>(const char **field_a, const char **field_b)
 {
 	uint32_t size_a, size_b;
@@ -1059,18 +1222,23 @@ static inline int
 field_compare_and_next(const char **field_a, const char **field_b);
 
 template <>
-inline int
+inline __attribute__((always_inline)) int
 field_compare_and_next<FIELD_TYPE_UNSIGNED>(const char **field_a,
 					    const char **field_b)
 {
-	int r = mp_compare_uint(*field_a, *field_b);
-	mp_next(field_a);
-	mp_next(field_b);
-	return r;
+	return mp_compare_uint_and_next(field_a, field_b);
 }
 
 template <>
-inline int
+inline __attribute__((always_inline)) int
+field_compare_and_next<FIELD_TYPE_INTEGER>(const char **field_a,
+					   const char **field_b)
+{
+	return mp_compare_integer_and_next(field_a, field_b);
+}
+
+template <>
+inline __attribute__((always_inline)) int
 field_compare_and_next<FIELD_TYPE_STRING>(const char **field_a,
 					  const char **field_b)
 {
@@ -1096,12 +1264,11 @@ template <int IDX, int TYPE, int ...MORE_TYPES> struct FieldCompare { };
 template <int IDX, int TYPE, int IDX2, int TYPE2, int ...MORE_TYPES>
 struct FieldCompare<IDX, TYPE, IDX2, TYPE2, MORE_TYPES...>
 {
-	inline static int compare(struct tuple *tuple_a,
-				  struct tuple *tuple_b,
-				  struct tuple_format *format_a,
-				  struct tuple_format *format_b,
-				  const char *field_a,
-				  const char *field_b)
+	inline __attribute__((always_inline)) static int
+	compare(struct tuple *tuple_a, struct tuple *tuple_b,
+		struct tuple_format *format_a,
+		struct tuple_format *format_b,
+		const char *field_a, const char *field_b)
 	{
 		int r;
 		/* static if */
@@ -1128,14 +1295,13 @@ struct FieldCompare<IDX, TYPE, IDX2, TYPE2, MORE_TYPES...>
 template <int IDX, int TYPE>
 struct FieldCompare<IDX, TYPE>
 {
-	inline static int compare(struct tuple *,
-				  struct tuple *,
-				  struct tuple_format *,
-				  struct tuple_format *,
-				  const char *field_a,
-				  const char *field_b)
+	inline __attribute__((always_inline)) static int
+	compare(struct tuple *, struct tuple *,
+		struct tuple_format *, struct tuple_format *,
+		const char *field_a, const char *field_b)
 	{
-		return field_compare<TYPE>(&field_a, &field_b);
+		/* _and_next: pointer advance is harmless for the last part */
+		return field_compare_and_next<TYPE>(&field_a, &field_b);
 	}
 };
 
@@ -1199,10 +1365,14 @@ struct comparator_signature {
 static const comparator_signature cmp_arr[] = {
 	COMPARATOR(0, FIELD_TYPE_UNSIGNED)
 	COMPARATOR(0, FIELD_TYPE_STRING)
+	COMPARATOR(0, FIELD_TYPE_INTEGER)
 	COMPARATOR(0, FIELD_TYPE_UNSIGNED, 1, FIELD_TYPE_UNSIGNED)
 	COMPARATOR(0, FIELD_TYPE_STRING  , 1, FIELD_TYPE_UNSIGNED)
 	COMPARATOR(0, FIELD_TYPE_UNSIGNED, 1, FIELD_TYPE_STRING)
 	COMPARATOR(0, FIELD_TYPE_STRING  , 1, FIELD_TYPE_STRING)
+	COMPARATOR(0, FIELD_TYPE_INTEGER , 1, FIELD_TYPE_INTEGER)
+	COMPARATOR(0, FIELD_TYPE_INTEGER , 1, FIELD_TYPE_UNSIGNED)
+	COMPARATOR(0, FIELD_TYPE_UNSIGNED, 1, FIELD_TYPE_INTEGER)
 	COMPARATOR(0, FIELD_TYPE_UNSIGNED, 1, FIELD_TYPE_UNSIGNED, 2, FIELD_TYPE_UNSIGNED)
 	COMPARATOR(0, FIELD_TYPE_STRING  , 1, FIELD_TYPE_UNSIGNED, 2, FIELD_TYPE_UNSIGNED)
 	COMPARATOR(0, FIELD_TYPE_UNSIGNED, 1, FIELD_TYPE_STRING  , 2, FIELD_TYPE_UNSIGNED)
@@ -1231,6 +1401,20 @@ field_compare_with_key<FIELD_TYPE_UNSIGNED>(const char **field, const char **key
 
 template <>
 inline int
+field_compare_with_key<FIELD_TYPE_INTEGER>(const char **field, const char **key)
+{
+	uint8_t ca = (uint8_t)**field;
+	uint8_t cb = (uint8_t)**key;
+	if (ca <= 0x7f && cb <= 0x7f)
+		return (int)ca - (int)cb;
+	if (ca <= 0xcf && cb <= 0xcf)
+		return mp_compare_uint(*field, *key);
+	return mp_compare_integer_with_type(*field, mp_typeof(**field),
+					    *key, mp_typeof(**key));
+}
+
+template <>
+inline int
 field_compare_with_key<FIELD_TYPE_STRING>(const char **field, const char **key)
 {
 	uint32_t size_a, size_b;
@@ -1247,18 +1431,23 @@ static inline int
 field_compare_with_key_and_next(const char **field_a, const char **field_b);
 
 template <>
-inline int
+inline __attribute__((always_inline)) int
 field_compare_with_key_and_next<FIELD_TYPE_UNSIGNED>(const char **field_a,
 						     const char **field_b)
 {
-	int r = mp_compare_uint(*field_a, *field_b);
-	mp_next(field_a);
-	mp_next(field_b);
-	return r;
+	return mp_compare_uint_and_next(field_a, field_b);
 }
 
 template <>
-inline int
+inline __attribute__((always_inline)) int
+field_compare_with_key_and_next<FIELD_TYPE_INTEGER>(const char **field_a,
+						    const char **field_b)
+{
+	return mp_compare_integer_and_next(field_a, field_b);
+}
+
+template <>
+inline __attribute__((always_inline)) int
 field_compare_with_key_and_next<FIELD_TYPE_STRING>(const char **field_a,
 					const char **field_b)
 {
@@ -1284,7 +1473,7 @@ struct FieldCompareWithKey {};
 template <int FLD_ID, int IDX, int TYPE, int IDX2, int TYPE2, int ...MORE_TYPES>
 struct FieldCompareWithKey<FLD_ID, IDX, TYPE, IDX2, TYPE2, MORE_TYPES...>
 {
-	inline static int
+	inline __attribute__((always_inline)) static int
 	compare(struct tuple *tuple, const char *key, uint32_t part_count,
 		struct key_def *key_def, struct tuple_format *format,
 		const char *field)
@@ -1311,12 +1500,10 @@ struct FieldCompareWithKey<FLD_ID, IDX, TYPE, IDX2, TYPE2, MORE_TYPES...>
 
 template <int FLD_ID, int IDX, int TYPE>
 struct FieldCompareWithKey<FLD_ID, IDX, TYPE> {
-	inline static int compare(struct tuple *,
-				  const char *key,
-				  uint32_t,
-				  struct key_def *,
-				  struct tuple_format *,
-				  const char *field)
+	inline __attribute__((always_inline)) static int
+	compare(struct tuple *, const char *key, uint32_t,
+		struct key_def *, struct tuple_format *,
+		const char *field)
 	{
 		return field_compare_with_key<TYPE>(&field, &key);
 	}
@@ -1391,6 +1578,10 @@ static const comparator_with_key_signature cmp_wk_arr[] = {
 	KEY_COMPARATOR(0, FIELD_TYPE_STRING  , 1, FIELD_TYPE_UNSIGNED, 2, FIELD_TYPE_STRING)
 	KEY_COMPARATOR(0, FIELD_TYPE_UNSIGNED, 1, FIELD_TYPE_STRING  , 2, FIELD_TYPE_STRING)
 	KEY_COMPARATOR(0, FIELD_TYPE_STRING  , 1, FIELD_TYPE_STRING  , 2, FIELD_TYPE_STRING)
+
+	KEY_COMPARATOR(0, FIELD_TYPE_INTEGER , 1, FIELD_TYPE_INTEGER)
+	KEY_COMPARATOR(0, FIELD_TYPE_INTEGER , 1, FIELD_TYPE_UNSIGNED)
+	KEY_COMPARATOR(0, FIELD_TYPE_UNSIGNED, 1, FIELD_TYPE_INTEGER)
 
 	KEY_COMPARATOR(1, FIELD_TYPE_UNSIGNED, 2, FIELD_TYPE_UNSIGNED)
 	KEY_COMPARATOR(1, FIELD_TYPE_STRING  , 2, FIELD_TYPE_UNSIGNED)
