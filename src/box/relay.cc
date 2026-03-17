@@ -231,6 +231,14 @@ struct relay {
 		 */
 		bool is_raft_push_sent;
 	} tx;
+	/** Current write position in wbuf. */
+	size_t wbuf_pos;
+	/**
+	 * Write buffer for batching rows before sending them to the
+	 * replica in a single writev() call. Placed at the end to
+	 * keep frequently accessed members cache-friendly.
+	 */
+	char wbuf[32 * 1024];
 };
 
 struct diag*
@@ -265,6 +273,11 @@ relay_txn_lag(const struct relay *relay)
 
 static void
 relay_send(struct relay *relay, struct xrow_header *packet);
+
+/** Flush the relay write buffer to the socket. */
+static void
+relay_flush(struct relay *relay);
+
 static void
 relay_send_initial_join_row(struct xstream *stream, struct xrow_header *row);
 
@@ -469,6 +482,7 @@ relay_initial_join(struct iostream *io, uint64_t sync, struct vclock *vclock,
 
 	/* Send read view to the replica. */
 	engine_join_xc(&ctx, &relay->stream);
+	relay_flush(relay);
 }
 
 int
@@ -483,6 +497,7 @@ relay_final_join_f(va_list ap)
 	assert(relay->stream.write != NULL);
 	recover_remaining_wals(relay->r, &relay->stream,
 			       &relay->stop_vclock, true);
+	relay_flush(relay);
 	assert(vclock_compare(&relay->r->vclock, &relay->stop_vclock) == 0);
 	return 0;
 }
@@ -783,6 +798,7 @@ relay_send_heartbeat(struct relay *relay)
 		row.replica_id = instance_id;
 		relay->last_heartbeat_time = ev_monotonic_now(loop());
 		relay_send(relay, &row);
+		relay_flush(relay);
 		relay->need_new_vclock_sync = false;
 	} catch (Exception *e) {
 		relay_set_error(relay, e);
@@ -1019,6 +1035,13 @@ relay_subscribe_f(va_list ap)
 		if (inj != NULL && inj->dparam != 0)
 			timeout = inj->dparam;
 
+		try {
+			relay_flush(relay);
+		} catch (Exception *e) {
+			relay_set_error(relay, e);
+			fiber_cancel(fiber());
+			break;
+		}
 		fiber_cond_wait_deadline(&relay->reader_cond,
 					 relay->last_row_time + timeout);
 		cbus_process(&relay->wal_endpoint);
@@ -1094,6 +1117,25 @@ relay_subscribe(struct replica *replica, struct iostream *io, uint64_t sync,
 		diag_raise();
 }
 
+/**
+ * Flush the relay write buffer to the socket. Does nothing if the
+ * buffer is empty.
+ */
+static void
+relay_flush(struct relay *relay)
+{
+	if (relay->wbuf_pos == 0)
+		return;
+	struct iovec iov = { relay->wbuf, relay->wbuf_pos };
+	if (coio_writev(relay->io, &iov, 1, 0) < 0)
+		diag_raise();
+	relay->wbuf_pos = 0;
+
+	struct errinj *inj = errinj(ERRINJ_RELAY_TIMEOUT, ERRINJ_DOUBLE);
+	if (inj != NULL && inj->dparam > 0)
+		fiber_sleep(inj->dparam);
+}
+
 static void
 relay_send(struct relay *relay, struct xrow_header *packet)
 {
@@ -1101,11 +1143,41 @@ relay_send(struct relay *relay, struct xrow_header *packet)
 
 	packet->sync = relay->sync;
 	relay->last_row_time = ev_monotonic_now(loop());
-	coio_write_xrow(relay->io, packet);
 
+	RegionGuard region_guard(&fiber()->gc);
+	int iovcnt;
+	struct iovec iov[XROW_IOVMAX];
+	xrow_to_iovec(packet, iov, &iovcnt);
+
+	size_t total = 0;
+	for (int i = 0; i < iovcnt; i++)
+		total += iov[i].iov_len;
+
+	/* If it won't fit, flush first. */
+	if (relay->wbuf_pos + total > sizeof(relay->wbuf))
+		relay_flush(relay);
+
+	/* If a single row is bigger than the buffer, send directly. */
+	if (total > sizeof(relay->wbuf)) {
+		if (coio_writev(relay->io, iov, iovcnt, 0) < 0)
+			diag_raise();
+		return;
+	}
+
+	/* Append to buffer. */
+	for (int i = 0; i < iovcnt; i++) {
+		memcpy(relay->wbuf + relay->wbuf_pos,
+		       iov[i].iov_base, iov[i].iov_len);
+		relay->wbuf_pos += iov[i].iov_len;
+	}
+
+	/*
+	 * When ERRINJ_RELAY_TIMEOUT is set, flush after every row
+	 * to preserve per-row delay behavior expected by tests.
+	 */
 	struct errinj *inj = errinj(ERRINJ_RELAY_TIMEOUT, ERRINJ_DOUBLE);
 	if (inj != NULL && inj->dparam > 0)
-		fiber_sleep(inj->dparam);
+		relay_flush(relay);
 }
 
 void
@@ -1159,6 +1231,7 @@ relay_raft_msg_push(struct cmsg *base)
 	xrow_encode_raft(&row, &fiber()->gc, &msg->req);
 	try {
 		relay_send_raft(relay, &row);
+		relay_flush(relay);
 		relay->sent_raft_term = msg->req.term;
 	} catch (Exception *e) {
 		relay_set_error(msg->relay, e);
