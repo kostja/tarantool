@@ -53,6 +53,13 @@ struct vy_history {
 	struct rlist stmts;
 	/** Memory pool for vy_history_node allocations. */
 	struct mempool *pool;
+	/**
+	 * Set to true if a mem or disk scan skipped entries
+	 * because their LSN exceeds the read view. When false,
+	 * the lookup result equals the global (latest) result
+	 * and can be safely cached even from a snapshot TX.
+	 */
+	bool is_stale;
 };
 
 /** Key history node. */
@@ -72,6 +79,7 @@ vy_history_create(struct vy_history *history, struct mempool *pool)
 {
 	history->pool = pool;
 	rlist_create(&history->stmts);
+	history->is_stale = false;
 }
 
 /**
@@ -115,6 +123,7 @@ vy_history_splice(struct vy_history *dst, struct vy_history *src)
 {
 	assert(dst->pool == src->pool);
 	rlist_splice_tail(&dst->stmts, &src->stmts);
+	dst->is_stale = dst->is_stale || src->is_stale;
 }
 
 /**

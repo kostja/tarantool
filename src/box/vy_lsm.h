@@ -60,6 +60,7 @@ struct vy_mem_env;
 struct vy_recovery;
 struct vy_run;
 struct vy_run_env;
+struct vy_scheduler_stat;
 typedef void
 (*vy_upsert_thresh_cb)(struct vy_lsm *lsm, struct vy_entry entry, void *arg);
 
@@ -670,13 +671,30 @@ vy_lsm_force_compaction(struct vy_lsm *lsm);
  * @param entry       Statement, allocated on malloc().
  * @param region_stmt NULL or the same statement, allocated on
  *                    lsregion.
+ * @param prev        If not NULL, set to the previous version
+ *                    of the same key in mem (for WW conflict
+ *                    detection).
  *
  * @retval  0 Success.
  * @retval -1 Memory error.
  */
 int
 vy_lsm_set(struct vy_lsm *lsm, struct vy_mem *mem,
-	   struct vy_entry entry, struct tuple **region_stmt);
+	   struct vy_entry entry, struct tuple **region_stmt,
+	   struct vy_entry *prev);
+
+/**
+ * Complete a dump task for @a lsm. Checks active snapshot TXs
+ * for WW conflicts with the dumped sealed mems, updates
+ * dump_lsn, deletes the dumped mems, accounts dump statistics,
+ * and clears the is_dumping flag. Scheduler-level statistics
+ * are accumulated into @a sched_stat.
+ */
+void
+vy_lsm_complete_dump(struct vy_lsm *lsm, int64_t dump_lsn,
+		     int64_t dump_generation, double dump_time,
+		     const struct vy_disk_stmt_counter *dump_output,
+		     struct vy_scheduler_stat *sched_stat);
 
 /**
  * Confirm that the statement stays in the in-memory index of

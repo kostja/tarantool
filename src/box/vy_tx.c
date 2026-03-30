@@ -110,6 +110,8 @@ vy_tx_manager_new(void)
 	rlist_create(&xm->writers);
 	rlist_create(&xm->prepared);
 	rlist_create(&xm->read_views);
+	rlist_create(&xm->snapshot_active);
+	fiber_cond_create(&xm->read_view_cond);
 	vy_global_read_view_create((struct vy_read_view *)&xm->global_read_view,
 				   INT64_MAX);
 	xm->p_global_read_view = &xm->global_read_view;
@@ -130,6 +132,7 @@ vy_tx_manager_new(void)
 void
 vy_tx_manager_delete(struct vy_tx_manager *xm)
 {
+	fiber_cond_destroy(&xm->read_view_cond);
 	mempool_destroy(&xm->read_view_mempool);
 	mempool_destroy(&xm->read_interval_mempool);
 	mempool_destroy(&xm->txv_mempool);
@@ -192,8 +195,15 @@ vy_tx_manager_read_view(struct vy_tx_manager *xm, int64_t plsn)
 	 */
 	struct vy_read_view *prev_rv = rv;
 	rv = xmempool_alloc(&xm->read_view_mempool);
+	/*
+	 * Save the old read view to destroy after insertion.
+	 * Destroying before insertion would free prev_rv if
+	 * prev_rv == old_rv and refs == 1.
+	 */
+	struct vy_read_view *old_rv = NULL;
 	if (tx_exists) {
 		rv->vlsn = MAX_LSN + tx->psn;
+		old_rv = tx->read_view;
 		tx->read_view = rv;
 		rv->refs = 2;
 	} else {
@@ -201,6 +211,8 @@ vy_tx_manager_read_view(struct vy_tx_manager *xm, int64_t plsn)
 		rv->refs = 1;
 	}
 	rlist_add_entry(&prev_rv->in_read_views, rv, in_read_views);
+	if (old_rv != NULL)
+		vy_tx_manager_destroy_read_view(xm, old_rv);
 	return rv;
 }
 
@@ -335,6 +347,7 @@ vy_tx_create(struct vy_tx_manager *xm, struct vy_tx *tx)
 	rlist_create(&tx->on_destroy);
 	rlist_create(&tx->in_writers);
 	rlist_create(&tx->in_prepared);
+	rlist_create(&tx->in_snapshot);
 }
 
 void
@@ -353,15 +366,24 @@ vy_tx_destroy(struct vy_tx *tx)
 
 	vy_tx_read_set_iter(&tx->read_set, NULL, vy_tx_read_set_free_cb, NULL);
 	rlist_del_entry(tx, in_writers);
+	rlist_del_entry(tx, in_snapshot);
 }
 
-/** Mark a transaction as aborted and account it in stats. */
+/**
+ * Mark a transaction as aborted and release its read view
+ * so that the LSM tree can compact old data. Without the
+ * release, aborted TXs would pin their read view until
+ * the user calls rollback.
+ */
 static void
 vy_tx_abort(struct vy_tx *tx)
 {
 	assert(tx->state == VINYL_TX_READY);
 	tx->state = VINYL_TX_ABORT;
 	tx->xm->stat.conflict++;
+	vy_tx_manager_destroy_read_view(tx->xm, tx->read_view);
+	tx->read_view = (struct vy_read_view *)tx->xm->p_global_read_view;
+	rlist_del_entry(tx, in_snapshot);
 }
 
 /** Return true if the transaction is read-only. */
@@ -378,11 +400,24 @@ vy_tx_is_in_read_view(struct vy_tx *tx)
 	return tx->read_view->vlsn != INT64_MAX;
 }
 
+/**
+ * Return true if this is a snapshot TX that has a read view
+ * assigned (i.e., it has read something and is no longer blind).
+ */
+static bool
+vy_tx_is_in_snapshot(struct vy_tx *tx)
+{
+	return tx->isolation == TXN_ISOLATION_SNAPSHOT &&
+	       vy_tx_is_in_read_view(tx);
+}
+
 void
 vy_tx_send_to_read_view(struct vy_tx *tx, int64_t plsn)
 {
 	assert(plsn >= MAX_LSN);
 	assert(tx->state == VINYL_TX_READY);
+	/* Snapshot TXs don't register in read_set. */
+	assert(tx->isolation != TXN_ISOLATION_SNAPSHOT);
 	if (tx->read_view->vlsn < plsn)
 		return;
 	if (!vy_tx_is_ro(tx)) {
@@ -412,6 +447,8 @@ vy_tx_send_readers_to_read_view(struct vy_tx *tx, struct txv *v)
 		/* Abort only active TXs */
 		if (abort->state != VINYL_TX_READY)
 			continue;
+		/* Snapshot TXs don't register in read_set. */
+		assert(abort->isolation != TXN_ISOLATION_SNAPSHOT);
 		vy_tx_send_to_read_view(abort, INT64_MAX);
 	}
 }
@@ -450,7 +487,35 @@ vy_tx_begin(struct vy_tx_manager *xm, enum txn_isolation_level isolation)
 		tx->is_applier_session = true;
 
 	tx->isolation = isolation;
+	/*
+	 * Snapshot TXs start with the global read view. The
+	 * read view is assigned lazily on the first read via
+	 * vy_tx_read_view(). Write-only TXs never get a read
+	 * view, which lets blind writes skip WW conflict
+	 * detection entirely. The TX is added to
+	 * snapshot_active lazily too (when the read view is
+	 * assigned) to keep the list sorted by vlsn.
+	 */
 	return tx;
+}
+
+const struct vy_read_view **
+vy_tx_read_view(struct vy_tx *tx)
+{
+	if (tx->isolation == TXN_ISOLATION_SNAPSHOT &&
+	    tx->read_view->vlsn == INT64_MAX) {
+		struct vy_tx_manager *xm = tx->xm;
+		tx->read_view = vy_tx_manager_read_view(xm, INT64_MAX);
+		/*
+		 * Append to tail: xm->lsn is monotonic, so the
+		 * list stays sorted by vlsn. This ordering is
+		 * relied upon by
+		 * vy_tx_manager_check_concurrent_write.
+		 */
+		rlist_add_tail_entry(&xm->snapshot_active, tx,
+				     in_snapshot);
+	}
+	return (const struct vy_read_view **)&tx->read_view;
 }
 
 /**
@@ -593,6 +658,226 @@ vy_tx_handle_deferred_delete(struct vy_tx *tx, struct txv *v)
 	return 0;
 }
 
+/**
+ * Check if a vy_mem contains an entry matching @a entry by
+ * @a key_def with LSN >= min_lsn (derived from @a tx's read
+ * view). Used to detect write-write conflicts at prepare time
+ * and at dump completion.
+ *
+ * For PK, pass cmp_def as key_def (exact full-key match).
+ * For unique SK, pass key_def (SK parts only) -- the function
+ * handles different PK values by checking entries on both
+ * sides of the search position. The caller must skip NULL
+ * keys (NULLs never conflict).
+ *
+ * Entries with the TX's own pseudo-LSN are skipped (to avoid
+ * false self-conflicts at prepare time). For dump-completion
+ * and DML-time checks the TX's entries are not in the mem, so
+ * the exclusion is a no-op.
+ */
+static bool
+vy_mem_check_concurrent_write(struct vy_mem *mem, struct vy_tx *tx,
+			      struct vy_entry entry, struct key_def *key_def)
+{
+	int64_t min_lsn = tx->read_view->vlsn + 1;
+	int64_t exclude_lsn = tx->psn > 0 ? MAX_LSN + tx->psn : 0;
+	struct vy_mem_tree_key tree_key;
+	tree_key.entry = entry;
+	tree_key.lsn = INT64_MAX;
+	struct vy_mem_tree_iterator itr =
+		vy_mem_tree_lower_bound(&mem->tree, &tree_key, NULL);
+	/*
+	 * The tree sorts by (cmp_def, -LSN). lower_bound finds
+	 * the first entry >= {key, INT64_MAX}, which is the
+	 * highest-LSN entry for entries with cmp_def >= ours.
+	 *
+	 * For PK (key_def == cmp_def), there is only one group
+	 * of entries with the same key, so a single check of the
+	 * highest-LSN entry at the lower_bound position suffices.
+	 *
+	 * For unique SK (key_def != cmp_def), multiple PKs can
+	 * share the same SK value (stale entries linger after
+	 * insert/delete/insert cycles). Entries with the same SK
+	 * but different PKs form separate groups in cmp_def
+	 * order. Scan forward through all groups with PK >= ours,
+	 * then backward through groups with PK < ours.
+	 */
+	struct vy_mem_tree_iterator fwd = itr;
+	for (; !vy_mem_tree_iterator_is_invalid(&fwd);
+	     vy_mem_tree_iterator_next(&mem->tree, &fwd)) {
+		struct vy_entry *found =
+			vy_mem_tree_iterator_get_elem(&mem->tree, &fwd);
+		if (vy_entry_compare(entry, *found, key_def) != 0)
+			break;
+		int64_t lsn = vy_stmt_lsn(found->stmt);
+		if (lsn >= min_lsn && lsn != exclude_lsn)
+			return true;
+	}
+	if (key_def == mem->cmp_def)
+		return false;
+	for (vy_mem_tree_iterator_prev(&mem->tree, &itr);
+	     !vy_mem_tree_iterator_is_invalid(&itr);
+	     vy_mem_tree_iterator_prev(&mem->tree, &itr)) {
+		struct vy_entry *found =
+			vy_mem_tree_iterator_get_elem(&mem->tree, &itr);
+		if (vy_entry_compare(entry, *found, key_def) != 0)
+			break;
+		int64_t lsn = vy_stmt_lsn(found->stmt);
+		if (lsn >= min_lsn && lsn != exclude_lsn)
+			return true;
+	}
+	return false;
+}
+
+/**
+ * Check sealed vy_mems of @a lsm for a concurrent write to the
+ * same key as @a entry. Returns true if a conflict is found.
+ *
+ * Sealed mems are scanned newest-first. Once an unpinned mem
+ * with dump_lsn < min_lsn is found, scanning stops: WAL FIFO
+ * guarantees all older sealed mems are fully resolved too, so
+ * dump_lsn < min_lsn for all older mems.
+ */
+bool
+vy_lsm_check_concurrent_write_mem(struct vy_lsm *lsm, struct vy_tx *tx,
+				  struct vy_entry entry,
+				  struct key_def *key_def)
+{
+	int64_t min_lsn = tx->read_view->vlsn + 1;
+	struct vy_mem *mem;
+	rlist_foreach_entry(mem, &lsm->sealed, in_sealed) {
+		if (mem->pin_count == 0 &&
+		    mem->dump_lsn >= 0 && mem->dump_lsn < min_lsn)
+			break;
+		if (vy_mem_check_concurrent_write(mem, tx, entry, key_def))
+			return true;
+	}
+	return false;
+}
+
+/**
+ * Check if @a tx has a write-write conflict with any of the
+ * sealed mems of @a lsm that are eligible for dump (generation
+ * <= @a dump_generation). Returns true if a conflict is found.
+ */
+static bool
+vy_tx_manager_check_active_tx(struct vy_tx *tx, struct vy_lsm *lsm,
+			      struct key_def *key,
+			      int64_t dump_generation)
+{
+	struct txv *v;
+	stailq_foreach_entry(v, &tx->log, next_in_log) {
+		if (v->lsm != lsm)
+			continue;
+		/* NULL unique SK keys never conflict. */
+		int multikey_idx = lsm->cmp_def->is_multikey ?
+				   (int)v->entry.hint : MULTIKEY_NONE;
+		if (lsm->index_id > 0 && key->is_nullable &&
+		    tuple_key_contains_null(v->entry.stmt, key,
+					    multikey_idx))
+			continue;
+		struct vy_mem *mem;
+		rlist_foreach_entry(mem, &lsm->sealed, in_sealed) {
+			if (mem->generation > dump_generation)
+				continue;
+			assert(mem->pin_count == 0);
+			if (vy_mem_check_concurrent_write(mem, tx,
+							  v->entry, key))
+				return true;
+		}
+	}
+	return false;
+}
+
+void
+vy_tx_manager_check_concurrent_write(struct vy_tx_manager *xm,
+				     struct vy_lsm *lsm,
+				     int64_t dump_lsn,
+				     int64_t dump_generation)
+{
+	struct key_def *key;
+	if (lsm->index_id == 0)
+		key = lsm->cmp_def;
+	else if (lsm->opts.is_unique)
+		key = lsm->key_def;
+	else
+		return;
+	struct vy_tx *tx, *next_tx;
+	rlist_foreach_entry_safe(tx, &xm->snapshot_active,
+				 in_snapshot, next_tx) {
+		if (tx->read_view->vlsn >= dump_lsn)
+			break;
+		if (tx->state != VINYL_TX_READY)
+			continue;
+		if (vy_tx_manager_check_active_tx(tx, lsm, key,
+						  dump_generation))
+			vy_tx_abort(tx);
+	}
+}
+
+/**
+ * Check sealed vy_mems of @a lsm for a concurrent write to the
+ * same key as @a entry. Used by prepare-time conflict checks to
+ * cover the case when vy_mem rotation happens during prepare:
+ * the active mem is empty (just created) and the concurrent
+ * write is in the just-sealed mem.
+ */
+static int
+vy_tx_check_sealed_mems(struct vy_tx *tx, struct vy_lsm *lsm,
+			struct vy_entry entry, struct key_def *key)
+{
+	if (vy_lsm_check_concurrent_write_mem(lsm, tx, entry, key)) {
+		tx->xm->stat.conflict++;
+		diag_set(ClientError, ER_TRANSACTION_CONFLICT);
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * Check for unique SK conflicts at prepare time. Called BEFORE
+ * vy_lsm_set so the TX's own entry is not yet in the vy_mem.
+ * Checks both the active mem and sealed mems.
+ */
+static int
+vy_tx_check_unique_secondary(struct vy_tx *tx, struct txv *v,
+			     struct key_def *key_def)
+{
+	/* NULL unique SK keys never conflict. */
+	int multikey_idx = v->lsm->cmp_def->is_multikey ?
+			   (int)v->entry.hint : MULTIKEY_NONE;
+	if (key_def->is_nullable &&
+	    tuple_key_contains_null(v->entry.stmt, key_def, multikey_idx))
+		return 0;
+	if (vy_mem_check_concurrent_write(v->mem, tx, v->entry, key_def)) {
+		tx->xm->stat.conflict++;
+		diag_set(ClientError, ER_TRANSACTION_CONFLICT);
+		return -1;
+	}
+	return vy_tx_check_sealed_mems(tx, v->lsm, v->entry, key_def);
+}
+
+/**
+ * Check for PK conflicts at prepare time. Uses @a prev -- the
+ * previous version of the same key returned by vy_mem_insert
+ * (O(1)) for the active mem, and scans sealed mems for conflicts
+ * that may have landed there due to rotation during prepare.
+ */
+static int
+vy_tx_check_primary(struct vy_tx *tx, struct vy_lsm *lsm,
+		    struct vy_entry entry, struct vy_entry prev)
+{
+	if (prev.stmt != NULL &&
+	    vy_stmt_lsn(prev.stmt) >= tx->read_view->vlsn + 1) {
+		tx->xm->stat.conflict++;
+		diag_set(ClientError, ER_TRANSACTION_CONFLICT);
+		return -1;
+	}
+	if (vy_tx_check_sealed_mems(tx, lsm, entry, lsm->cmp_def) != 0)
+		return -1;
+	return 0;
+}
+
 int
 vy_tx_prepare(struct vy_tx *tx)
 {
@@ -605,11 +890,41 @@ vy_tx_prepare(struct vy_tx *tx)
 	}
 
 	assert(tx->state == VINYL_TX_READY);
-	tx->state = VINYL_TX_COMMIT;
-	if (vy_tx_is_ro(tx))
+	if (vy_tx_is_ro(tx)) {
+		if (vy_tx_is_in_snapshot(tx)) {
+			/*
+			 * A read-only snapshot TX with a prepared
+			 * read view (vlsn >= MAX_LSN) must wait
+			 * for the prepared TX to commit. Otherwise
+			 * it could return data that is later rolled
+			 * back if the prepared TX fails WAL. Keep
+			 * state READY so that cascading abort in
+			 * vy_tx_rollback_after_prepare can abort us.
+			 */
+			while (tx->read_view->vlsn >= MAX_LSN &&
+			       tx->state == VINYL_TX_READY)
+				fiber_cond_wait(&xm->read_view_cond);
+			if (tx->state == VINYL_TX_ABORT) {
+				diag_set(ClientError,
+					 ER_TRANSACTION_CONFLICT);
+				return -1;
+			}
+		}
+		tx->state = VINYL_TX_COMMIT;
+		rlist_del_entry(tx, in_snapshot);
 		return 0;
-	assert(!vy_tx_is_in_read_view(tx));
-	assert(tx->read_view == &xm->global_read_view);
+	}
+	tx->state = VINYL_TX_COMMIT;
+	/*
+	 * Snapshot TXs get read views eagerly (at vy_tx_begin),
+	 * so they are always in a read view by the time they
+	 * prepare. SSI TXs start with the global read view
+	 * and may be sent to a real one on conflict.
+	 */
+	assert(!vy_tx_is_in_read_view(tx) ||
+	       tx->isolation == TXN_ISOLATION_SNAPSHOT);
+	assert(tx->read_view == &xm->global_read_view ||
+	       tx->isolation == TXN_ISOLATION_SNAPSHOT);
 	tx->psn = ++xm->psn;
 
 	/*
@@ -619,14 +934,22 @@ vy_tx_prepare(struct vy_tx *tx)
 	/* repsert - REPLACE/UPSERT */
 	struct tuple *delete = NULL, *repsert = NULL;
 	MAYBE_UNUSED uint32_t current_space_id = 0;
+	bool check_ww = vy_tx_is_in_snapshot(tx);
 	struct txv *v;
 	stailq_foreach_entry(v, &tx->log, next_in_log) {
 		struct vy_lsm *lsm = v->lsm;
+		struct vy_entry prev;
+		struct vy_entry *p_prev = NULL;
+		struct key_def *uniq = NULL;
 		if (lsm->index_id == 0) {
 			/* The beginning of the new txn_stmt is met. */
 			current_space_id = lsm->space_id;
 			repsert = NULL;
 			delete = NULL;
+			if (check_ww)
+				p_prev = &prev;
+		} else if (lsm->opts.is_unique && check_ww) {
+			uniq = lsm->key_def;
 		}
 		assert(lsm->space_id == current_space_id);
 
@@ -700,11 +1023,22 @@ vy_tx_prepare(struct vy_tx *tx)
 		vy_stmt_set_lsn(v->entry.stmt, MAX_LSN + tx->psn);
 		struct tuple **region_stmt =
 			(type == IPROTO_DELETE) ? &delete : &repsert;
-		if (vy_lsm_set(lsm, v->mem, v->entry, region_stmt) != 0)
+		/*
+		 * Check unique SK conflicts before inserting
+		 * into vy_mem, so we don't find our own entry.
+		 */
+		if (uniq != NULL &&
+		    vy_tx_check_unique_secondary(tx, v, uniq) != 0)
+			return -1;
+		if (vy_lsm_set(lsm, v->mem, v->entry, region_stmt, p_prev) != 0)
 			return -1;
 		v->region_stmt = *region_stmt;
+		if (p_prev != NULL &&
+		    vy_tx_check_primary(tx, lsm, v->entry, prev) != 0)
+			return -1;
 		vy_tx_send_readers_to_read_view(tx, v);
 	}
+	rlist_del_entry(tx, in_snapshot);
 	assert(rlist_empty(&tx->in_prepared));
 	rlist_add_tail_entry(&xm->prepared, tx, in_prepared);
 	return 0;
@@ -741,9 +1075,26 @@ vy_tx_commit(struct vy_tx *tx, int64_t lsn)
 			vy_mem_unpin(v->mem);
 	}
 
-	/* Update read views of dependant transactions. */
-	if (tx->read_view != &xm->global_read_view)
+	/*
+	 * When a transaction is prepared, its statements are
+	 * stamped with pseudo-LSNs (MAX_LSN + psn). The
+	 * tx_exists path in vy_tx_manager_read_view creates
+	 * a shared read view at this pseudo-LSN, linking it
+	 * to the prepared TX. Now that the real LSN is known,
+	 * convert the pseudo-LSN to the real one so the
+	 * dependent reader sees committed data at the correct
+	 * LSN.
+	 *
+	 * Only convert pseudo-LSN read views (vlsn >= MAX_LSN).
+	 * Real-LSN read views must not be mutated as they may
+	 * be shared by multiple TXs.
+	 */
+	if (tx->read_view != &xm->global_read_view &&
+	    tx->read_view->vlsn >= MAX_LSN) {
 		tx->read_view->vlsn = lsn;
+		if (tx->read_view->refs > 1)
+			fiber_cond_broadcast(&xm->read_view_cond);
+	}
 out:
 	vy_tx_destroy(tx);
 	mempool_free(&xm->tx_mempool, tx);
@@ -764,7 +1115,23 @@ vy_tx_rollback_after_prepare(struct vy_tx *tx)
 	 * link must not be an empty list head (rlist_del is a no-op if the
 	 * link is an empty head).
 	 */
-	rlist_del_entry(tx, in_prepared);
+	if (!rlist_empty(&tx->in_prepared)) {
+		/*
+		 * WAL failure: the TX completed prepare but failed
+		 * the WAL write. Abort all snapshot TXs that have a
+		 * prepared read view (vlsn >= MAX_LSN) -- they may
+		 * have seen data from this TX.
+		 */
+		rlist_del_entry(tx, in_prepared);
+		struct vy_tx *dep, *next_dep;
+		rlist_foreach_entry_safe(dep, &tx->xm->snapshot_active,
+					 in_snapshot, next_dep) {
+			if (dep->read_view->vlsn >= MAX_LSN)
+				vy_tx_abort(dep);
+		}
+		/* Wake read-only TXs waiting in vy_tx_prepare. */
+		fiber_cond_broadcast(&tx->xm->read_view_cond);
+	}
 
 	struct txv *v;
 	stailq_foreach_entry(v, &tx->log, next_in_log) {
@@ -797,7 +1164,8 @@ vy_tx_rollback(struct vy_tx *tx)
 int
 vy_tx_begin_statement(struct vy_tx *tx, struct space *space, void **savepoint)
 {
-	if (tx->state == VINYL_TX_READY && vy_tx_is_in_read_view(tx))
+	if (tx->state == VINYL_TX_READY && vy_tx_is_in_read_view(tx) &&
+	    tx->isolation != TXN_ISOLATION_SNAPSHOT)
 		vy_tx_abort(tx);
 	if (tx->state == VINYL_TX_ABORT) {
 		diag_set(ClientError, ER_TRANSACTION_CONFLICT);
@@ -856,6 +1224,12 @@ vy_tx_track(struct vy_tx *tx, struct vy_lsm *lsm,
 		/* No point in tracking reads. */
 		return;
 	}
+	/*
+	 * Snapshot TXs get a read view on first read (lazy vlsn).
+	 * By the time vy_tx_track is called, the read view must
+	 * already be assigned via vy_tx_read_view().
+	 */
+	assert(tx->isolation != TXN_ISOLATION_SNAPSHOT);
 
 	struct vy_read_interval *new_interval;
 	new_interval = vy_read_interval_new(tx, lsm, left, left_belongs,
@@ -1063,13 +1437,26 @@ vy_tx_set_entry(struct vy_tx *tx, struct vy_lsm *lsm, struct vy_entry entry)
 	tx->write_set_version++;
 	tx->write_size += tuple_size(entry.stmt);
 	stailq_add_tail_entry(&tx->log, v, next_in_log);
+	/*
+	 * For snapshot TXs, check for concurrent writes via
+	 * point lookup in sealed mems and on disk. The check
+	 * runs AFTER the entry is added to the write set so
+	 * that the dump-completion WW check can find it if a
+	 * dump completes during the yield.
+	 */
+	if (vy_tx_is_in_snapshot(tx) &&
+	    (lsm->index_id == 0 || lsm->opts.is_unique)) {
+		if (vy_lsm_check_concurrent_write(lsm, tx, entry) != 0)
+			return -1;
+	}
 	return 0;
 }
 
 int
 vy_tx_set(struct vy_tx *tx, struct vy_lsm *lsm, struct tuple *stmt)
 {
-	if (vy_tx_is_in_read_view(tx)) {
+	if (vy_tx_is_in_read_view(tx) &&
+	    tx->isolation != TXN_ISOLATION_SNAPSHOT) {
 		/*
 		 * If a conflict occurs while the first DML statement in
 		 * a transaction is waiting for a disk read to check key

@@ -1169,6 +1169,8 @@ vy_run_iterator_find_lsn(struct vy_run_iterator *itr, struct vy_entry *ret)
 
 	while (vy_stmt_lsn(itr->curr.stmt) > (**itr->read_view).vlsn ||
 	       vy_stmt_flags(itr->curr.stmt) & VY_STMT_SKIP_READ) {
+		if (vy_stmt_lsn(itr->curr.stmt) > (**itr->read_view).vlsn)
+			itr->is_stale = true;
 		if (vy_run_iterator_next_pos(itr, itr->iterator_type,
 					     &itr->curr_pos) != 0) {
 			vy_run_iterator_stop(itr);
@@ -1428,6 +1430,7 @@ vy_run_iterator_open(struct vy_run_iterator *itr,
 	itr->curr_page = NULL;
 	itr->prev_page = NULL;
 	itr->search_started = false;
+	itr->is_stale = false;
 
 	/*
 	 * Make sure the format we use to create tuples won't

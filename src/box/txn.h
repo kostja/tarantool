@@ -203,6 +203,8 @@ enum txn_isolation_level {
 	TXN_ISOLATION_BEST_EFFORT,
 	/** Allow to read only the changes confirmed on any cluster node. */
 	TXN_ISOLATION_LINEARIZABLE,
+	/** Snapshot isolation: no read tracking, write-write conflicts only. */
+	TXN_ISOLATION_SNAPSHOT,
 	/** Upper bound of valid values. */
 	txn_isolation_level_MAX,
 };

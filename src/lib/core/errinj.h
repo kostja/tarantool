@@ -170,6 +170,9 @@ struct errinj {
 	_(ERRINJ_VY_LOG_FLUSH_DELAY, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_LOG_WRITE_BAD_RECORDS, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_POINT_LOOKUP_DELAY, ERRINJ_BOOL, {.bparam = false}) \
+	_(ERRINJ_VY_POINT_LOOKUP_LSN_DELAY, ERRINJ_BOOL, {.bparam = false})\
+	_(ERRINJ_VY_CHECK_CONCURRENT_WRITE_DELAY, ERRINJ_BOOL, {.bparam = false})\
+	_(ERRINJ_VY_CHECK_CONCURRENT_WRITE_GATE, ERRINJ_INT, {.iparam = 0})\
 	_(ERRINJ_VY_QUOTA_DELAY, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_READ_PAGE, ERRINJ_BOOL, {.bparam = false}) \
 	_(ERRINJ_VY_READ_PAGE_DELAY, ERRINJ_BOOL, {.bparam = false}) \
@@ -248,6 +251,7 @@ void errinj_set_with_environment_vars(void);
 #  define ERROR_INJECT_WHILE(ID, CODE)
 #  define errinj(ID, TYPE) ((struct errinj *) NULL)
 #  define ERROR_INJECT_COUNTDOWN(ID, CODE)
+#  define ERROR_INJECT_GATE(ID)
 #else
 #  /* Returns the error injection by id */
 #  define errinj(ID, TYPE) \
@@ -279,6 +283,21 @@ void errinj_set_with_environment_vars(void);
 		    errinj(ID, ERRINJ_INT)->iparam-- == 0) {		\
 			CODE;						\
 		}							\
+	} while (0)
+/*
+ * Synchronization gate for deterministic test orchestration.
+ * Protocol: test arms the gate (iparam = 1), target fiber
+ * signals arrival (iparam++), test detects arrival (polls
+ * iparam > 1), does work, then releases (iparam = 0).
+ */
+#  define ERROR_INJECT_GATE(ID) \
+	do { \
+		struct errinj *inj = errinj(ID, ERRINJ_INT); \
+		if (inj->iparam > 0) { \
+			inj->iparam++; \
+			while (inj->iparam > 0) \
+				fiber_sleep(0.001); \
+		} \
 	} while (0)
 #endif
 

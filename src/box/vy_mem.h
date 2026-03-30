@@ -52,6 +52,8 @@ extern "C" {
 
 struct vy_history;
 
+struct vy_tx_manager;
+
 /** Vinyl memory environment. */
 struct vy_mem_env {
 	struct lsregion allocator;
@@ -59,6 +61,8 @@ struct vy_mem_env {
 	struct quota quota;
 	/** Size of memory used for storing tree extents. */
 	size_t tree_extent_size;
+	/** TX manager, used for conflict detection on mem seal. */
+	struct vy_tx_manager *xm;
 };
 
 /**
@@ -67,7 +71,8 @@ struct vy_mem_env {
  * @param memory The maximum number of in-memory bytes that vinyl uses.
  */
 void
-vy_mem_env_create(struct vy_mem_env *env, size_t memory);
+vy_mem_env_create(struct vy_mem_env *env, size_t memory,
+		  struct vy_tx_manager *xm);
 
 /**
  * Destroy a vinyl memory environment.
@@ -285,13 +290,18 @@ vy_mem_older_lsn(struct vy_mem *mem, struct vy_entry entry);
  * @param mem        vy_mem.
  * @param entry      Vinyl statement.
  * @param count      Statement counter to update.
+ * @param prev       If not NULL, set to the previous version
+ *                   of the same key in this mem (for conflict
+ *                   detection). Set to vy_entry_none() if no
+ *                   previous version exists.
  *
  * @retval  0 Success.
  * @retval -1 Memory error.
  */
 int
 vy_mem_insert(struct vy_mem *mem, struct vy_entry entry,
-	      struct vy_stmt_counter *count);
+	      struct vy_stmt_counter *count,
+	      struct vy_entry *prev);
 
 /**
  * Insert an upsert statement into the mem.
@@ -299,13 +309,18 @@ vy_mem_insert(struct vy_mem *mem, struct vy_entry entry,
  * @param mem Mem to insert to.
  * @param entry Upsert statement to insert.
  * @param count Statement counter to update.
+ * @param prev       If not NULL, set to the previous version
+ *                   of the same key in this mem (for conflict
+ *                   detection). Set to vy_entry_none() if no
+ *                   previous version exists.
  *
  * @retval  0 Success.
  * @retval -1 Memory error.
  */
 int
 vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry,
-		     struct vy_stmt_counter *count);
+		     struct vy_stmt_counter *count,
+		     struct vy_entry *prev);
 
 /**
  * Confirm insertion of a statement into the in-memory level.
@@ -385,6 +400,13 @@ struct vy_mem_iterator {
 	 * prepared statements if is_prepared_ok is false.
 	 */
 	int64_t min_skipped_plsn;
+	/**
+	 * Set to true if any statement was skipped because its LSN
+	 * exceeds the read view's vlsn. Used to decide whether a
+	 * snapshot TX's lookup result is safe to cache: if nothing
+	 * was skipped, the result equals the global result.
+	 */
+	bool is_stale;
 };
 
 /**

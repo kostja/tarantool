@@ -26,7 +26,7 @@ vy_iterator_C_test_init(size_t cache_size)
 	vy_cache_env_create(&cache_env, cord_slab_cache());
 	vy_cache_env_set_quota(&cache_env, cache_size);
 	size_t mem_size = 64 * 1024 * 1024;
-	vy_mem_env_create(&mem_env, mem_size);
+	vy_mem_env_create(&mem_env, mem_size, NULL);
 	mempool_create(&history_node_pool, cord_slab_cache(),
 		       sizeof(struct vy_history_node));
 }
@@ -150,9 +150,9 @@ vy_mem_insert_template(struct vy_mem *mem, const struct vy_stmt_template *templ)
 	tuple_unref(entry.stmt);
 	entry.stmt = region_stmt;
 	if (templ->type == IPROTO_UPSERT)
-		vy_mem_insert_upsert(mem, entry, &dummy_count);
+		vy_mem_insert_upsert(mem, entry, &dummy_count, NULL);
 	else
-		vy_mem_insert(mem, entry, &dummy_count);
+		vy_mem_insert(mem, entry, &dummy_count, NULL);
 	return entry;
 }
 

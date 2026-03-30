@@ -205,13 +205,17 @@ struct vy_tx {
 	int64_t psn;
 	/* List of triggers invoked when this transaction ends. */
 	struct rlist on_destroy;
+	/** Link in vy_tx_manager::snapshot_active. */
+	struct rlist in_snapshot;
 };
 
-static inline const struct vy_read_view **
-vy_tx_read_view(struct vy_tx *tx)
-{
-	return (const struct vy_read_view **)&tx->read_view;
-}
+/**
+ * Return the TX's read view, assigning it lazily for snapshot
+ * TXs on the first read. Write-only snapshot TXs keep the
+ * global read view, which lets them skip WW conflict detection.
+ */
+const struct vy_read_view **
+vy_tx_read_view(struct vy_tx *tx);
 
 /** Return true if the transaction may see prepared statements. */
 static inline bool
@@ -225,6 +229,8 @@ vy_tx_is_prepared_ok(struct vy_tx *tx)
 		return false;
 	case TXN_ISOLATION_BEST_EFFORT:
 		return !rlist_empty(&tx->in_writers);
+	case TXN_ISOLATION_SNAPSHOT:
+		return true;
 	default:
 		unreachable();
 	}
@@ -297,7 +303,50 @@ struct vy_tx_manager {
 	struct mempool read_interval_mempool;
 	/** Memory pool for struct vy_read_view allocations. */
 	struct mempool read_view_mempool;
+	/**
+	 * Active snapshot TXs, linked by vy_tx::in_snapshot,
+	 * ordered by read view LSN. Used at dump completion
+	 * to abort TXs whose writes conflict with entries
+	 * in the dumped sealed mems.
+	 */
+	struct rlist snapshot_active;
+	/**
+	 * Signaled when a prepared TX commits and its pseudo-LSN
+	 * read view is converted to a real LSN. Read-only snapshot
+	 * TXs that share a prepared read view wait on this cond
+	 * before committing, to avoid returning rolled-back data
+	 * if the prepared TX fails WAL.
+	 */
+	struct fiber_cond read_view_cond;
 };
+
+/**
+ * Abort active snapshot TXs that have write-write conflicts
+ * with dumped sealed mems. Called at dump completion, before
+ * the sealed mems are freed. At this point all entries have
+ * their real LSNs and @a dump_lsn (max committed LSN across
+ * all dumped mems) is a reliable cutoff.
+ * @a dump_generation selects which sealed mems to check.
+ */
+void
+vy_tx_manager_check_concurrent_write(struct vy_tx_manager *xm,
+				     struct vy_lsm *lsm,
+				     int64_t dump_lsn,
+				     int64_t dump_generation);
+
+/**
+ * Check sealed vy_mems of @a lsm for a concurrent write to the
+ * same key as @a entry. Returns true if a conflict is found.
+ *
+ * Sealed mems are scanned newest-first. Once an unpinned mem
+ * with dump_lsn < min_lsn is found, scanning stops: WAL FIFO
+ * guarantees all older sealed mems are fully resolved too, so
+ * dump_lsn < min_lsn for all older mems.
+ */
+bool
+vy_lsm_check_concurrent_write_mem(struct vy_lsm *lsm, struct vy_tx *tx,
+				  struct vy_entry entry,
+				  struct key_def *key_def);
 
 /** Allocate a tx manager object. */
 struct vy_tx_manager *

@@ -1494,7 +1494,18 @@ vy_get(struct vy_lsm *lsm, struct vy_tx *tx,
 		} else {
 			entry = partial;
 		}
-		if ((*rv)->vlsn == INT64_MAX)
+		/*
+		 * Cache the result if it equals the latest version.
+		 * The global read view always sees the latest, so
+		 * its results are always cacheable. For non-global
+		 * read views, VY_STMT_STALE on the result means a
+		 * newer version was skipped. NULL results can't
+		 * carry the flag, so they are only cached for the
+		 * global read view.
+		 */
+		if ((*rv)->vlsn == INT64_MAX ||
+		    (entry.stmt != NULL &&
+		     !vy_stmt_has_flag(entry.stmt, VY_STMT_STALE)))
 			vy_cache_add_point(&lsm->cache, entry, key);
 		goto out;
 	}
@@ -1707,8 +1718,6 @@ vy_check_is_unique(struct vy_env *env, struct vy_tx *tx,
 	if (env->status != VINYL_ONLINE)
 		return 0;
 
-	const struct vy_read_view **rv = vy_tx_read_view(tx);
-
 	/*
 	 * We only need to check the uniqueness of the primary index
 	 * if this is INSERT, because REPLACE will silently overwrite
@@ -1716,6 +1725,7 @@ vy_check_is_unique(struct vy_env *env, struct vy_tx *tx,
 	 */
 	if (space_needs_check_unique_constraint(space, 0) &&
 	    vy_stmt_type(stmt) == IPROTO_INSERT) {
+		const struct vy_read_view **rv = vy_tx_read_view(tx);
 		struct vy_lsm *lsm = vy_lsm(space->index[0]);
 		if (vy_check_is_unique_primary(tx, rv, lsm, stmt) != 0)
 			return -1;
@@ -1732,7 +1742,8 @@ vy_check_is_unique(struct vy_env *env, struct vy_tx *tx,
 		if (key_update_can_be_skipped(lsm->key_def->column_mask,
 					      column_mask))
 			continue;
-		if (vy_check_is_unique_secondary(tx, rv, lsm, stmt) != 0)
+		if (vy_check_is_unique_secondary(tx, vy_tx_read_view(tx),
+						 lsm, stmt) != 0)
 			return -1;
 	}
 	return 0;
@@ -2721,7 +2732,7 @@ vy_env_new(const char *path, size_t memory,
 		goto error_squash_queue;
 
 	vy_stmt_env_create(&e->stmt_env);
-	vy_mem_env_create(&e->mem_env, memory);
+	vy_mem_env_create(&e->mem_env, memory, e->xm);
 	vy_scheduler_create(&e->scheduler, write_threads,
 			    vy_env_dump_complete_cb,
 			    &e->run_env, &e->xm->read_views,
@@ -3572,7 +3583,7 @@ vy_squash_process(struct vy_squash *squash)
 	 */
 	size_t mem_used_before = lsregion_used(&env->mem_env.allocator);
 	struct tuple *region_stmt = NULL;
-	int rc = vy_lsm_set(lsm, mem, result, &region_stmt);
+	int rc = vy_lsm_set(lsm, mem, result, &region_stmt, NULL);
 	tuple_unref(result.stmt);
 	result.stmt = region_stmt;
 	size_t mem_used_after = lsregion_used(&env->mem_env.allocator);
@@ -3966,7 +3977,7 @@ vinyl_index_create_iterator(struct index *base, enum iterator_type type,
 	lsm->stat.lookup++;
 	vy_read_iterator_open_after(
 		&it->iterator, lsm, tx, type, it->key, last,
-		(const struct vy_read_view **)&tx->read_view);
+		vy_tx_read_view(tx));
 	return (struct iterator *)it;
 err_pos:
 	tuple_unref(it->key.stmt);
@@ -4110,7 +4121,8 @@ vy_build_insert_stmt(struct vy_lsm *lsm, struct vy_mem *mem,
 	vy_stmt_set_lsn(region_stmt, lsn);
 	struct vy_entry entry;
 	vy_stmt_foreach_entry(entry, region_stmt, lsm->cmp_def) {
-		if (vy_mem_insert(mem, entry, &lsm->stat.memory.count) != 0)
+		if (vy_mem_insert(mem, entry, &lsm->stat.memory.count,
+				  NULL) != 0)
 			return -1;
 		vy_mem_commit_stmt(mem, entry);
 	}
@@ -4642,7 +4654,7 @@ vy_deferred_delete_on_replace(struct trigger *trigger, void *event)
 		}
 		struct vy_entry entry;
 		vy_stmt_foreach_entry(entry, delete, lsm->cmp_def) {
-			rc = vy_lsm_set(lsm, mem, entry, &region_stmt);
+			rc = vy_lsm_set(lsm, mem, entry, &region_stmt, NULL);
 			if (rc != 0)
 				break;
 			entry.stmt = region_stmt;

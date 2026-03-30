@@ -60,6 +60,7 @@ const char *txn_isolation_level_strs[txn_isolation_level_MAX] = {
 	"READ_CONFIRMED",
 	"BEST_EFFORT",
 	"LINEARIZABLE",
+	"SNAPSHOT",
 };
 
 const char *txn_isolation_level_aliases[txn_isolation_level_MAX] = {
@@ -67,7 +68,8 @@ const char *txn_isolation_level_aliases[txn_isolation_level_MAX] = {
 	"read-committed",
 	"read-confirmed",
 	"best-effort",
-	"linearizable"
+	"linearizable",
+	"snapshot"
 };
 
 /* Txn cache. */

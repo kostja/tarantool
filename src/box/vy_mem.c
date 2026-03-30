@@ -49,7 +49,8 @@ enum {
 };
 
 void
-vy_mem_env_create(struct vy_mem_env *env, size_t memory)
+vy_mem_env_create(struct vy_mem_env *env, size_t memory,
+		  struct vy_tx_manager *xm)
 {
 	/* Vinyl memory is limited by vy_quota. */
 	quota_init(&env->quota, QUOTA_MAX);
@@ -57,6 +58,7 @@ vy_mem_env_create(struct vy_mem_env *env, size_t memory)
 			   SLAB_SIZE, false, "vinyl");
 	lsregion_create(&env->allocator, &env->arena);
 	env->tree_extent_size = 0;
+	env->xm = xm;
 }
 
 void
@@ -165,7 +167,8 @@ vy_mem_older_lsn(struct vy_mem *mem, struct vy_entry entry)
 
 int
 vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry,
-		     struct vy_stmt_counter *count)
+		     struct vy_stmt_counter *count,
+		     struct vy_entry *prev)
 {
 	assert(vy_stmt_type(entry.stmt) == IPROTO_UPSERT);
 	/* Check if the statement can be inserted in the vy_mem. */
@@ -193,6 +196,22 @@ vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry,
 	 */
 	mem->version++;
 	/*
+	 * Get the previous version of this key. Return it to
+	 * the caller for WW conflict detection, and use it
+	 * below for n_upserts counting.
+	 */
+	vy_mem_tree_iterator_next(&mem->tree, &inserted);
+	struct vy_entry *older = vy_mem_tree_iterator_get_elem(&mem->tree,
+							       &inserted);
+	if (older == NULL ||
+	    vy_entry_compare(entry, *older, mem->cmp_def) != 0) {
+		if (prev != NULL)
+			*prev = vy_entry_none();
+		return 0;
+	}
+	if (prev != NULL)
+		*prev = *older;
+	/*
 	 * Update n_upserts if needed. Get the previous statement
 	 * from the inserted one and if it has the same key, then
 	 * increment n_upserts of the new statement until the
@@ -208,11 +227,7 @@ vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry,
 	 * These values are used by vy_lsm_commit_upsert to squash
 	 * UPSERTs subsequence.
 	 */
-	vy_mem_tree_iterator_next(&mem->tree, &inserted);
-	struct vy_entry *older = vy_mem_tree_iterator_get_elem(&mem->tree,
-							       &inserted);
-	if (older == NULL || vy_stmt_type(older->stmt) != IPROTO_UPSERT ||
-	    vy_entry_compare(entry, *older, mem->cmp_def) != 0)
+	if (vy_stmt_type(older->stmt) != IPROTO_UPSERT)
 		return 0;
 	uint8_t n_upserts = vy_stmt_n_upserts(older->stmt);
 	/*
@@ -229,7 +244,8 @@ vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry,
 
 int
 vy_mem_insert(struct vy_mem *mem, struct vy_entry entry,
-	      struct vy_stmt_counter *count)
+	      struct vy_stmt_counter *count,
+	      struct vy_entry *prev)
 {
 	assert(vy_stmt_type(entry.stmt) != IPROTO_UPSERT);
 	/* Check if the statement can be inserted in the vy_mem. */
@@ -239,7 +255,9 @@ vy_mem_insert(struct vy_mem *mem, struct vy_entry entry,
 	assert(!vy_stmt_is_refable(entry.stmt));
 	size_t size = tuple_size(entry.stmt);
 	struct vy_entry replaced = vy_entry_none();
-	if (vy_mem_tree_insert(&mem->tree, entry, &replaced, NULL))
+	struct vy_mem_tree_iterator inserted;
+	if (vy_mem_tree_insert_get_iterator(&mem->tree, entry,
+					    &replaced, &inserted))
 		return -1;
 	if (replaced.stmt == NULL) {
 		mem->count.rows++;
@@ -252,6 +270,21 @@ vy_mem_insert(struct vy_mem *mem, struct vy_entry entry,
 	 * will be aborted in case of rollback.
 	 */
 	mem->version++;
+	/*
+	 * Return the previous version of this key in the mem
+	 * (if any). Used by snapshot isolation to detect
+	 * write-write conflicts as a side effect of the insert.
+	 */
+	if (prev != NULL) {
+		*prev = vy_entry_none();
+		vy_mem_tree_iterator_next(&mem->tree, &inserted);
+		struct vy_entry *older =
+			vy_mem_tree_iterator_get_elem(&mem->tree,
+						      &inserted);
+		if (older != NULL &&
+		    vy_entry_compare(entry, *older, mem->cmp_def) == 0)
+			*prev = *older;
+	}
 	return 0;
 }
 
@@ -357,6 +390,8 @@ vy_mem_iterator_find_lsn(struct vy_mem_iterator *itr)
 	struct key_def *cmp_def = itr->mem->cmp_def;
 	while (vy_stmt_lsn(itr->curr.stmt) > (**itr->read_view).vlsn ||
 	       vy_mem_iterator_should_skip_curr(itr)) {
+		if (vy_stmt_lsn(itr->curr.stmt) > (**itr->read_view).vlsn)
+			itr->is_stale = true;
 		if (vy_mem_iterator_step(itr) != 0 ||
 		    (itr->iterator_type == ITER_EQ &&
 		     vy_entry_compare(itr->key, itr->curr, cmp_def))) {
@@ -501,6 +536,7 @@ vy_mem_iterator_open(struct vy_mem_iterator *itr, struct vy_mem_iterator_stat *s
 	itr->search_started = false;
 	itr->is_prepared_ok = is_prepared_ok;
 	itr->min_skipped_plsn = INT64_MAX;
+	itr->is_stale = false;
 }
 
 /*

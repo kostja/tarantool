@@ -258,6 +258,8 @@ box.txn_isolation_level = {
     ['BEST_EFFORT'] = 3,
     ['linearizable'] = 4,
     ['LINEARIZABLE'] = 4,
+    ['snapshot'] = 5,
+    ['SNAPSHOT'] = 5,
 }
 
 -- Create private isolation level map anything-correct -> number.

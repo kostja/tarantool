@@ -449,6 +449,7 @@ vy_cache_get(struct vy_cache *cache, struct vy_entry key)
 		vy_cache_tree_find(&cache->cache_tree, key);
 	if (node == NULL)
 		return vy_entry_none();
+	assert(!vy_stmt_has_flag((*node)->entry.stmt, VY_STMT_STALE));
 	return (*node)->entry;
 }
 

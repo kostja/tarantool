@@ -106,6 +106,7 @@ vy_point_lookup_scan_mem(struct vy_lsm *lsm, struct vy_mem *mem,
 	int rc = vy_mem_iterator_next(&mem_itr, &mem_history);
 	vy_history_splice(history, &mem_history);
 	*min_skipped_plsn = MIN(*min_skipped_plsn, mem_itr.min_skipped_plsn);
+	history->is_stale = history->is_stale || mem_itr.is_stale;
 	vy_mem_iterator_close(&mem_itr);
 	return rc;
 
@@ -169,6 +170,7 @@ vy_point_lookup_scan_slice(struct vy_lsm *lsm, struct vy_slice *slice,
 	vy_history_create(&slice_history, &lsm->env->history_node_pool);
 	int rc = vy_run_iterator_next(&run_itr, &slice_history);
 	vy_history_splice(history, &slice_history);
+	history->is_stale = history->is_stale || run_itr.is_stale;
 	vy_run_iterator_close(&run_itr);
 	return rc;
 }
@@ -319,6 +321,8 @@ done:
 		lsm->stat.upsert.applied += upserts_applied;
 		vy_lsm_acct_read_amp(lsm, lsm->last_range,
 				     disk_bytes, ret->stmt);
+		if (ret->stmt != NULL && history.is_stale)
+			vy_stmt_set_flag(ret->stmt, VY_STMT_STALE);
 	}
 	vy_history_cleanup(&history);
 
@@ -359,5 +363,162 @@ done:
 	}
 out:
 	vy_history_cleanup(&history);
+	return rc;
+}
+
+/**
+ * Check if @history contains a version with lsn >= @min_lsn.
+ */
+static inline bool
+vy_history_has_lsn(struct vy_history *history, int64_t min_lsn)
+{
+	if (rlist_empty(&history->stmts))
+		return false;
+	struct vy_history_node *node = rlist_first_entry(
+		&history->stmts, struct vy_history_node, link);
+	return vy_stmt_lsn(node->entry.stmt) >= min_lsn;
+}
+
+int
+vy_lsm_check_concurrent_write(struct vy_lsm *lsm, struct vy_tx *tx,
+			      struct vy_entry entry)
+{
+	assert(lsm->index_id == 0 || lsm->opts.is_unique);
+	ERROR_INJECT(ERRINJ_VY_CHECK_CONCURRENT_WRITE_DELAY,
+		     fiber_sleep(0));
+	ERROR_INJECT_GATE(ERRINJ_VY_CHECK_CONCURRENT_WRITE_GATE);
+	struct key_def *key_def = lsm->index_id > 0 ?
+				  lsm->key_def : lsm->cmp_def;
+	int multikey_idx = lsm->cmp_def->is_multikey ?
+			   (int)entry.hint : MULTIKEY_NONE;
+	/* NULL unique SK keys never conflict. */
+	if (lsm->index_id > 0 && key_def->is_nullable &&
+	    tuple_key_contains_null(entry.stmt, key_def, multikey_idx))
+		return 0;
+	int64_t min_lsn = tx->read_view->vlsn + 1;
+	bool found = false;
+	int rc = 0;
+	/*
+	 * Scan sealed mems. The active vy_mem is checked at
+	 * prepare time via the BPS tree prev entry, and at
+	 * dump completion via vy_tx_manager_check_concurrent_write.
+	 */
+	if (vy_lsm_check_concurrent_write_mem(lsm, tx, entry, key_def)) {
+		found = true;
+		goto done;
+	}
+	/*
+	 * lsm->dump_lsn is the max committed LSN on disk,
+	 * including entries from sealed mems that were dumped
+	 * and freed. If it is below the TX's read view, all
+	 * entries on disk are visible to the TX. dump_lsn is
+	 * -1 when no dumps have happened yet, which is always
+	 * less than min_lsn, so this also covers the no-dumps
+	 * case.
+	 */
+	if (lsm->dump_lsn < min_lsn)
+		goto done;
+	/*
+	 * For unique SK, extract the SK-only key for cache
+	 * and disk scan. The partial key positions iterators
+	 * at the start of the SK group.
+	 */
+	struct vy_entry key = entry;
+	struct tuple *sk_key = NULL;
+	if (lsm->index_id > 0) {
+		sk_key = vy_stmt_extract_key(entry.stmt, key_def,
+					     lsm->env->key_format,
+					     multikey_idx);
+		if (sk_key == NULL)
+			return -1;
+		key.stmt = sk_key;
+		key.hint = vy_stmt_hint(sk_key, lsm->cmp_def);
+	}
+	const struct vy_read_view **rv = &tx->xm->p_global_read_view;
+
+	/* Check the tuple cache. */
+	struct vy_history history;
+	vy_history_create(&history, &lsm->env->history_node_pool);
+	rc = vy_point_lookup_scan_cache(lsm, rv, true, key, &history);
+	if (rc != 0)
+		goto done_cleanup;
+	if (!rlist_empty(&history.stmts)) {
+		found = vy_history_has_lsn(&history, min_lsn);
+		goto done_cleanup;
+	}
+
+	/*
+	 * Scan disk slices. Slices are ordered newest-first.
+	 * Stop once we hit one with max_lsn < min_lsn (all
+	 * subsequent are older). Pin the LSM to prevent
+	 * use-after-free if the space is dropped during a
+	 * yield.
+	 *
+	 * For unique SK, a single slice may contain multiple
+	 * entries with the same SK but different PKs (from
+	 * insert/delete/insert cycles). Iterate through all
+	 * matching key_def keys using the run iterator.
+	 */
+	vy_lsm_ref(lsm);
+	struct vy_range *range = vy_range_tree_find_by_key(
+		&lsm->range_tree, ITER_EQ, key);
+	assert(range != NULL);
+	if (range->slice_count == 0)
+		goto done_cleanup_unref;
+	size_t region_svp = region_used(&fiber()->gc);
+	struct vy_slice **slices = xregion_alloc_array(
+		&fiber()->gc, typeof(slices[0]), range->slice_count);
+	int count = 0;
+	struct vy_slice *slice;
+	rlist_foreach_entry(slice, &range->slices, in_range) {
+		if (slice->run->info.max_lsn < min_lsn)
+			break;
+		vy_slice_pin(slice);
+		slices[count++] = slice;
+	}
+	for (int i = 0; i < count; i++) {
+		if (rc == 0 && !found) {
+			struct vy_run_iterator run_itr;
+			vy_run_iterator_open(
+				&run_itr,
+				&lsm->stat.disk.iterator,
+				slices[i], ITER_EQ, key, rv,
+				lsm->cmp_def, lsm->key_def,
+				lsm->disk_format);
+			do {
+				vy_history_cleanup(&history);
+				rc = vy_run_iterator_next(&run_itr,
+							  &history);
+				ERROR_INJECT_YIELD(
+					ERRINJ_VY_POINT_LOOKUP_LSN_DELAY);
+				if (rc != 0)
+					break;
+				if (rlist_empty(&history.stmts))
+					break;
+				found = vy_history_has_lsn(
+					&history, min_lsn);
+			} while (!found);
+			vy_run_iterator_close(&run_itr);
+			if (tx->state == VINYL_TX_ABORT) {
+				diag_set(ClientError,
+					 ER_TRANSACTION_CONFLICT);
+				rc = -1;
+			}
+		}
+		vy_slice_unpin(slices[i]);
+	}
+	region_truncate(&fiber()->gc, region_svp);
+done_cleanup_unref:
+	vy_lsm_unref(lsm);
+done_cleanup:
+	vy_history_cleanup(&history);
+	if (sk_key != NULL)
+		tuple_unref(sk_key);
+done:
+	if (rc == 0 && found) {
+		tx->xm->stat.conflict++;
+		diag_set(ClientError, ER_TRANSACTION_CONFLICT);
+		rc = -1;
+	}
 	return rc;
 }

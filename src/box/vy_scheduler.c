@@ -1150,8 +1150,6 @@ vy_task_dump_complete(struct vy_task *task)
 	int64_t dump_lsn = new_run->dump_lsn;
 	double dump_time = ev_monotonic_now(loop()) - task->start_time;
 	struct vy_disk_stmt_counter dump_output = new_run->count;
-	struct vy_stmt_counter dump_input;
-	struct vy_mem *mem, *next_mem;
 	struct vy_slice **new_slices, *slice;
 	struct vy_range *range, *begin_range, *end_range;
 	int i;
@@ -1269,32 +1267,12 @@ vy_task_dump_complete(struct vy_task *task)
 	free(new_slices);
 
 delete_mems:
-	/*
-	 * Delete dumped in-memory trees and account dump in
-	 * LSM tree statistics.
-	 */
-	vy_stmt_counter_reset(&dump_input);
-	rlist_foreach_entry_safe(mem, &lsm->sealed, in_sealed, next_mem) {
-		if (mem->generation > scheduler->dump_generation)
-			continue;
-		vy_stmt_counter_add(&dump_input, &mem->count);
-		vy_lsm_delete_mem(lsm, mem);
-	}
-	lsm->dump_lsn = MAX(lsm->dump_lsn, dump_lsn);
-	vy_lsm_acct_dump(lsm, dump_time, &dump_input, &dump_output);
-	/*
-	 * Indexes of the same space share a memory level so we
-	 * account dump input only when the primary index is dumped.
-	 */
-	if (lsm->index_id == 0)
-		scheduler->stat.dump_input += dump_input.bytes;
-	scheduler->stat.dump_output += dump_output.bytes;
-	scheduler->stat.dump_time += dump_time;
+	vy_lsm_complete_dump(lsm, dump_lsn, scheduler->dump_generation,
+			     dump_time, &dump_output, &scheduler->stat);
 
 	/* The iterator has been cleaned up in a worker thread. */
 	task->wi->iface->close(task->wi);
 
-	lsm->is_dumping = false;
 	vy_scheduler_update_lsm(scheduler, lsm);
 
 	if (lsm->index_id != 0)

@@ -75,6 +75,7 @@ vy_history_cleanup(struct vy_history *history)
 		mempool_free(history->pool, node);
 	}
 	rlist_create(&history->stmts);
+	history->is_stale = false;
 }
 
 int

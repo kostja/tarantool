@@ -51,6 +51,7 @@
 #include "vy_range.h"
 #include "vy_run.h"
 #include "vy_stat.h"
+#include "vy_tx.h"
 #include "vy_stmt.h"
 #include "vy_upsert.h"
 #include "vy_history.h"
@@ -1010,7 +1011,8 @@ vy_lsm_delete_mem(struct vy_lsm *lsm, struct vy_mem *mem)
 
 int
 vy_lsm_set(struct vy_lsm *lsm, struct vy_mem *mem,
-	   struct vy_entry entry, struct tuple **region_stmt)
+	   struct vy_entry entry, struct tuple **region_stmt,
+	   struct vy_entry *prev)
 {
 	uint32_t format_id = entry.stmt->format_id;
 
@@ -1072,9 +1074,45 @@ vy_lsm_set(struct vy_lsm *lsm, struct vy_mem *mem,
 	entry.stmt = *region_stmt;
 	struct vy_stmt_counter *count = &lsm->stat.memory.count;
 	if (vy_stmt_type(*region_stmt) != IPROTO_UPSERT)
-		return vy_mem_insert(mem, entry, count);
+		return vy_mem_insert(mem, entry, count, prev);
 	else
-		return vy_mem_insert_upsert(mem, entry, count);
+		return vy_mem_insert_upsert(mem, entry, count, prev);
+}
+
+void
+vy_lsm_complete_dump(struct vy_lsm *lsm, int64_t dump_lsn,
+		     int64_t dump_generation, double dump_time,
+		     const struct vy_disk_stmt_counter *dump_output,
+		     struct vy_scheduler_stat *sched_stat)
+{
+	/*
+	 * Update dump_lsn before freeing the sealed mems so
+	 * that vy_lsm_check_concurrent_write can proceed
+	 * to the disk scan if a sealed mem is freed but its
+	 * entries are now on disk.
+	 */
+	lsm->dump_lsn = MAX(lsm->dump_lsn, dump_lsn);
+	vy_tx_manager_check_concurrent_write(lsm->mem->env->xm, lsm,
+					     dump_lsn, dump_generation);
+	struct vy_stmt_counter dump_input;
+	vy_stmt_counter_reset(&dump_input);
+	struct vy_mem *mem, *next_mem;
+	rlist_foreach_entry_safe(mem, &lsm->sealed, in_sealed, next_mem) {
+		if (mem->generation > dump_generation)
+			continue;
+		vy_stmt_counter_add(&dump_input, &mem->count);
+		vy_lsm_delete_mem(lsm, mem);
+	}
+	vy_lsm_acct_dump(lsm, dump_time, &dump_input, dump_output);
+	/*
+	 * Indexes of the same space share a memory level so we
+	 * account dump input only when the primary index is dumped.
+	 */
+	if (lsm->index_id == 0)
+		sched_stat->dump_input += dump_input.bytes;
+	sched_stat->dump_output += dump_output->bytes;
+	sched_stat->dump_time += dump_time;
+	lsm->is_dumping = false;
 }
 
 /**

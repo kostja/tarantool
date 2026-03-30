@@ -2690,7 +2690,8 @@ detect_whether_prepared_ok(struct txn *txn, struct space *space)
 	else if (txn->isolation == TXN_ISOLATION_READ_CONFIRMED ||
 		 txn->isolation == TXN_ISOLATION_LINEARIZABLE)
 		return false;
-	assert(txn->isolation == TXN_ISOLATION_BEST_EFFORT);
+	assert(txn->isolation == TXN_ISOLATION_BEST_EFFORT ||
+	       txn->isolation == TXN_ISOLATION_SNAPSHOT);
 	/*
 	 * The best effort that we can make is to determine whether the
 	 * transaction is read-only or not. For read only (including autocommit

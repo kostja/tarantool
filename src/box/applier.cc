@@ -267,6 +267,12 @@ apply_snapshot_row(struct xrow_header *row)
 	if (txn == NULL)
 		return -1;
 	/*
+	 * The applier is write-only: use read-committed to avoid
+	 * inheriting the user's txn_isolation (which may create
+	 * unnecessary read views or read tracking in vinyl).
+	 */
+	txn->isolation = TXN_ISOLATION_READ_COMMITTED;
+	/*
 	 * Do not wait for confirmation when fetching a snapshot.
 	 * Master only sends confirmed rows during join.
 	 */

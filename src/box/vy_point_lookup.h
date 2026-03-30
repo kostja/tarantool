@@ -64,6 +64,12 @@ struct vy_read_view;
  * If @keep_delete flag is set, the function will return the latest
  * DELETE statement instead of NULL if it exists.
  *
+ * If the mem or disk scan skipped any statement because its LSN
+ * exceeds the read view, the result statement will have the
+ * VY_STMT_STALE flag set. This tells the caller that the result
+ * may differ from the global (latest) result and must not be
+ * cached.
+ *
  * Note, this function doesn't track the result in the transaction
  * read set, i.e. it is up to the caller to call vy_tx_track() if
  * necessary.
@@ -91,6 +97,18 @@ vy_point_lookup(struct vy_lsm *lsm, struct vy_tx *tx,
 int
 vy_point_lookup_mem(struct vy_lsm *lsm, const struct vy_read_view **rv,
 		    struct vy_entry key, struct vy_entry *ret);
+
+/**
+ * DML-time WW conflict check for a snapshot TX. Checks PK
+ * (index_id == 0) and unique SK for a concurrent write to
+ * the same key as @a entry. For unique SK, extracts the SK
+ * key (skipping NULLs). Scans sealed mems, cache, and disk
+ * for a version with LSN > vlsn. Returns -1 on conflict or
+ * error, 0 if no conflict. May yield (disk reads).
+ */
+int
+vy_lsm_check_concurrent_write(struct vy_lsm *lsm, struct vy_tx *tx,
+			      struct vy_entry entry);
 
 #if defined(__cplusplus)
 } /* extern "C" */

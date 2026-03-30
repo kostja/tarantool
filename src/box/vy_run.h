@@ -308,6 +308,11 @@ struct vy_run_iterator {
 	struct vy_page *prev_page;
 	/** Is false until first .._get or .._next_.. method is called */
 	bool search_started;
+	/**
+	 * Set to true if any statement was skipped because its LSN
+	 * exceeds the read view's vlsn.
+	 */
+	bool is_stale;
 };
 
 /**
