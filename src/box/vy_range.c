@@ -384,13 +384,10 @@ vy_range_init_slice(struct vy_range *range, struct vy_slice *slice)
 			range->end, run->info.min_key,
 			HINT_NONE, range->cmp_def) > 0);
 
-	struct vy_page_info *page0 = vy_run_page_info(slice->run, 0);
-
 	/* slice->begin = MAX(range::begin, run::min_key) */
 	if (range->begin.stmt != NULL &&
-	    vy_entry_compare_with_raw_key(range->begin, page0->min_key,
-					  page0->min_key_hint,
-					  range->cmp_def) >= 0) {
+	    vy_entry_compare_with_raw_key(range->begin, run->info.min_key,
+					  HINT_NONE, range->cmp_def) >= 0) {
 		slice->begin = range->begin;
 		tuple_ref(range->begin.stmt);
 	} else {
@@ -404,7 +401,7 @@ vy_range_init_slice(struct vy_range *range, struct vy_slice *slice)
 		slice->begin =
 			vy_entry_key_from_msgpack(env->key_format,
 						  range->cmp_def,
-						  page0->min_key);
+						  run->info.min_key);
 		if (slice->begin.stmt == NULL)
 			panic("failed to allocate slice begin");
 	}
@@ -1477,50 +1474,47 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 	if (slice->count.bytes < range_size * 4 / 3)
 		return false;
 
-	/* Find the median key in the oldest run (approximately). */
-	struct vy_page_info *mid_page;
-	mid_page = vy_run_page_info(slice->run, slice->first_page_no +
-				    (slice->last_page_no -
-				     slice->first_page_no) / 2);
+	/*
+	 * Find the approximate median key in the oldest run using
+	 * group boundary keys. With LCP groups (and future PGM
+	 * blocks), individual page keys are not kept in memory --
+	 * only one boundary key per group of LCP_GROUP_MAX pages.
+	 * The group boundary is a good enough approximation for
+	 * split decisions.
+	 */
+	struct vy_run *run = slice->run;
+	uint32_t first_page = slice->first_page_no;
+	uint32_t last_page = slice->last_page_no;
+	if (first_page >= last_page)
+		return false;
+	uint32_t mid_page = first_page + (last_page - first_page) / 2;
 
-	struct vy_page_info *first_page = vy_run_page_info(slice->run,
-						slice->first_page_no);
+	const char *mid_key =
+		lcp_index_group_key(&run->lcp_index, mid_page);
+
+	const char *first_key =
+		lcp_index_group_key(&run->lcp_index, first_page);
 
 	/* No point in splitting if a new range is going to be empty. */
-	if (vy_key_compare(first_page->min_key, first_page->min_key_hint,
-			   mid_page->min_key, mid_page->min_key_hint,
+	if (vy_key_compare(first_key, HINT_NONE, mid_key, HINT_NONE,
 			   range->cmp_def) == 0)
 		return false;
 	/*
 	 * In extreme cases the median key can be < the beginning
-	 * of the slice, e.g.
-	 *
-	 * RUN:
-	 * ... |---- page N ----|-- page N + 1 --|-- page N + 2 --
-	 *     | min_key = [10] | min_key = [50] | min_key = [100]
-	 *
-	 * SLICE:
-	 * begin = [30], end = [70]
-	 * first_page_no = N, last_page_no = N + 1
-	 *
-	 * which makes mid_page_no = N and mid_page->min_key = [10].
-	 *
-	 * In such cases there's no point in splitting the range.
+	 * of the slice, e.g. when the slice begins in the middle
+	 * of a group. In such cases there's no point in splitting.
 	 */
 	if (slice->begin.stmt != NULL &&
-	    vy_entry_compare_with_raw_key(slice->begin, mid_page->min_key,
-					  mid_page->min_key_hint,
-					  range->cmp_def) >= 0)
+	    vy_entry_compare_with_raw_key(slice->begin, mid_key,
+					  HINT_NONE, range->cmp_def) >= 0)
 		return false;
 	/*
 	 * The median key can't be >= the end of the slice as we
-	 * take the min key of a page for the median key.
+	 * pick the median group from within the slice's range.
 	 */
-	assert(vy_entry_compare_with_raw_key(slice->end_bound,
-					     mid_page->min_key,
-					     mid_page->min_key_hint,
-					     range->cmp_def) > 0);
-	*p_split_key = mid_page->min_key;
+	assert(vy_entry_compare_with_raw_key(slice->end_bound, mid_key,
+					     HINT_NONE, range->cmp_def) > 0);
+	*p_split_key = mid_key;
 
 	say_verbose("range %" PRId64 " exceeds %" PRIu64 " and needs split: "
 		    "has %d slices, %" PRIu64 " bytes, last slice has "

@@ -200,7 +200,7 @@ struct vy_compaction_plan {
 	 * key to vy_lsm_split_range() to avoid recomputation.
 	 *
 	 * This is a borrowed pointer into run->info or
-	 * page->min_key.  It is safe because no run can be freed
+	 * lcp_group->key. It is safe because no run can be freed
 	 * between plan computation and scheduling: run files are
 	 * only deleted after compaction completes, and a range
 	 * is removed from the scheduler heap while its task runs.

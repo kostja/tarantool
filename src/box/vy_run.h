@@ -43,6 +43,7 @@
 #include "index_def.h"
 #include "xlog.h"
 
+#include "salad/lcp.h"
 #include "small/mempool.h"
 
 #if defined(__cplusplus)
@@ -109,10 +110,6 @@ struct vy_run_info {
 struct vy_page_info {
 	/** Offset of page data in the run file. */
 	uint64_t offset;
-	/** Minimal key stored in the page. */
-	char *min_key;
-	/** Comparison hint of the min key. */
-	hint_t min_key_hint;
 	/** Size of page data in the run file. */
 	uint32_t size;
 	/** Size of page data in memory, i.e. unpacked. */
@@ -141,6 +138,8 @@ struct vy_run {
 	struct vy_disk_stmt_counter count;
 	/** Size of memory used for storing page index. */
 	size_t page_index_size;
+	/** LCP-compressed page min_keys. */
+	struct lcp_index lcp_index;
 	/** Max LSN stored on disk. */
 	int64_t dump_lsn;
 	/**
@@ -348,6 +347,40 @@ uint32_t
 vy_page_index_find_page(struct vy_run *run, struct vy_entry key,
 			struct key_def *cmp_def, enum iterator_type itype,
 			bool *equal_key);
+
+/** Group iterator with a region-allocated key buffer. */
+struct vy_page_iter {
+	/** Underlying LCP group iterator. */
+	struct lcp_group_iter group_iter;
+	/** First absolute page number in this group. */
+	uint32_t base_page;
+	/** Region-allocated buffer for key reconstruction. */
+	char *buf;
+	/** Region state saved at init, restored at destroy. */
+	size_t region_svp;
+};
+
+/** Must be paired with vy_page_iter_destroy(). */
+static inline void
+vy_page_iter_init(struct vy_page_iter *it,
+		  const struct lcp_index *index,
+		  uint32_t group_no, uint32_t base_page)
+{
+	it->base_page = base_page;
+	struct region *region = &fiber()->gc;
+	it->region_svp = region_used(region);
+	it->buf = (char *)xregion_alloc(region, index->max_key_len);
+	lcp_group_iter_init(&it->group_iter,
+			    &index->groups[group_no], it->buf);
+}
+
+/** Free the key reconstruction buffer. */
+static inline void
+vy_page_iter_destroy(struct vy_page_iter *it)
+{
+	region_truncate(&fiber()->gc, it->region_svp);
+}
+
 /**
  * Initialize vinyl run environment
  *
@@ -680,6 +713,8 @@ struct vy_run_writer {
 	 * of max key of a finished run.
 	 */
 	struct vy_entry last;
+	/** Incrementally builds run->lcp_index during dump. */
+	struct lcp_builder lcp_index_builder;
 };
 
 /** Create a run writer to fill a run with statements. */

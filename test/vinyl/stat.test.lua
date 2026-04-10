@@ -10,7 +10,7 @@ test_run:cmd('switch test')
 fiber = require('fiber')
 
 s = box.schema.space.create('test', {engine = 'vinyl'})
-_ = s:create_index('pk', {page_size = 4096, range_size = 16384, run_count_per_level = 1, run_size_ratio = 1000})
+_ = s:create_index('pk', {page_size = 1024, range_size = 16384, run_count_per_level = 1, run_size_ratio = 1000})
 
 --
 -- Helper functions.
@@ -128,7 +128,7 @@ for i = 1, 100, 4 do put(i) end
 box.snapshot()
 wait(istat, st, 'disk.dump.count', 1)
 stat_diff(istat(), st)
-gstat().memory.page_index == 294
+gstat().memory.page_index == 694
 
 -- put + dump + compaction
 st = istat()
@@ -193,10 +193,10 @@ st = istat()
 box.snapshot()
 wait(istat, st, 'disk.compaction.count', 2)
 st = istat()
-st.range_count -- 4
+st.range_count -- 3
 st.run_count -- 2
 st.run_avg -- 0
-st.run_histogram -- [1]:4
+st.run_histogram -- [1]:3
 
 -- range lookup
 for i = 1, 100 do put(i) end

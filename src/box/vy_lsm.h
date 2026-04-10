@@ -286,6 +286,10 @@ struct vy_lsm {
 	size_t bloom_size;
 	/** Size of memory used for page index. */
 	size_t page_index_size;
+	/** LCP total prefix length across all runs' groups. */
+	uint64_t lcp_total_prefix;
+	/** LCP group count across all runs in this LSM. */
+	uint32_t lcp_group_count;
 	/**
 	 * Incremented for each change of the mem list,
 	 * to invalidate iterators.

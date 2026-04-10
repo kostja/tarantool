@@ -8,7 +8,7 @@ _ = s:create_index('pk', {run_count_per_level = 100, page_size = 128, range_size
 test_run:cmd("setopt delimiter ';'")
 function dump(big)
     local step = big and 1 or 5
-    for i = 1, 20, step do
+    for i = 1, 40, step do
         s:replace{i, digest.urandom(1000)}
     end
     box.snapshot()

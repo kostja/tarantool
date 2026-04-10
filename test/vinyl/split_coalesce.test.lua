@@ -7,7 +7,7 @@ var = box.schema.space.create('var')
 _ = var:create_index('primary', {parts = {1, 'string'}})
 
 s = box.schema.space.create('test', {engine='vinyl'})
-_ = s:create_index('primary', {unique=true, parts={1, 'unsigned'}, page_size=256, range_size=2048, run_count_per_level=1, run_size_ratio=1000})
+_ = s:create_index('primary', {unique=true, parts={1, 'unsigned'}, page_size=256, range_size=8704, run_count_per_level=1, run_size_ratio=1000})
 
 function vyinfo() return box.space.test.index.primary:stat() end
 

@@ -734,6 +734,8 @@ vy_lsm_add_run(struct vy_lsm *lsm, struct vy_run *run)
 
 	lsm->bloom_size += bloom_size;
 	lsm->page_index_size += page_index_size;
+	lsm->lcp_total_prefix += run->lcp_index.total_prefix_len;
+	lsm->lcp_group_count += run->lcp_index.count;
 
 	env->bloom_size += bloom_size;
 	env->page_index_size += page_index_size;
@@ -763,6 +765,8 @@ vy_lsm_remove_run(struct vy_lsm *lsm, struct vy_run *run)
 
 	lsm->bloom_size -= bloom_size;
 	lsm->page_index_size -= page_index_size;
+	lsm->lcp_total_prefix -= run->lcp_index.total_prefix_len;
+	lsm->lcp_group_count -= run->lcp_index.count;
 
 	env->bloom_size -= bloom_size;
 	env->page_index_size -= page_index_size;

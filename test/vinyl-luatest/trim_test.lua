@@ -51,12 +51,13 @@ end)
 g.test_bloat_compaction_after_split = function(cg)
     cg.server:exec(function()
         local s = box.schema.space.create('test', {engine = 'vinyl'})
-        -- 80 rows × 200 bytes ≈ 17 KB per dump.  range_size=8192
-        -- ensures exactly 1 median split after compaction
-        -- (17 KB > 2×8192, sub-ranges ~8.5 KB < 1.5×8192).
+        -- 80 rows x 200 bytes = 17 KB per dump. page_size=128
+        -- gives 1 row per page (80 pages, 5 LCP groups).
+        -- range_size=8192 ensures exactly 1 median split
+        -- after compaction (17 KB > 2x8192).
         s:create_index('pk', {
             run_count_per_level = 100,
-            page_size = 512,
+            page_size = 128,
             range_size = 8192,
         })
 
@@ -372,7 +373,7 @@ g.test_empty_range_coalesced = function(cg)
         local s = box.schema.space.create('test', {engine = 'vinyl'})
         s:create_index('pk', {
             run_count_per_level = 100,
-            page_size = 512,
+            page_size = 128,
             range_size = 4096,
         })
 
@@ -418,7 +419,7 @@ g.test_small_range_coalesced = function(cg)
         local s = box.schema.space.create('test', {engine = 'vinyl'})
         s:create_index('pk', {
             run_count_per_level = 100,
-            page_size = 512,
+            page_size = 128,
             range_size = 4096,
         })
 
@@ -786,47 +787,63 @@ end
 -- Negative test: verify that a slice with waste below the bloat
 -- threshold is NOT compacted.
 --
--- Setup: 2 ranges from a split sharing a small run.  After one
--- range compacts (via compact()), the shared run has minimal
--- waste: with ~4 pages total and ~2 pages per slice,
--- unreferenced ≈ 2, waste = 2*2/4 = 1 < 2.  Bloat compaction
+-- Setup: 3 ranges from two splits sharing a small run.  After one
+-- range compacts (via auto-compact), the shared run has minimal
+-- waste: with ~3 pages total and ~1 page per slice,
+-- unreferenced ≈ 1, waste = 1*1/3 = 0 < 2.  Bloat compaction
 -- should NOT fire.
 --
 g.test_bloat_below_threshold = function(cg)
     cg.server:exec(function()
         local s = box.schema.space.create('test', {engine = 'vinyl'})
         s:create_index('pk', {
-            run_count_per_level = 100,
-            page_size = 512,
-            range_size = 1024,
+            run_count_per_level = 2,
+            page_size = 128,
+            range_size = 5000,
         })
 
-        -- Phase 1: Create a small run and split into 2 ranges.
-        -- 10 keys × 200 bytes ≈ 2 KB.  With page_size=512,
-        -- the shared run has ~4 pages.
-        for i = 1, 10 do s:replace{i, string.rep('x', 200)} end
+        local pad = string.rep('x', 200)
+
+        -- Phase 1: 50 keys × 2 dumps + compact.  The merged run
+        -- has 50 pages, large enough for the LCP-based split to
+        -- find a mid-group boundary and split into 2 ranges.
+        for i = 1, 50 do s:replace{i, pad} end
         box.snapshot()
-        for i = 1, 10 do s:replace{i, string.rep('y', 200)} end
+        for i = 1, 50 do s:replace{i, pad} end
         box.snapshot()
         s.index.pk:compact()
 
         t.helpers.retrying({timeout = 5}, function()
-            t.assert_ge(s.index.pk:stat().disk.compaction.count, 1)
             t.assert_equals(s.index.pk:stat().range_count, 2)
-            t.assert_equals(s.index.pk:stat().run_count, 1)
         end)
 
-        -- Phase 2: Dump a small overlapping set to one range
-        -- and force compaction via compact().  Range 1 (keys
-        -- 1-2) has 2 slices → compact merges them, consuming
-        -- the shared run's slice.  Range 2 has only 1 slice →
-        -- compact() is a no-op.  After compaction, the shared
-        -- run's waste is too small for bloat detection.
+        -- Phase 1b: 50 new keys × 2 dumps to the upper range.
+        -- The upper range hits 3 slices and auto-compacts; the
+        -- merged result splits again, producing 3 ranges total.
+        for i = 51, 100 do s:replace{i, pad} end
+        box.snapshot()
+        for i = 51, 100 do s:replace{i, pad} end
+        box.snapshot()
+
+        t.helpers.retrying({timeout = 5}, function()
+            t.assert_equals(box.stat.vinyl().scheduler.idle, 1)
+            t.assert_equals(s.index.pk:stat().range_count, 3)
+        end)
+
+        -- Phase 2: Snapshot one key per range -- this produces
+        -- a tiny shared run with one slice in each of the 3
+        -- ranges. Then snapshot another key in range 1's key
+        -- space -- this produces a single-slice run in range 1
+        -- only. Range 1 now has 3 slices and auto-compacts;
+        -- the other ranges stay at 2 slices.
         local compaction_before =
             s.index.pk:stat().disk.compaction.count
-        for i = 1, 2 do s:replace{i, string.rep('z', 200)} end
+        s:replace{1, pad}
+        s:replace{40, pad}
+        s:replace{75, pad}
         box.snapshot()
-        s.index.pk:compact()
+        s:replace{2, pad}
+        box.snapshot()
 
         t.helpers.retrying({timeout = 5}, function()
             t.assert_equals(

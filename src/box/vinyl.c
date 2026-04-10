@@ -429,6 +429,10 @@ vinyl_index_stat(struct index *index, struct info_handler *h)
 	info_table_end(h); /* compaction */
 	info_append_int(h, "index_size", lsm->page_index_size);
 	info_append_int(h, "bloom_size", lsm->bloom_size);
+	info_append_double(h, "lcp_avg_prefix",
+			   lsm->lcp_group_count > 0 ?
+			   (double)lsm->lcp_total_prefix /
+			   lsm->lcp_group_count : 0);
 	info_table_end(h); /* disk */
 
 	info_table_begin(h, "cache");

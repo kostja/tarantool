@@ -249,28 +249,13 @@ vy_run_env_coio_call(struct vy_run_env *env, struct cbus_call_msg *msg,
 }
 
 /**
- * Initialize page info struct
+ * Initialize page info struct.
  */
 static void
-vy_page_info_create(struct vy_page_info *page_info, uint64_t offset,
-		    const char *min_key, struct key_def *cmp_def)
+vy_page_info_create(struct vy_page_info *page_info, uint64_t offset)
 {
 	memset(page_info, 0, sizeof(*page_info));
 	page_info->offset = offset;
-	page_info->unpacked_size = 0;
-	page_info->min_key = mp_dup(min_key);
-	uint32_t part_count = mp_decode_array(&min_key);
-	page_info->min_key_hint = key_hint(min_key, part_count, cmp_def);
-}
-
-/**
- * Destroy page info struct
- */
-static void
-vy_page_info_destroy(struct vy_page_info *page_info)
-{
-	if (page_info->min_key != NULL)
-		free(page_info->min_key);
 }
 
 struct vy_run *
@@ -295,12 +280,8 @@ vy_run_new(struct vy_run_env *env, int64_t id)
 static void
 vy_run_clear(struct vy_run *run)
 {
-	if (run->page_info != NULL) {
-		uint32_t page_no;
-		for (page_no = 0; page_no < run->info.page_count; ++page_no)
-			vy_page_info_destroy(run->page_info + page_no);
+	if (run->page_info != NULL)
 		free(run->page_info);
-	}
 	run->page_info = NULL;
 	run->page_index_size = 0;
 	run->info.page_count = 0;
@@ -312,6 +293,8 @@ vy_run_clear(struct vy_run *run)
 	run->info.min_key = NULL;
 	free(run->info.max_key);
 	run->info.max_key = NULL;
+	lcp_index_destroy(&run->lcp_index);
+	lcp_index_create(&run->lcp_index);
 }
 
 void
@@ -329,6 +312,35 @@ size_t
 vy_run_bloom_size(struct vy_run *run)
 {
 	return run->info.bloom == NULL ? 0 : tuple_bloom_size(run->info.bloom);
+}
+
+/**
+ * Linear scan over an LCP group's pages: starting from suffix 1
+ * (the group boundary key in suffix 0 has already been compared
+ * during the binary phase), find the highest page whose min_key
+ * satisfies the search bound. Returns the absolute page index.
+ */
+static inline uint32_t
+vy_page_iter_search(struct vy_page_iter *it, struct vy_entry key,
+		    struct key_def *cmp_def, bool is_lower_bound,
+		    bool *equal_key)
+{
+	uint32_t buf_len;
+	/* Skip suffix 0 (the group boundary, already compared). */
+	lcp_group_iter_next_key(&it->group_iter, &buf_len);
+	uint32_t page = it->base_page;
+	uint32_t i = 1;
+	while (lcp_group_iter_next_key(&it->group_iter,
+				       &buf_len) != NULL) {
+		int cmp = vy_entry_compare_with_raw_key(
+			key, it->buf, HINT_NONE, cmp_def);
+		*equal_key = *equal_key || cmp == 0;
+		if (is_lower_bound ? cmp <= 0 : cmp < 0)
+			break;
+		page = it->base_page + i;
+		i++;
+	}
+	return page;
 }
 
 uint32_t
@@ -354,37 +366,54 @@ vy_page_index_find_page(struct vy_run *run, struct vy_entry key,
 	 * min_key:         [1   1   2   2   2   2   2   3   3   3]
 	 * we want to find: [    LT  GE              LE  GT       ]
 	 * For LT and GE it's a classical lower_bound search.
-	 * Let's set up a range with left page's min_key < key and
-	 *  right page's min >= key; binary cut the range until it
+	 * Let's set up a range with left group's min_key < key and
+	 *  right group's min >= key; binary cut the range until it
 	 *  becomes of length 1 and then LT pos = left bound of the range
 	 *  and GE pos = right bound of the range.
 	 * For LE and GT it's a classical upper_bound search.
-	 * Let's set up a range with left page's min_key <= key and
-	 *  right page's min > key; binary cut the range until it
+	 * Let's set up a range with left group's min_key <= key and
+	 *  right group's min > key; binary cut the range until it
 	 *  becomes of length 1 and then LE pos = left bound of the range
 	 *  and GT pos = right bound of the range.
 	 */
 	bool is_lower_bound = itype == ITER_LT || itype == ITER_GE;
 
 	assert(run->info.page_count > 0);
+	struct lcp_index *lcp = &run->lcp_index;
 	/* Initially the range is set with virtual positions */
-	int32_t range[2] = { -1, run->info.page_count };
-	assert(run->info.page_count > 0);
+	int32_t range[2] = { -1, lcp->count };
+	assert(lcp->count > 0);
 	do {
 		int32_t mid = range[0] + (range[1] - range[0]) / 2;
-		struct vy_page_info *info = vy_run_page_info(run, mid);
-		int cmp = vy_entry_compare_with_raw_key(key, info->min_key,
-							info->min_key_hint,
-							cmp_def);
+		int cmp = vy_entry_compare_with_raw_key(
+			key, lcp->groups[mid].key, HINT_NONE, cmp_def);
 		if (is_lower_bound)
 			range[cmp <= 0] = mid;
 		else
 			range[cmp < 0] = mid;
 		*equal_key = *equal_key || cmp == 0;
 	} while (range[1] - range[0] > 1);
-	if (range[0] < 0)
-		range[0] = run->info.page_count;
-	uint32_t page = range[dir > 0];
+
+	/*
+	 * range[] now bounds groups. Linear scan within the left
+	 * group (range[0]) converts to absolute page indices.
+	 */
+	int32_t page_range[2];
+	if (range[0] >= 0) {
+		struct vy_page_iter it;
+		vy_page_iter_init(&it, lcp, (uint32_t)range[0],
+				  (uint32_t)range[0] * LCP_GROUP_MAX);
+		page_range[0] = (int32_t)vy_page_iter_search(
+			&it, key, cmp_def, is_lower_bound, equal_key);
+		page_range[1] = page_range[0] + 1;
+		vy_page_iter_destroy(&it);
+	} else {
+		page_range[0] = -1;
+		page_range[1] = 0;
+	}
+	if (page_range[0] < 0)
+		page_range[0] = run->info.page_count;
+	uint32_t page = page_range[dir > 0];
 
 	/**
 	 * Since page search uses only min_key of pages,
@@ -466,26 +495,28 @@ vy_slice_cut(struct vy_slice *slice, int64_t id, struct vy_entry begin,
 /**
  * Decode page information from xrow.
  *
- * @param[out] page Page information.
- * @param xrow      Xrow to decode.
- * @param cmp_def   Definition of keys stored in the page.
- * @param filename  Filename for error reporting.
+ * @param[out] page          Page information.
+ * @param[out] min_key  Pointer to the page min_key in the xrow
+ *                      body (raw msgpack). Valid until the next
+ *                      row is read from the cursor.
+ * @param xrow          Xrow to decode.
+ * @param filename      Filename for error reporting.
  *
  * @retval  0 Success.
  * @retval -1 Error.
  */
 static int
-vy_page_info_decode(struct vy_page_info *page, const struct xrow_header *xrow,
-		    struct key_def *cmp_def, const char *filename)
+vy_page_info_decode(struct vy_page_info *page, const char **min_key,
+		    const struct xrow_header *xrow, const char *filename)
 {
 	assert(xrow->type == VY_INDEX_PAGE_INFO);
 	const char *pos = xrow->body->iov_base;
 	memset(page, 0, sizeof(*page));
+	*min_key = NULL;
 	uint64_t key_map = vy_page_info_key_map;
 	uint32_t map_size = mp_decode_map(&pos);
 	uint32_t map_item;
 	const char *key_beg;
-	uint32_t part_count;
 	for (map_item = 0; map_item < map_size; ++map_item) {
 		uint32_t key = mp_decode_uint(&pos);
 		key_map &= ~(1ULL << key);
@@ -502,10 +533,7 @@ vy_page_info_decode(struct vy_page_info *page, const struct xrow_header *xrow,
 		case VY_PAGE_INFO_MIN_KEY:
 			key_beg = pos;
 			mp_next(&pos);
-			page->min_key = mp_dup(key_beg);
-			part_count = mp_decode_array(&key_beg);
-			page->min_key_hint = key_hint(key_beg, part_count,
-						      cmp_def);
+			*min_key = key_beg;
 			break;
 		case VY_PAGE_INFO_UNPACKED_SIZE:
 			page->unpacked_size = mp_decode_uint(&pos);
@@ -1588,10 +1616,7 @@ vy_run_iterator_close(struct vy_run_iterator *itr)
 static void
 vy_run_acct_page(struct vy_run *run, struct vy_page_info *page)
 {
-	const char *min_key_end = page->min_key;
-	mp_next(&min_key_end);
 	run->page_index_size += sizeof(struct vy_page_info);
-	run->page_index_size += min_key_end - page->min_key;
 	run->count.rows += page->row_count;
 	run->count.bytes += page->unpacked_size;
 	run->count.bytes_compressed += page->size;
@@ -1600,11 +1625,15 @@ vy_run_acct_page(struct vy_run *run, struct vy_page_info *page)
 
 int
 vy_run_recover(struct vy_run *run, const char *dir,
-	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def)
+	       uint32_t space_id, uint32_t iid,
+	       struct key_def *cmp_def MAYBE_UNUSED)
 {
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dir,
 			    space_id, iid, run->id, VY_FILE_INDEX);
+
+	struct lcp_builder lcp_bld;
+	lcp_builder_init(&lcp_bld, &run->lcp_index);
 
 	struct xlog_cursor cursor;
 	ERROR_INJECT_COUNTDOWN(ERRINJ_VY_RUN_RECOVER_COUNTDOWN, {
@@ -1660,6 +1689,8 @@ vy_run_recover(struct vy_run *run, const char *dir,
 		goto fail_close;
 	}
 
+	lcp_builder_reserve(&lcp_bld, run->info.page_count);
+
 	for (uint32_t page_no = 0; page_no < run->info.page_count; page_no++) {
 		int rc = xlog_cursor_next_row(&cursor, &xrow);
 		if (rc != 0) {
@@ -1684,7 +1715,9 @@ vy_run_recover(struct vy_run *run, const char *dir,
 			goto fail_close;
 		}
 		struct vy_page_info *page = run->page_info + page_no;
-		if (vy_page_info_decode(page, &xrow, cmp_def, path) < 0) {
+		const char *page_min_key = NULL;
+		if (vy_page_info_decode(page, &page_min_key,
+					&xrow, path) < 0) {
 			/**
 			 * Limit the count of pages to successfully
 			 * created pages
@@ -1693,7 +1726,13 @@ vy_run_recover(struct vy_run *run, const char *dir,
 			goto fail_close;
 		}
 		vy_run_acct_page(run, page);
+		lcp_builder_add_mp(&lcp_bld, page_min_key);
 	}
+	if (lcp_builder_finish(&lcp_bld) != 0) {
+		diag_set(OutOfMemory, 0, "malloc", "lcp index");
+		goto fail_close;
+	}
+	run->page_index_size += run->lcp_index.mem_used;
 
 	/* We don't need to keep metadata file open any longer. */
 	xlog_cursor_close(&cursor, false);
@@ -1711,11 +1750,13 @@ vy_run_recover(struct vy_run *run, const char *dir,
 	}
 	run->fd = cursor.fd;
 	xlog_cursor_close(&cursor, true);
+	lcp_builder_destroy(&lcp_bld);
 	return 0;
 
 fail_close:
 	xlog_cursor_close(&cursor, false);
 fail:
+	lcp_builder_destroy(&lcp_bld);
 	vy_run_clear(run);
 	diag_log();
 	say_error("failed to load `%s'", path);
@@ -1809,6 +1850,8 @@ vy_run_alloc_page_info(struct vy_run *run, uint32_t *page_info_capacity)
  * Allocates using region_alloc.
  *
  * @param page_info page information to encode
+ * @param min_key   page min_key (raw msgpack)
+ * @param min_key_size size of min_key in bytes
  * @param[out] xrow xrow to fill
  *
  * @retval  0 success
@@ -1816,15 +1859,10 @@ vy_run_alloc_page_info(struct vy_run *run, uint32_t *page_info_capacity)
  */
 static int
 vy_page_info_encode(const struct vy_page_info *page_info,
+		    const char *min_key, uint32_t min_key_size,
 		    struct xrow_header *xrow)
 {
 	struct region *region = &fiber()->gc;
-
-	uint32_t min_key_size;
-	const char *tmp = page_info->min_key;
-	assert(mp_typeof(*tmp) == MP_ARRAY);
-	mp_next(&tmp);
-	min_key_size = tmp - page_info->min_key;
 
 	/* calc tuple size */
 	uint32_t size;
@@ -1860,7 +1898,7 @@ vy_page_info_encode(const struct vy_page_info *page_info,
 	pos = mp_encode_uint(pos, VY_PAGE_INFO_ROW_COUNT);
 	pos = mp_encode_uint(pos, page_info->row_count);
 	pos = mp_encode_uint(pos, VY_PAGE_INFO_MIN_KEY);
-	memcpy(pos, page_info->min_key, min_key_size);
+	memcpy(pos, min_key, min_key_size);
 	pos += min_key_size;
 	pos = mp_encode_uint(pos, VY_PAGE_INFO_UNPACKED_SIZE);
 	pos = mp_encode_uint(pos, page_info->unpacked_size);
@@ -2020,9 +2058,19 @@ vy_run_write_index(struct vy_run *run, const char *dirpath,
 	    xlog_write_row(&index_xlog, &xrow) < 0)
 		goto fail_rollback;
 
+	char *min_key = (char *)xregion_alloc(region,
+					      run->lcp_index.max_key_len);
+	struct lcp_index_iter lcp_it;
+	lcp_index_iter_init(&lcp_it, &run->lcp_index, min_key);
 	for (uint32_t page_no = 0; page_no < run->info.page_count; ++page_no) {
 		struct vy_page_info *page_info = vy_run_page_info(run, page_no);
-		if (vy_page_info_encode(page_info, &xrow) < 0) {
+		uint32_t min_key_size = 0;
+		const char *rc = lcp_index_iter_next_key(&lcp_it,
+							 &min_key_size);
+		assert(rc != NULL);
+		(void)rc;
+		if (vy_page_info_encode(page_info, min_key,
+					min_key_size, &xrow) < 0) {
 			goto fail_rollback;
 		}
 		if (xlog_write_row(&index_xlog, &xrow) < 0)
@@ -2077,6 +2125,7 @@ vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 	xlog_clear(&writer->data_xlog);
 	ibuf_create(&writer->row_index_buf, &cord()->slabc,
 		    4096 * sizeof(uint32_t));
+	lcp_builder_init(&writer->lcp_index_builder, &run->lcp_index);
 	run->info.min_lsn = INT64_MAX;
 	run->info.max_lsn = -1;
 	assert(run->page_info == NULL);
@@ -2139,8 +2188,10 @@ vy_run_writer_start_page(struct vy_run_writer *writer,
 		run->info.min_key = mp_dup(key);
 	}
 	struct vy_page_info *page = run->page_info + run->info.page_count;
-	vy_page_info_create(page, writer->data_xlog.offset, key,
-			    writer->cmp_def);
+	vy_page_info_create(page, writer->data_xlog.offset);
+
+	lcp_builder_add_mp(&writer->lcp_index_builder, key);
+
 	run->info.page_count++;
 	xlog_tx_begin(&writer->data_xlog);
 	return 0;
@@ -2260,6 +2311,7 @@ vy_run_writer_destroy(struct vy_run_writer *writer, bool reuse_fd)
 	if (writer->bloom != NULL)
 		tuple_bloom_builder_delete(writer->bloom);
 	ibuf_destroy(&writer->row_index_buf);
+	lcp_builder_destroy(&writer->lcp_index_builder);
 }
 
 int
@@ -2306,7 +2358,12 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 		run->info.bloom = tuple_bloom_new(writer->bloom,
 						  writer->index_opts.bloom_fpr);
 
-	/* Shrink to fit actual size. */
+	if (lcp_builder_finish(&writer->lcp_index_builder) != 0) {
+		diag_set(OutOfMemory, 0, "malloc", "lcp index");
+		goto out;
+	}
+
+	/* Shrink page_info to fit actual size. */
 	uint32_t page_count = run->info.page_count;
 	struct vy_page_info *new_pi = realloc(run->page_info,
 					      page_count * sizeof(*new_pi));
@@ -2314,6 +2371,7 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 		run->page_info = new_pi;
 		writer->page_info_capacity = page_count;
 	}
+	run->page_index_size += run->lcp_index.mem_used;
 
 	if (vy_run_write_index(run, writer->dirpath,
 			       writer->space_id, writer->iid) != 0)
@@ -2355,12 +2413,14 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 
 	int rc = 0;
 	uint32_t page_info_capacity = 0;
+	struct lcp_builder lcp_bld;
+	lcp_builder_init(&lcp_bld, &run->lcp_index);
 
 	const char *key = NULL;
 	int64_t max_lsn = 0;
 	int64_t min_lsn = INT64_MAX;
 	struct tuple *prev_tuple = NULL;
-	char *page_min_key = NULL;
+	bool is_page_start = true;
 
 	struct tuple_bloom_builder *bloom_builder = NULL;
 	if (opts->bloom_fpr < 1) {
@@ -2411,8 +2471,10 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 				goto close_err;
 			if (run->info.min_key == NULL)
 				run->info.min_key = mp_dup(key);
-			if (page_min_key == NULL)
-				page_min_key = mp_dup(key);
+			if (is_page_start) {
+				lcp_builder_add_mp(&lcp_bld, key);
+				is_page_start = false;
+			}
 			if (xrow.lsn > max_lsn)
 				max_lsn = xrow.lsn;
 			if (xrow.lsn < min_lsn)
@@ -2421,17 +2483,22 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		}
 		struct vy_page_info *info;
 		info = run->page_info + run->info.page_count;
-		vy_page_info_create(info, page_offset, page_min_key, cmp_def);
+		vy_page_info_create(info, page_offset);
 		info->row_count = page_row_count;
 		info->size = next_page_offset - page_offset;
 		info->unpacked_size = xlog_cursor_tx_pos(&cursor);
 		info->row_index_offset = page_row_index_offset;
 		++run->info.page_count;
 		vy_run_acct_page(run, info);
-
-		free(page_min_key);
-		page_min_key = NULL;
+		is_page_start = true;
 	}
+	/* Finish the last LCP group. */
+	if (lcp_builder_finish(&lcp_bld) != 0) {
+		diag_set(OutOfMemory, 0, "malloc", "lcp index");
+		goto close_err;
+	}
+
+	run->page_index_size += run->lcp_index.mem_used;
 
 	if (key != NULL)
 		run->info.max_key = mp_dup(key);
@@ -2459,14 +2526,14 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	xlog_remove_file(path, 0);
 	if (vy_run_write_index(run, dir, space_id, iid) != 0)
 		goto close_err;
+	lcp_builder_destroy(&lcp_bld);
 	return 0;
 close_err:
+	lcp_builder_destroy(&lcp_bld);
 	vy_run_clear(run);
 	region_truncate(region, mem_used);
 	if (prev_tuple != NULL)
 		tuple_unref(prev_tuple);
-	if (page_min_key != NULL)
-		free(page_min_key);
 	if (bloom_builder != NULL)
 		tuple_bloom_builder_delete(bloom_builder);
 	if (xlog_cursor_is_open(&cursor))

@@ -115,15 +115,15 @@ space:drop()
 --
 space = box.schema.space.create('test', {engine = 'vinyl'})
 page_size = 64
-range_size = page_size * 15
+range_size = page_size * 60
 pk = space:create_index('pk', {page_size = page_size, range_size = range_size, run_count_per_level = 1})
 pad = ''
 for i = 1, 64 do pad = pad..(i % 10) end
-for i = 1, 8 do space:replace{i, pad} end
+for i = 1, 40 do space:replace{i, pad} end
 box.snapshot()
 
 -- Decrease the range_size and dump many runs to trigger split.
-pk:alter({range_size = page_size * 2})
+pk:alter({range_size = page_size * 15})
 while pk:stat().range_count < 2 do space:replace{1, pad} box.snapshot() fiber.sleep(0.01) end
 
 space:drop()
