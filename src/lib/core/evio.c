@@ -140,6 +140,16 @@ evio_setsockopt_server(int fd, int family, int type)
 	if (sio_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
 		       &on, sizeof(on)))
 		return -1;
+#ifdef SO_REUSEPORT
+	/*
+	 * Allow multiple processes to bind to the same port.
+	 * Used by the multi-process supervisor (ncpu > 1) to
+	 * let worker processes share listen ports.
+	 */
+	if (sio_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
+		       &on, sizeof(on)))
+		return -1;
+#endif
 	/*
 	 * Allow binding to the same port for ipv4 and ipv6 simultaneously on
 	 * platforms with dualstack sockets support.

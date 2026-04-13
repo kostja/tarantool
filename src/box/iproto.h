@@ -188,6 +188,56 @@ iproto_session_send(struct session *session,
 void
 iproto_free(void);
 
+/**
+ * Multi-process worker support (ncpu > 1).
+ *
+ * When picodata runs in multi-process mode, multiple worker processes
+ * share the same listen port via SO_REUSEPORT. Intra-cluster connections
+ * encode the target worker ID in the client source port, so the accepting
+ * worker can route the fd to the correct sibling via IPC.
+ *
+ * The following API stubs define the interface between the picodata
+ * supervisor and tarantool's iproto layer:
+ *
+ * - iproto_set_worker_id(): tells this instance its worker ID
+ * - iproto_set_worker_ipc_fd(): registers an IPC channel to a sibling
+ * - iproto_accept_fd(): injects a pre-accepted fd into the iproto loop
+ *
+ * Connection routing flow:
+ * 1. Worker accepts connection on shared port (via SO_REUSEPORT)
+ * 2. Inspects peer's source port to decode target worker ID
+ * 3. If target != self, sends fd to target via IPC (SCM_RIGHTS)
+ * 4. Target calls iproto_accept_fd() to process the connection
+ */
+
+/**
+ * Set this worker's ID (0-based index within the ncpu group).
+ * Must be called before iproto_listen().
+ */
+void
+iproto_set_worker_id(int worker_id);
+
+/**
+ * Register an IPC Unix socket fd for communicating with a sibling worker.
+ * Used for passing connection fds via SCM_RIGHTS when a connection
+ * arrives on the wrong worker (based on source port routing).
+ *
+ * @param peer_worker_id  the sibling's worker ID
+ * @param fd              our end of the Unix socketpair to that sibling
+ */
+void
+iproto_set_worker_ipc_fd(int peer_worker_id, int fd);
+
+/**
+ * Inject a pre-accepted connection fd into the iproto processing loop.
+ * Called when a sibling worker routes a connection to us via IPC.
+ *
+ * @param fd  the accepted connection file descriptor
+ * @return 0 on success, -1 on error
+ */
+int
+iproto_accept_fd(int fd);
+
 #endif /* defined(__cplusplus) */
 
 #endif

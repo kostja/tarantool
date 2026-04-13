@@ -3531,6 +3531,49 @@ iproto_send_listen_msg(struct evio_service *binary)
 	return 0;
 }
 
+/*
+ * Multi-process worker support (ncpu > 1).
+ * See iproto.h for the design overview.
+ */
+
+/** This worker's ID within the ncpu group. -1 means single-process mode. */
+static int iproto_worker_id = -1;
+
+/** IPC fds to sibling workers, indexed by peer worker_id. */
+static int iproto_worker_ipc_fds[128];
+static int iproto_worker_ipc_fd_count = 0;
+
+void
+iproto_set_worker_id(int worker_id)
+{
+	iproto_worker_id = worker_id;
+}
+
+void
+iproto_set_worker_ipc_fd(int peer_worker_id, int fd)
+{
+	assert(peer_worker_id >= 0 &&
+	       peer_worker_id < (int)lengthof(iproto_worker_ipc_fds));
+	iproto_worker_ipc_fds[peer_worker_id] = fd;
+	if (peer_worker_id >= iproto_worker_ipc_fd_count)
+		iproto_worker_ipc_fd_count = peer_worker_id + 1;
+}
+
+int
+iproto_accept_fd(int fd)
+{
+	/*
+	 * TODO: inject the fd into the iproto processing loop.
+	 * This requires creating an iproto_connection for the fd
+	 * and attaching it to one of the iproto threads, similar
+	 * to what happens in iproto_on_accept() but without the
+	 * accept() call.
+	 */
+	(void)fd;
+	say_warn("iproto_accept_fd: not yet implemented");
+	return -1;
+}
+
 int
 iproto_listen(const struct uri_set *uri_set)
 {
