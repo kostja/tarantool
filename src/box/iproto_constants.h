@@ -585,6 +585,8 @@ request_replace_body_create(struct request_replace_body *body,
 	_(BLOOM_FILTER, 7)						\
 	/** Number of statements of each type (map). */			\
 	_(STMT_STAT, 8)							\
+	/** Binary fuse8 filter for full-key EQ lookups. */		\
+	_(FUSE_FILTER, 9)						\
 
 #define VY_RUN_INFO_KEY_MEMBER(s, v) VY_RUN_INFO_ ## s = v,
 

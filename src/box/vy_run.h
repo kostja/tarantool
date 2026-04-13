@@ -43,6 +43,7 @@
 #include "index_def.h"
 #include "xlog.h"
 
+#include "binaryfusefilter.h"
 #include "salad/lcp.h"
 #include "small/mempool.h"
 
@@ -98,8 +99,18 @@ struct vy_run_info {
 	int64_t max_lsn;
 	/** Number of pages in the run. */
 	uint32_t page_count;
-	/** Bloom filter of all tuples in run */
+	/**
+	 * Legacy bloom filter of all tuples in run. NULL for runs
+	 * written by current code -- they use @a fuse instead.
+	 * Kept for backward compatibility with on-disk runs that
+	 * predate the fuse filter.
+	 */
 	struct tuple_bloom *bloom;
+	/**
+	 * Binary fuse8 filter of all tuples in run. NULL when the
+	 * run was loaded from disk in the legacy bloom format.
+	 */
+	binary_fuse8_t *fuse;
 	/** Statement statistics. */
 	struct vy_stmt_stat stmt_stat;
 };
@@ -704,8 +715,11 @@ struct vy_run_writer {
 	uint32_t page_info_capacity;
 	/** Xlog to write data. */
 	struct xlog data_xlog;
-	/** Bloom filter. */
-	struct tuple_bloom_builder *bloom;
+	/**
+	 * Buffer of accumulated 64-bit key hashes. Finalized into
+	 * a binary fuse8 filter when the run is committed.
+	 */
+	struct ibuf fuse_hashes;
 	/** Buffer of a current page row offsets. */
 	struct ibuf row_index_buf;
 	/**

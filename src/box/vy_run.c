@@ -289,6 +289,11 @@ vy_run_clear(struct vy_run *run)
 		tuple_bloom_delete(run->info.bloom);
 		run->info.bloom = NULL;
 	}
+	if (run->info.fuse != NULL) {
+		binary_fuse8_free(run->info.fuse);
+		free(run->info.fuse);
+		run->info.fuse = NULL;
+	}
 	free(run->info.min_key);
 	run->info.min_key = NULL;
 	free(run->info.max_key);
@@ -311,7 +316,49 @@ vy_run_delete(struct vy_run *run)
 size_t
 vy_run_bloom_size(struct vy_run *run)
 {
-	return run->info.bloom == NULL ? 0 : tuple_bloom_size(run->info.bloom);
+	size_t size = 0;
+	if (run->info.bloom != NULL)
+		size += tuple_bloom_size(run->info.bloom);
+	if (run->info.fuse != NULL)
+		size += binary_fuse8_size_in_bytes(run->info.fuse);
+	return size;
+}
+
+/**
+ * Build a binary fuse8 filter from an array of @a count 64-bit
+ * key hashes and store it in @a run_info->fuse. The run-level
+ * filter is best-effort: if there are fewer than 2 hashes, or
+ * if allocation or population fails, the filter is left unset
+ * and the function returns 0. The caller-side query path
+ * silently falls through to a normal page lookup when the
+ * filter is missing, so the caller does not need to react to
+ * this case.
+ */
+static int
+vy_run_info_build_fuse(struct vy_run_info *run_info,
+		       uint64_t *hashes, size_t count)
+{
+	assert(run_info->fuse == NULL);
+	if (count < 2) {
+		say_verbose("fuse filter skipped: %zu hashes", count);
+		return 0;
+	}
+	binary_fuse8_t *filter = xmalloc(sizeof(*filter));
+	if (!binary_fuse8_allocate((uint32_t)count, filter)) {
+		say_warn("fuse filter allocation failed for %zu keys",
+			 count);
+		free(filter);
+		return 0;
+	}
+	if (!binary_fuse8_populate(hashes, (uint32_t)count, filter)) {
+		say_warn("fuse filter population failed for %zu keys",
+			 count);
+		binary_fuse8_free(filter);
+		free(filter);
+		return 0;
+	}
+	run_info->fuse = filter;
+	return 0;
 }
 
 /**
@@ -665,6 +712,20 @@ vy_run_info_decode(struct vy_run_info *run_info,
 			run_info->bloom = tuple_bloom_decode(
 				&pos, iproto_to_tuple_bloom_version(key));
 			break;
+		case VY_RUN_INFO_FUSE_FILTER: {
+			uint32_t bin_len = 0;
+			const char *bin = mp_decode_bin(&pos, &bin_len);
+			run_info->fuse = xmalloc(sizeof(*run_info->fuse));
+			if (!binary_fuse8_deserialize(run_info->fuse, bin)) {
+				diag_set(ClientError, ER_INVALID_INDEX_FILE,
+					 filename,
+					 "Failed to deserialize fuse filter");
+				free(run_info->fuse);
+				run_info->fuse = NULL;
+				return -1;
+			}
+			break;
+		}
 		case VY_RUN_INFO_STMT_STAT:
 			vy_stmt_stat_decode(&run_info->stmt_stat, &pos);
 			break;
@@ -1323,16 +1384,45 @@ vy_run_iterator_seek(struct vy_run_iterator *itr, struct vy_entry last,
 	struct key_def *cmp_def = itr->cmp_def;
 	struct vy_slice *slice = itr->slice;
 	struct tuple_bloom *bloom = slice->run->info.bloom;
+	binary_fuse8_t *fuse = slice->run->info.fuse;
 	struct vy_entry key = itr->key;
 	enum iterator_type iterator_type = itr->iterator_type;
 
 	*ret = vy_entry_none();
 	assert(itr->search_started);
 
-	/* Check the bloom filter on the first iteration. */
-	bool check_bloom = (itr->iterator_type == ITER_EQ &&
-			    itr->curr.stmt == NULL && bloom != NULL);
-	if (check_bloom && !vy_bloom_maybe_has(bloom, itr->key, itr->key_def)) {
+	/*
+	 * Check the run-level filter on the first iteration.
+	 * New runs use a binary fuse8 filter; older runs that
+	 * were recovered from disk may still carry a legacy
+	 * bloom filter.
+	 *
+	 * The fuse filter only stores hashes of full keys, so it
+	 * cannot answer partial-key EQ queries -- they fall
+	 * through to a normal page lookup. The legacy bloom
+	 * filter supports partial-key lookups and is used
+	 * whenever it is present.
+	 */
+	bool check_filter = (itr->iterator_type == ITER_EQ &&
+			     itr->curr.stmt == NULL);
+	bool key_is_full = false;
+	if (check_filter && fuse != NULL && vy_stmt_is_key(itr->key.stmt)) {
+		const char *data = tuple_data(itr->key.stmt);
+		uint32_t part_count = mp_decode_array(&data);
+		key_is_full = (part_count == itr->key_def->part_count);
+	} else if (check_filter && fuse != NULL) {
+		/* A vy_entry tuple always carries the full key. */
+		key_is_full = true;
+	}
+	if (check_filter && fuse != NULL && key_is_full) {
+		uint64_t hash = vy_stmt_hash64(itr->key, itr->key_def);
+		if (!binary_fuse8_contain(hash, fuse)) {
+			vy_run_iterator_stop(itr);
+			itr->stat->bloom_hit++;
+			return 0;
+		}
+	} else if (check_filter && bloom != NULL &&
+		   !vy_bloom_maybe_has(bloom, itr->key, itr->key_def)) {
 		vy_run_iterator_stop(itr);
 		itr->stat->bloom_hit++;
 		return 0;
@@ -1423,7 +1513,7 @@ vy_run_iterator_seek(struct vy_run_iterator *itr, struct vy_entry last,
 	return vy_run_iterator_find_lsn(itr, ret);
 
 not_found:
-	if (check_bloom)
+	if (check_filter)
 		itr->stat->bloom_miss++;
 	vy_run_iterator_stop(itr);
 	return 0;
@@ -1975,6 +2065,12 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 		bloom_key = tuple_bloom_version_to_iproto(
 			run_info->bloom->version);
 	}
+	size_t fuse_size = 0;
+	if (run_info->fuse != NULL) {
+		key_count++;
+		fuse_size = binary_fuse8_serialization_bytes(
+			run_info->fuse);
+	}
 
 	size_t size = mp_sizeof_map(key_count);
 	size += mp_sizeof_uint(VY_RUN_INFO_MIN_KEY) + min_key_size;
@@ -1988,6 +2084,9 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 	if (run_info->bloom != NULL)
 		size += mp_sizeof_uint(bloom_key) +
 			tuple_bloom_size(run_info->bloom);
+	if (run_info->fuse != NULL)
+		size += mp_sizeof_uint(VY_RUN_INFO_FUSE_FILTER) +
+			mp_sizeof_binl(fuse_size) + fuse_size;
 	size += mp_sizeof_uint(VY_RUN_INFO_STMT_STAT) +
 		vy_stmt_stat_sizeof(&run_info->stmt_stat);
 
@@ -2015,6 +2114,12 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 	if (run_info->bloom != NULL) {
 		pos = mp_encode_uint(pos, bloom_key);
 		pos = tuple_bloom_encode(run_info->bloom, pos);
+	}
+	if (run_info->fuse != NULL) {
+		pos = mp_encode_uint(pos, VY_RUN_INFO_FUSE_FILTER);
+		pos = mp_encode_binl(pos, fuse_size);
+		binary_fuse8_serialize(run_info->fuse, pos);
+		pos += fuse_size;
 	}
 	pos = mp_encode_uint(pos, VY_RUN_INFO_STMT_STAT);
 	pos = vy_stmt_stat_encode(&run_info->stmt_stat, pos);
@@ -2117,12 +2222,9 @@ vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 	writer->cmp_def = cmp_def;
 	writer->key_def = key_def;
 	writer->index_opts = *index_opts;
-	if (writer->index_opts.bloom_fpr < 1) {
-		writer->bloom = tuple_bloom_builder_new(key_def->part_count);
-		if (writer->bloom == NULL)
-			return -1;
-	}
 	xlog_clear(&writer->data_xlog);
+	ibuf_create(&writer->fuse_hashes, &cord()->slabc,
+		    4096 * sizeof(uint64_t));
 	ibuf_create(&writer->row_index_buf, &cord()->slabc,
 		    4096 * sizeof(uint32_t));
 	lcp_builder_init(&writer->lcp_index_builder, &run->lcp_index);
@@ -2208,9 +2310,14 @@ vy_run_writer_start_page(struct vy_run_writer *writer,
 static int
 vy_run_writer_write_to_page(struct vy_run_writer *writer, struct vy_entry entry)
 {
-	if (writer->bloom != NULL &&
-	    vy_bloom_builder_add(writer->bloom, entry, writer->key_def) != 0)
+	uint64_t *hash = (uint64_t *)ibuf_alloc(&writer->fuse_hashes,
+						sizeof(uint64_t));
+	if (hash == NULL) {
+		diag_set(OutOfMemory, sizeof(uint64_t), "ibuf",
+			 "fuse hashes");
 		return -1;
+	}
+	*hash = vy_stmt_hash64(entry, writer->key_def);
 	if (writer->last.stmt != NULL)
 		vy_stmt_unref_if_possible(writer->last.stmt);
 	writer->last = entry;
@@ -2308,8 +2415,7 @@ vy_run_writer_destroy(struct vy_run_writer *writer, bool reuse_fd)
 		vy_stmt_unref_if_possible(writer->last.stmt);
 	if (xlog_is_open(&writer->data_xlog))
 		xlog_close(&writer->data_xlog, reuse_fd);
-	if (writer->bloom != NULL)
-		tuple_bloom_builder_delete(writer->bloom);
+	ibuf_destroy(&writer->fuse_hashes);
 	ibuf_destroy(&writer->row_index_buf);
 	lcp_builder_destroy(&writer->lcp_index_builder);
 }
@@ -2354,9 +2460,11 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 	    xlog_rename(&writer->data_xlog) < 0)
 		goto out;
 
-	if (writer->bloom != NULL)
-		run->info.bloom = tuple_bloom_new(writer->bloom,
-						  writer->index_opts.bloom_fpr);
+	uint64_t *hashes = (uint64_t *)writer->fuse_hashes.rpos;
+	size_t hash_count = ibuf_used(&writer->fuse_hashes) /
+			    sizeof(uint64_t);
+	if (vy_run_info_build_fuse(&run->info, hashes, hash_count) != 0)
+		goto out;
 
 	if (lcp_builder_finish(&writer->lcp_index_builder) != 0) {
 		diag_set(OutOfMemory, 0, "malloc", "lcp index");
@@ -2395,9 +2503,11 @@ int
 vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		     uint32_t space_id, uint32_t iid,
 		     struct key_def *cmp_def, struct key_def *key_def,
-		     struct tuple_format *format, const struct index_opts *opts)
+		     struct tuple_format *format,
+		     const struct index_opts *opts MAYBE_UNUSED)
 {
 	assert(run->info.bloom == NULL);
+	assert(run->info.fuse == NULL);
 	assert(run->page_info == NULL);
 	struct region *region = &fiber()->gc;
 	size_t mem_used = region_used(region);
@@ -2422,12 +2532,9 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	struct tuple *prev_tuple = NULL;
 	bool is_page_start = true;
 
-	struct tuple_bloom_builder *bloom_builder = NULL;
-	if (opts->bloom_fpr < 1) {
-		bloom_builder = tuple_bloom_builder_new(key_def->part_count);
-		if (bloom_builder == NULL)
-			goto close_err;
-	}
+	struct ibuf fuse_hashes;
+	ibuf_create(&fuse_hashes, &cord()->slabc,
+		    4096 * sizeof(uint64_t));
 
 	off_t page_offset, next_page_offset = xlog_cursor_pos(&cursor);
 	while ((rc = xlog_cursor_next_tx(&cursor)) == 0) {
@@ -2453,14 +2560,16 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 			struct tuple *tuple = vy_stmt_decode(&xrow, format);
 			if (tuple == NULL)
 				goto close_err;
-			if (bloom_builder != NULL) {
-				struct vy_entry entry = {tuple, HINT_NONE};
-				if (vy_bloom_builder_add(bloom_builder, entry,
-							 key_def) != 0) {
-					tuple_unref(tuple);
-					goto close_err;
-				}
+			uint64_t *hash = (uint64_t *)ibuf_alloc(
+				&fuse_hashes, sizeof(uint64_t));
+			if (hash == NULL) {
+				diag_set(OutOfMemory, sizeof(uint64_t),
+					 "ibuf", "fuse hashes");
+				tuple_unref(tuple);
+				goto close_err;
 			}
+			struct vy_entry entry = {tuple, HINT_NONE};
+			*hash = vy_stmt_hash64(entry, key_def);
 			key = vy_stmt_is_key(tuple) ? tuple_data(tuple) :
 			      tuple_extract_key(tuple, cmp_def,
 						MULTIKEY_NONE, NULL);
@@ -2513,12 +2622,11 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	run->fd = cursor.fd;
 	xlog_cursor_close(&cursor, true);
 
-	if (bloom_builder != NULL) {
-		run->info.bloom = tuple_bloom_new(bloom_builder,
-						  opts->bloom_fpr);
-		tuple_bloom_builder_delete(bloom_builder);
-		bloom_builder = NULL;
-	}
+	uint64_t *hashes = (uint64_t *)fuse_hashes.rpos;
+	size_t hash_count = ibuf_used(&fuse_hashes) / sizeof(uint64_t);
+	if (vy_run_info_build_fuse(&run->info, hashes, hash_count) != 0)
+		goto close_err;
+	ibuf_destroy(&fuse_hashes);
 
 	/* New run index is ready for write, unlink old file if exists */
 	vy_run_snprint_path(path, sizeof(path), dir,
@@ -2534,8 +2642,7 @@ close_err:
 	region_truncate(region, mem_used);
 	if (prev_tuple != NULL)
 		tuple_unref(prev_tuple);
-	if (bloom_builder != NULL)
-		tuple_bloom_builder_delete(bloom_builder);
+	ibuf_destroy(&fuse_hashes);
 	if (xlog_cursor_is_open(&cursor))
 		xlog_cursor_close(&cursor, false);
 	return -1;

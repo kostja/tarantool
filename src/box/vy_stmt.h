@@ -715,6 +715,16 @@ vy_bloom_maybe_has(const struct tuple_bloom *bloom,
 		   struct vy_entry entry, struct key_def *key_def);
 
 /**
+ * Compute a 64-bit hash of the full key of @a entry, suitable
+ * for binary fuse filters. Computed by running two independent
+ * PMurHash32 instances with different seeds over the same
+ * normalized field bytes used by tuple_hash(), then combining
+ * the two 32-bit results into one 64-bit value.
+ */
+uint64_t
+vy_stmt_hash64(struct vy_entry entry, struct key_def *key_def);
+
+/**
  * Encode vy_stmt for a primary key as xrow_header
  *
  * @param value statement to encode
