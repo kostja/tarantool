@@ -183,6 +183,7 @@ set(box_sources
     vy_history.c
     vy_read_set.c
     vy_scheduler.c
+    vy_compaction_plan.c
     vy_regulator.c
     vy_quota.c
     request.c
