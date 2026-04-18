@@ -582,6 +582,31 @@ xlog_tx_rollback(struct xlog *log);
 ssize_t
 xlog_flush(struct xlog *log);
 
+/**
+ * Append a pre-encoded xlog transaction block verbatim to the
+ * log. The input bytes must form a complete xlog tx (fixheader
+ * plus body), as produced by a previous xlog_tx_commit. No tx
+ * may be open on the log (obuf empty).
+ *
+ * Designed for byte-level reuse of compressed pages during
+ * vinyl compaction, where re-encoding an unchanged source page
+ * would waste the decompression and recompression cost.
+ *
+ * @param log        destination xlog (owned by the caller)
+ * @param data       pointer to the tx block
+ * @param size       size of the block in bytes
+ * @param row_count  number of rows the block contains; counted
+ *                   into log->rows for consistency with the
+ *                   normal write path
+ *
+ * @retval >= 0      bytes written (equals size on success)
+ * @retval -1        write error; the file is truncated to its
+ *                   last known good offset
+ */
+ssize_t
+xlog_append_raw(struct xlog *log, const void *data, size_t size,
+		int row_count);
+
 
 /**
  * Sync a log file. The exact action is defined

@@ -2318,6 +2318,183 @@ out:
 	return rc;
 }
 
+int
+vy_run_writer_copy_page_range(struct vy_run_writer *writer,
+			      struct vy_slice *src,
+			      uint32_t first_page, uint32_t last_page)
+{
+	struct vy_run *src_run = src->run;
+	struct vy_run *out_run = writer->run;
+	size_t region_svp = region_used(&fiber()->gc);
+
+	/*
+	 * Pages inside the range must already be finalised on the
+	 * source. Dictionary compatibility is a precondition of
+	 * the copy: the destination's zstd decoder uses the
+	 * output run's dict, and the compressed bytes were
+	 * emitted against the source run's dict.
+	 */
+	assert(first_page <= last_page);
+	assert(last_page < src_run->info.page_count);
+	assert(src_run->dict == out_run->dict);
+
+	/* The caller must not mix copy with an open tuple-level
+	 * tx. vy_run_writer_append_stmt buffers a page in
+	 * row_index_buf + data_xlog.obuf; flushing it first keeps
+	 * the on-disk order consistent with the writer's internal
+	 * page_info sequence. */
+	if (ibuf_used(&writer->row_index_buf) != 0 &&
+	    vy_run_writer_end_page(writer) != 0)
+		goto err;
+
+	if (!xlog_is_open(&writer->data_xlog) &&
+	    vy_run_writer_create_xlog(writer) != 0)
+		goto err;
+
+	ZSTD_DStream *zdctx = vy_env_get_zdctx(src_run->env);
+	if (zdctx == NULL)
+		goto err;
+
+	for (uint32_t page_no = first_page; page_no <= last_page; page_no++) {
+		struct vy_page_info *src_page =
+			vy_run_page_info(src_run, page_no);
+		size_t page_svp = region_used(&fiber()->gc);
+
+		/*
+		 * Grow the output's page_info array first so we
+		 * know the target slot is valid before touching
+		 * the file.
+		 */
+		if (out_run->info.page_count >= writer->page_info_capacity &&
+		    vy_run_alloc_page_info(out_run,
+					   &writer->page_info_capacity) != 0)
+			goto err;
+		struct vy_page_info *out_page =
+			&out_run->page_info[out_run->info.page_count];
+		vy_page_info_create(out_page, writer->data_xlog.offset);
+
+		/*
+		 * Load the page: the same read serves both the
+		 * raw-byte copy to the output and the tuple
+		 * decode for bloom and stat accounting.
+		 */
+		struct vy_page *page = vy_page_new(src_page);
+		if (page == NULL)
+			goto err;
+		if (vy_page_read(page, src_page, src_run, zdctx) != 0) {
+			vy_page_delete(page);
+			goto err;
+		}
+
+		/*
+		 * Re-read the compressed bytes for verbatim
+		 * append. Going back to the file here costs one
+		 * cached read but keeps vy_page_read's API
+		 * unchanged; a later refactor can return both.
+		 */
+		char *raw = (char *)region_alloc(&fiber()->gc,
+						 src_page->size);
+		if (raw == NULL) {
+			diag_set(OutOfMemory, src_page->size,
+				 "region gc", "page copy");
+			vy_page_delete(page);
+			goto err;
+		}
+		ssize_t readen = fio_pread(src_run->fd, raw,
+					   src_page->size,
+					   src_page->offset);
+		if (readen != (ssize_t)src_page->size) {
+			if (readen < 0)
+				diag_set(SystemError,
+					 "failed to read from file");
+			else
+				diag_set(ClientError, ER_INVALID_RUN_FILE,
+					 "Unexpected end of file");
+			vy_page_delete(page);
+			goto err;
+		}
+		ssize_t written = xlog_append_raw(&writer->data_xlog, raw,
+						  src_page->size,
+						  src_page->row_count);
+		if (written < 0) {
+			vy_page_delete(page);
+			goto err;
+		}
+
+		out_page->unpacked_size = src_page->unpacked_size;
+		out_page->size = src_page->size;
+		out_page->row_count = src_page->row_count;
+		out_page->row_index_offset = src_page->row_index_offset;
+
+		/*
+		 * Walk the page's tuples to fold them into the
+		 * output's per-type stats, LSN range, and bloom.
+		 * The lcp index takes the first key, matching
+		 * vy_run_writer_start_page.
+		 */
+		for (uint32_t i = 0; i < page->row_count; i++) {
+			struct vy_entry entry = vy_page_stmt(page, i,
+					writer->cmp_def, NULL);
+			if (entry.stmt == NULL) {
+				vy_page_delete(page);
+				goto err;
+			}
+			if (i == 0) {
+				const char *key = vy_stmt_is_key(entry.stmt) ?
+					tuple_data(entry.stmt) :
+					tuple_extract_key(entry.stmt,
+							  writer->cmp_def,
+							  vy_entry_multikey_idx(
+								entry,
+								writer->cmp_def),
+							  NULL);
+				if (key == NULL) {
+					vy_stmt_unref_if_possible(entry.stmt);
+					vy_page_delete(page);
+					goto err;
+				}
+				if (out_run->info.page_count == 0 &&
+				    out_run->info.min_key == NULL)
+					out_run->info.min_key = mp_dup(key);
+				lcp_builder_add_mp(&writer->lcp_index_builder,
+						   key);
+			}
+			if (writer->bloom != NULL &&
+			    vy_bloom_builder_add(writer->bloom, entry,
+						 writer->key_def) != 0) {
+				vy_stmt_unref_if_possible(entry.stmt);
+				vy_page_delete(page);
+				goto err;
+			}
+			int64_t lsn = vy_stmt_lsn(entry.stmt);
+			out_run->info.min_lsn = MIN(out_run->info.min_lsn, lsn);
+			out_run->info.max_lsn = MAX(out_run->info.max_lsn, lsn);
+			vy_stmt_stat_acct(&out_run->info.stmt_stat,
+					  vy_stmt_type(entry.stmt));
+
+			if (page_no == last_page &&
+			    i == page->row_count - 1) {
+				if (writer->last.stmt != NULL)
+					vy_stmt_unref_if_possible(
+						writer->last.stmt);
+				writer->last = entry;
+			} else {
+				vy_stmt_unref_if_possible(entry.stmt);
+			}
+		}
+		vy_page_delete(page);
+
+		out_run->info.page_count++;
+		vy_run_acct_page(out_run, out_page);
+		region_truncate(&fiber()->gc, page_svp);
+	}
+	region_truncate(&fiber()->gc, region_svp);
+	return 0;
+err:
+	region_truncate(&fiber()->gc, region_svp);
+	return -1;
+}
+
 /**
  * Destroy a run writer.
  * @param writer Writer to destroy.

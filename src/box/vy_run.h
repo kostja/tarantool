@@ -744,6 +744,33 @@ int
 vy_run_writer_append_stmt(struct vy_run_writer *writer, struct vy_entry entry);
 
 /**
+ * Copy a contiguous range of pages from a source slice into the
+ * destination run verbatim, without decompressing and re-encoding
+ * the page bodies. For each copied page, the page's tuples are
+ * decoded to update the output bloom, per-type stats, and LSN
+ * range, while the compressed body is appended byte-for-byte.
+ *
+ * The source run's dictionary must match the destination's; the
+ * caller is responsible for checking this before invoking.
+ *
+ * The planner never emits copy segments for the pages that
+ * straddle a range boundary, so the copied pages' key range is
+ * always fully contained in the destination's range.
+ *
+ * @param writer      destination run writer
+ * @param src         source slice (provides run + page ids)
+ * @param first_page  inclusive first page id within the slice
+ * @param last_page   inclusive last page id within the slice
+ *
+ * @retval  0  success
+ * @retval -1  memory, I/O, or format error (diag is set)
+ */
+int
+vy_run_writer_copy_page_range(struct vy_run_writer *writer,
+			      struct vy_slice *src,
+			      uint32_t first_page, uint32_t last_page);
+
+/**
  * Finalize run writing by writing run index into file. The writer
  * is deleted after call.
  * @param writer Run writer.

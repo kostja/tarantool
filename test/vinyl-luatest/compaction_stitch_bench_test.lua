@@ -55,7 +55,7 @@ g.test_sensor_tail_append = function(cg)
             end
         end
         box.snapshot()
-        local disk_mb = tonumber(s.index.pk:stat().disk.count.bytes) /
+        local disk_mb = tonumber(s.index.pk:stat().disk.bytes) /
                         1024 / 1024
         log.info('sensor_bench: populate %d sensors x %d tuples ' ..
                  'in %.1fs, disk=%.1fMB',

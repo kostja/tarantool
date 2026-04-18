@@ -1464,6 +1464,41 @@ xlog_flush(struct xlog *log)
 	return xlog_tx_write(log);
 }
 
+ssize_t
+xlog_append_raw(struct xlog *log, const void *data, size_t size,
+		int row_count)
+{
+	/*
+	 * The caller must not mix this with an open tx: the
+	 * underlying obuf would be flushed out of order.
+	 */
+	assert(obuf_size(&log->obuf) == 0);
+
+	ssize_t written = fio_writen(log->fd, data, size);
+	if (written < 0) {
+		/*
+		 * Mirror xlog_tx_write() error recovery: truncate
+		 * back to the last known good offset so the file
+		 * stays consistent.
+		 */
+		if (lseek(log->fd, log->offset, SEEK_SET) < 0 ||
+		    ftruncate(log->fd, log->offset) != 0)
+			panic_syserror("failed to truncate xlog after "
+				       "write error");
+		log->allocated = 0;
+		diag_set(SystemError, "failed to write to '%s' file",
+			 log->filename);
+		return -1;
+	}
+	if (log->allocated > (size_t)written)
+		log->allocated -= written;
+	else
+		log->allocated = 0;
+	log->offset += written;
+	log->rows += row_count;
+	return written;
+}
+
 static int
 sync_cb(eio_req *req)
 {
