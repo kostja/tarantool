@@ -52,6 +52,7 @@
 #include "schema.h"
 #include "xrow.h"
 #include "vy_lsm.h"
+#include "vy_compaction_plan.h"
 #include "vy_log.h"
 #include "vy_mem.h"
 #include "vy_quota.h"
@@ -204,6 +205,12 @@ struct vy_task {
 	 */
 	struct vy_compaction_plan compaction_plan;
 	/**
+	 * Stitch plan: sequence of merge/copy segments describing
+	 * how to produce the new run. Built by
+	 * vy_task_compaction_new() from the compaction plan.
+	 */
+	struct vy_stitch_plan stitch_plan;
+	/**
 	 * Index options may be modified while a task is in
 	 * progress so we save them here to safely access them
 	 * from another thread.
@@ -266,6 +273,7 @@ vy_task_delete(struct vy_task *task)
 {
 	assert(task->deferred_delete_batch == NULL);
 	assert(task->deferred_delete_in_progress == 0);
+	vy_stitch_plan_destroy(&task->stitch_plan);
 	vy_compaction_plan_destroy(&task->compaction_plan);
 	vy_dict_sample_destroy(&task->dict_sample);
 	key_def_delete(task->cmp_def);
@@ -1522,11 +1530,244 @@ err:
 	return -1;
 }
 
+/**
+ * Create an uninitialised bounded sub-slice of @a slice covering
+ * the intersection of the slice's key range with [@a begin, @a end).
+ * Used to feed a write iterator with just the keys inside a given
+ * stitch merge segment; the sub-slice is owned by the caller and
+ * must be vy_slice_delete'd after the iterator closes.
+ *
+ * @param begin  merge segment lower bound (inclusive, NULL = -inf).
+ * @param end    merge segment upper bound (exclusive, NULL = +inf).
+ * @param[out] result  new sub-slice, or NULL if no intersection.
+ *
+ * @retval  0  success (may set *result to NULL).
+ * @retval -1  allocation error.
+ */
+static int
+vy_stitch_sub_slice_new(struct vy_slice *slice,
+			struct vy_entry begin, struct vy_entry end,
+			struct key_def *cmp_def,
+			struct vy_slice **result)
+{
+	*result = NULL;
+	struct vy_run *run = slice->run;
+	if (run->info.page_count == 0)
+		return 0;
+
+	struct vy_entry sub_begin = slice->begin;
+	if (begin.stmt != NULL &&
+	    vy_entry_compare(begin, slice->begin, cmp_def) > 0)
+		sub_begin = begin;
+	struct vy_entry sub_end = slice->end_bound;
+	bool end_clipped = false;
+	if (end.stmt != NULL &&
+	    vy_bound_cmp(end, slice->end_bound, cmp_def) < 0) {
+		sub_end = end;
+		end_clipped = true;
+	}
+	/*
+	 * An empty intersection isn't an error: the caller just
+	 * skips adding this slice to the write iterator.
+	 */
+	if (vy_bound_cmp(sub_begin, sub_end, cmp_def) >= 0)
+		return 0;
+
+	struct vy_slice *sub = vy_slice_new(vy_log_next_id(), run);
+	if (sub == NULL)
+		return -1;
+
+	sub->begin = sub_begin;
+	tuple_ref(sub_begin.stmt);
+	sub->end_bound = sub_end;
+	tuple_ref(sub_end.stmt);
+	if (end_clipped)
+		vy_stmt_set_flags(sub->end_bound.stmt,
+				  VY_STMT_EXCLUSIVE_BOUND);
+
+	bool unused;
+	sub->first_page_no =
+		vy_page_index_find_page(run, sub->begin, cmp_def,
+					ITER_GE, &unused);
+	enum iterator_type itype = vy_entry_is_exclusive(sub->end_bound) ?
+				   ITER_LT : ITER_LE;
+	sub->last_page_no =
+		vy_page_index_find_page(run, sub->end_bound, cmp_def,
+					itype, &unused);
+	/*
+	 * vy_page_index_find_page returns page_count for a search
+	 * that lands past the end of the run; pin both indices to
+	 * the valid range so vy_slice_stream_next's bounds check
+	 * receives in-range page numbers.
+	 */
+	if (sub->first_page_no >= run->info.page_count)
+		sub->first_page_no = run->info.page_count - 1;
+	if (sub->last_page_no >= run->info.page_count)
+		sub->last_page_no = run->info.page_count - 1;
+	assert(sub->last_page_no < run->info.page_count);
+	*result = sub;
+	return 0;
+}
+
+/**
+ * Build a write iterator bounded by [begin, end) over all slices
+ * in the task's compaction plan. The resulting iterator owns the
+ * freshly-allocated sub-slices; they are tracked in @a subs so the
+ * caller can delete them after closing the iterator.
+ */
+static struct vy_stmt_stream *
+vy_stitch_merge_iterator_new(struct vy_task *task,
+			     struct vy_entry begin, struct vy_entry end,
+			     struct vy_slice **subs, int *sub_count)
+{
+	struct vy_lsm *lsm = task->lsm;
+	struct vy_scheduler *scheduler = task->scheduler;
+	struct vy_compaction_plan *plan = &task->compaction_plan;
+
+	struct vy_stmt_stream *wi = vy_write_iterator_new(
+		task->cmp_def, lsm->index_id == 0,
+		plan->is_last_level, scheduler->read_views,
+		lsm->index_id > 0 ? NULL : &task->deferred_delete_handler);
+	if (wi == NULL)
+		return NULL;
+
+	*sub_count = 0;
+	for (int i = 0; i < plan->count; i++) {
+		struct vy_slice *sub;
+		if (vy_stitch_sub_slice_new(plan->slices[i], begin, end,
+					    task->cmp_def, &sub) != 0)
+			goto fail;
+		if (sub == NULL)
+			continue;
+		if (vy_write_iterator_new_slice(wi, sub,
+						lsm->disk_format) != 0) {
+			vy_slice_delete(sub);
+			goto fail;
+		}
+		subs[(*sub_count)++] = sub;
+	}
+	return wi;
+
+fail:
+	for (int i = 0; i < *sub_count; i++)
+		vy_slice_delete(subs[i]);
+	*sub_count = 0;
+	wi->iface->close(wi);
+	return NULL;
+}
+
+/**
+ * Drive a single merge segment: open the bounded iterator, stream
+ * tuples into the run writer, close and free its sub-slices.
+ */
+static int
+vy_task_compaction_run_merge(struct vy_task *task,
+			     struct vy_run_writer *writer,
+			     struct vy_entry begin, struct vy_entry end)
+{
+	enum { YIELD_LOOPS = 32 };
+	struct vy_compaction_plan *plan = &task->compaction_plan;
+	struct vy_slice **subs = calloc(plan->count, sizeof(*subs));
+	if (subs == NULL) {
+		diag_set(OutOfMemory, plan->count * sizeof(*subs),
+			 "calloc", "sub slices");
+		return -1;
+	}
+	int sub_count = 0;
+	struct vy_stmt_stream *wi = vy_stitch_merge_iterator_new(
+		task, begin, end, subs, &sub_count);
+	if (wi == NULL) {
+		free(subs);
+		return -1;
+	}
+
+	int rc = 0;
+	if (wi->iface->start(wi) != 0) {
+		rc = -1;
+		goto stop_wi;
+	}
+	int loops = 0;
+	struct vy_entry entry = vy_entry_none();
+	while ((rc = wi->iface->next(wi, &entry)) == 0 && entry.stmt != NULL) {
+		struct errinj *inj = errinj(ERRINJ_VY_RUN_WRITE_STMT_TIMEOUT,
+					    ERRINJ_DOUBLE);
+		if (inj != NULL && inj->dparam > 0)
+			thread_sleep(inj->dparam);
+		rc = vy_run_writer_append_stmt(writer, entry);
+		if (rc != 0)
+			break;
+		if (++loops % YIELD_LOOPS == 0)
+			fiber_sleep(0);
+		if (fiber_is_cancelled()) {
+			diag_set(FiberIsCancelled);
+			rc = -1;
+			break;
+		}
+	}
+stop_wi:
+	wi->iface->stop(wi);
+	wi->iface->close(wi);
+	for (int i = 0; i < sub_count; i++)
+		vy_slice_delete(subs[i]);
+	free(subs);
+	return rc;
+}
+
+static int
+vy_task_compaction_write_stitched(struct vy_task *task)
+{
+	struct vy_lsm *lsm = task->lsm;
+	struct vy_stitch_plan *stitch = &task->stitch_plan;
+
+	ERROR_INJECT(ERRINJ_VY_RUN_WRITE,
+		     {diag_set(ClientError, ER_INJECTION,
+			       "vinyl dump"); return -1;});
+	ERROR_INJECT_SLEEP(ERRINJ_VY_RUN_WRITE_DELAY);
+
+	struct vy_run_writer writer;
+	if (vy_run_writer_create(&writer, task->new_run, lsm->env->path,
+				 lsm->space_id, lsm->index_id,
+				 task->cmp_def, task->key_def,
+				 &task->index_opts,
+				 &task->dict_sample) != 0)
+		return -1;
+
+	int rc = 0;
+	for (int s = 0; s < stitch->count; s++) {
+		struct vy_stitch_segment *seg = &stitch->segs[s];
+		if (seg->type == VY_STITCH_MERGE) {
+			rc = vy_task_compaction_run_merge(task, &writer,
+							  seg->merge.begin,
+							  seg->merge.end);
+		} else {
+			rc = vy_run_writer_copy_page_range(&writer,
+							   lsm->disk_format,
+							   seg->copy.src,
+							   seg->copy.first_page,
+							   seg->copy.last_page);
+		}
+		if (rc != 0)
+			goto fail_abort;
+		if (fiber_is_cancelled()) {
+			diag_set(FiberIsCancelled);
+			rc = -1;
+			goto fail_abort;
+		}
+	}
+	if (vy_run_writer_commit(&writer) != 0)
+		goto fail_abort;
+	return 0;
+
+fail_abort:
+	vy_run_writer_abort(&writer);
+	return -1;
+}
+
 static int
 vy_task_compaction_execute(struct vy_task *task)
 {
 	ERROR_INJECT_SLEEP(ERRINJ_VY_COMPACTION_DELAY);
-	return vy_task_write_run(task);
+	return vy_task_compaction_write_stitched(task);
 }
 
 static int
@@ -1710,8 +1951,6 @@ vy_task_compaction_complete(struct vy_task *task)
 	scheduler->stat.compaction_output += compaction_output.bytes;
 	scheduler->stat.compaction_time += compaction_time;
 out:
-	/* The iterator has been cleaned up in worker. */
-	task->wi->iface->close(task->wi);
 	vy_scheduler_update_lsm(scheduler, lsm);
 
 	say_verbose("%s: completed compacting range %s",
@@ -1725,9 +1964,6 @@ vy_task_compaction_abort(struct vy_task *task)
 	struct vy_scheduler *scheduler = task->scheduler;
 	struct vy_lsm *lsm = task->lsm;
 	struct vy_range *range = task->range;
-
-	/* The iterator has been cleaned up in worker. */
-	task->wi->iface->close(task->wi);
 
 	/*
 	 * The range is already in the queue if it's an abort of
@@ -1772,22 +2008,9 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 		goto err_run;
 
 	struct vy_compaction_plan *plan = &range->compaction_plan;
-	struct vy_stmt_stream *wi;
-	wi = vy_write_iterator_new(task->cmp_def, lsm->index_id == 0,
-				   plan->is_last_level,
-				   scheduler->read_views,
-				   lsm->index_id > 0 ? NULL :
-				   &task->deferred_delete_handler);
-	if (wi == NULL)
-		goto err_wi;
-
-	struct vy_slice *slice;
 	int32_t dump_count = 0;
 	for (int i = 0; i < plan->count; i++) {
-		slice = plan->slices[i];
-		if (vy_write_iterator_new_slice(wi, slice,
-						lsm->disk_format) != 0)
-			goto err_wi_sub;
+		struct vy_slice *slice = plan->slices[i];
 		new_run->dump_lsn = MAX(new_run->dump_lsn,
 					slice->run->dump_lsn);
 		dump_count += slice->run->dump_count;
@@ -1806,10 +2029,24 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 
 	task->range = range;
 	task->new_run = new_run;
-	task->wi = wi;
 	vy_dict_sample_init(&task->dict_sample, dump_count,
 			    lsm->dict_last.train_period,
 			    new_run->dict);
+
+	/*
+	 * Verbatim page copy is currently gated on major compaction:
+	 * non-last-level outputs can still be shadowed by older slices
+	 * holding different versions of the same keys, so the copied
+	 * pages would resurrect stale tuples. A min_copy_pages
+	 * threshold of 4 damps out the fixed per-segment overhead on
+	 * small overlap gaps without starving genuine page-copy wins.
+	 */
+	int min_copy_pages = plan->is_last_level ? 4 : 0;
+	if (vy_stitch_plan_build(plan->slices, plan->count,
+				 range->begin, range->end,
+				 task->cmp_def, min_copy_pages,
+				 &task->stitch_plan) != 0)
+		goto err_stitch;
 
 	/*
 	 * Remove the range we are going to compact from the heap
@@ -1828,9 +2065,7 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	*p_task = task;
 	return 0;
 
-err_wi_sub:
-	task->wi->iface->close(wi);
-err_wi:
+err_stitch:
 	vy_run_discard(new_run);
 err_run:
 	vy_task_delete(task);

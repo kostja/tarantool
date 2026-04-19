@@ -2320,6 +2320,7 @@ out:
 
 int
 vy_run_writer_copy_page_range(struct vy_run_writer *writer,
+			      struct tuple_format *disk_format,
 			      struct vy_slice *src,
 			      uint32_t first_page, uint32_t last_page)
 {
@@ -2434,7 +2435,7 @@ vy_run_writer_copy_page_range(struct vy_run_writer *writer,
 		 */
 		for (uint32_t i = 0; i < page->row_count; i++) {
 			struct vy_entry entry = vy_page_stmt(page, i,
-					writer->cmp_def, NULL);
+					writer->cmp_def, disk_format);
 			if (entry.stmt == NULL) {
 				vy_page_delete(page);
 				goto err;

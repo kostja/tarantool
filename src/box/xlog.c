@@ -1474,8 +1474,12 @@ xlog_append_raw(struct xlog *log, const void *data, size_t size,
 	 */
 	assert(obuf_size(&log->obuf) == 0);
 
-	ssize_t written = fio_writen(log->fd, data, size);
-	if (written < 0) {
+	/*
+	 * fio_writen returns 0 on success (it retries short writes
+	 * internally) or -1 on error. The byte count isn't returned,
+	 * so we advance offset/allocated by @a size on success.
+	 */
+	if (fio_writen(log->fd, data, size) < 0) {
 		/*
 		 * Mirror xlog_tx_write() error recovery: truncate
 		 * back to the last known good offset so the file
@@ -1490,13 +1494,13 @@ xlog_append_raw(struct xlog *log, const void *data, size_t size,
 			 log->filename);
 		return -1;
 	}
-	if (log->allocated > (size_t)written)
-		log->allocated -= written;
+	if (log->allocated > size)
+		log->allocated -= size;
 	else
 		log->allocated = 0;
-	log->offset += written;
+	log->offset += size;
 	log->rows += row_count;
-	return written;
+	return size;
 }
 
 static int

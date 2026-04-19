@@ -757,16 +757,19 @@ vy_run_writer_append_stmt(struct vy_run_writer *writer, struct vy_entry entry);
  * straddle a range boundary, so the copied pages' key range is
  * always fully contained in the destination's range.
  *
- * @param writer      destination run writer
- * @param src         source slice (provides run + page ids)
- * @param first_page  inclusive first page id within the slice
- * @param last_page   inclusive last page id within the slice
+ * @param writer       destination run writer
+ * @param disk_format  format used to reify REPLACE/UPSERT tuples
+ *                     for bloom and stats accounting
+ * @param src          source slice (provides run + page ids)
+ * @param first_page   inclusive first page id within the slice
+ * @param last_page    inclusive last page id within the slice
  *
  * @retval  0  success
  * @retval -1  memory, I/O, or format error (diag is set)
  */
 int
 vy_run_writer_copy_page_range(struct vy_run_writer *writer,
+			      struct tuple_format *disk_format,
 			      struct vy_slice *src,
 			      uint32_t first_page, uint32_t last_page);
 
