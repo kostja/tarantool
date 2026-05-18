@@ -384,6 +384,24 @@ enum tuple_flag {
 	tuple_flag_MAX,
 };
 
+#ifndef NDEBUG
+/**
+ * Debug-only: stamp TUPLE_TX_LOCAL on a tuple allocated on the
+ * main (tx) cord. Out-of-line so tuple.h does not need fiber.h
+ * for cord_is_main_dont_create().
+ */
+void
+tuple_set_tx_local(struct tuple *tuple);
+
+/**
+ * Debug-only: assert that a TX-local tuple's refcount is only
+ * touched on the main cord. Out-of-line so the inline tuple_ref /
+ * tuple_unref do not pull in fiber.h.
+ */
+void
+tuple_assert_tx_local(struct tuple *tuple);
+#endif
+
 /**
  * An atom of Tarantool storage. Represents MsgPack Array.
  * Tuple has the following structure:
