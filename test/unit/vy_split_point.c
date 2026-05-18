@@ -70,7 +70,7 @@ vy_bound_new_i64(int64_t value, bool exclusive)
 {
 	struct vy_entry e = vy_key_new_i64(value);
 	if (exclusive)
-		vy_stmt_set_flags(e.stmt, VY_STMT_EXCLUSIVE_BOUND);
+		vy_stmt_add_flag(e.stmt, VY_STMT_EXCLUSIVE_BOUND);
 	return e;
 }
 

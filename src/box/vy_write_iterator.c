@@ -944,8 +944,7 @@ vy_read_view_merge(struct vy_write_iterator *stream, struct vy_entry prev,
 			if (rv->entry.stmt == NULL)
 				return -1;
 		}
-		vy_stmt_set_flags(rv->entry.stmt,
-				  flags & ~VY_STMT_DEFERRED_DELETE);
+		vy_stmt_del_flag(rv->entry.stmt, VY_STMT_DEFERRED_DELETE);
 	}
 	if (prev.stmt != NULL) {
 		/* Not the first statement. */

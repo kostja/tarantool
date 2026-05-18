@@ -1983,7 +1983,7 @@ vy_delete(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 		if (delete == NULL)
 			return -1;
 		if (space->index_count > 1)
-			vy_stmt_set_flags(delete, VY_STMT_DEFERRED_DELETE);
+			vy_stmt_add_flag(delete, VY_STMT_DEFERRED_DELETE);
 		vy_lsm_probe_blind_write(pk, delete);
 		rc = vy_tx_set(tx, pk, delete);
 	}
@@ -2040,7 +2040,7 @@ vy_perform_update(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 			       column_mask) != 0)
 		return -1;
 
-	vy_stmt_set_flags(stmt->new_tuple, VY_STMT_UPDATE);
+	vy_stmt_add_flag(stmt->new_tuple, VY_STMT_UPDATE);
 
 	if (vy_tx_set(tx, pk, stmt->new_tuple) != 0)
 		return -1;
@@ -2528,7 +2528,7 @@ vy_replace(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 			vy_stmt_set_type(stmt->new_tuple, IPROTO_INSERT);
 		}
 	} else if (space->index_count > 1) {
-		vy_stmt_set_flags(stmt->new_tuple, VY_STMT_DEFERRED_DELETE);
+		vy_stmt_add_flag(stmt->new_tuple, VY_STMT_DEFERRED_DELETE);
 	}
 	/*
 	 * Replace in the primary index without explicit deletion
@@ -4751,7 +4751,7 @@ vy_deferred_delete_on_replace(struct trigger *trigger, void *event)
 	 * flag, which makes the read iterator ignore them.
 	 */
 	vy_stmt_set_lsn(delete, lsn);
-	vy_stmt_set_flags(delete, VY_STMT_SKIP_READ);
+	vy_stmt_add_flag(delete, VY_STMT_SKIP_READ);
 
 	/* Insert the deferred DELETE into secondary indexes. */
 	int rc = 0;

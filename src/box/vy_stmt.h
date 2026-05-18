@@ -282,6 +282,7 @@ vy_stmt_flags(struct tuple *stmt)
 static inline void
 vy_stmt_set_flags(struct tuple *stmt, uint8_t flags)
 {
+	assert(flags == 0 || ((struct vy_stmt *)stmt)->flags == 0);
 	((struct vy_stmt *)stmt)->flags = flags;
 }
 
@@ -290,6 +291,13 @@ static inline void
 vy_stmt_add_flag(struct tuple *stmt, uint8_t flag)
 {
 	((struct vy_stmt *)stmt)->flags |= flag;
+}
+
+/** Clear one or more flags in the vinyl statement's flag word. */
+static inline void
+vy_stmt_del_flag(struct tuple *stmt, uint8_t flag)
+{
+	((struct vy_stmt *)stmt)->flags &= ~flag;
 }
 
 /** Check if the entry has VY_STMT_EXCLUSIVE_BOUND flag set. */

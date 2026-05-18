@@ -477,10 +477,9 @@ vy_tx_handle_deferred_delete(struct vy_tx *tx, struct txv *v)
 {
 	struct vy_lsm *pk = v->lsm;
 	struct tuple *stmt = v->entry.stmt;
-	uint8_t flags = vy_stmt_flags(stmt);
 
 	assert(pk->index_id == 0);
-	assert(flags & VY_STMT_DEFERRED_DELETE);
+	assert(vy_stmt_flags(stmt) & VY_STMT_DEFERRED_DELETE);
 
 	struct space *space = space_cache_find(pk->space_id);
 	if (space == NULL) {
@@ -511,7 +510,7 @@ vy_tx_handle_deferred_delete(struct vy_tx *tx, struct txv *v)
 	 * If a terminal statement is found, we can produce
 	 * DELETE right away so clear the flag now.
 	 */
-	vy_stmt_set_flags(stmt, flags & ~VY_STMT_DEFERRED_DELETE);
+	vy_stmt_del_flag(stmt, VY_STMT_DEFERRED_DELETE);
 
 	if (vy_stmt_type(overwritten.stmt) == IPROTO_DELETE) {
 		/* The tuple's already deleted, nothing to do. */
@@ -665,11 +664,8 @@ vy_tx_prepare(struct vy_tx *tx)
 			 * overwritten so no need to generate a deferred
 			 * DELETE for secondary indexes.
 			 */
-			uint8_t flags = vy_stmt_flags(v->entry.stmt);
-			if (flags & VY_STMT_DEFERRED_DELETE) {
-				vy_stmt_set_flags(v->entry.stmt, flags &
-						  ~VY_STMT_DEFERRED_DELETE);
-			}
+			vy_stmt_del_flag(v->entry.stmt,
+					 VY_STMT_DEFERRED_DELETE);
 		}
 
 		if (!v->is_first_insert && type == IPROTO_INSERT) {
@@ -1018,11 +1014,8 @@ vy_tx_set_entry(struct vy_tx *tx, struct vy_lsm *lsm, struct vy_entry entry)
 		 * statement so as to generate a DELETE for the tuple
 		 * overwritten by this transaction.
 		 */
-		if (vy_stmt_flags(old->entry.stmt) & VY_STMT_DEFERRED_DELETE) {
-			uint8_t flags = vy_stmt_flags(entry.stmt);
-			vy_stmt_set_flags(entry.stmt, flags |
-					  VY_STMT_DEFERRED_DELETE);
-		}
+		if (vy_stmt_flags(old->entry.stmt) & VY_STMT_DEFERRED_DELETE)
+			vy_stmt_add_flag(entry.stmt, VY_STMT_DEFERRED_DELETE);
 	}
 
 	if (old == NULL && vy_stmt_type(entry.stmt) == IPROTO_INSERT)

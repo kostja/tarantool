@@ -423,8 +423,8 @@ vy_range_init_slice(struct vy_range *range, struct vy_slice *slice)
 					  HINT_NONE, range->cmp_def) <= 0) {
 		slice->end_bound = range->end;
 		tuple_ref(range->end.stmt);
-		vy_stmt_set_flags(slice->end_bound.stmt,
-				  VY_STMT_EXCLUSIVE_BOUND);
+		vy_stmt_add_flag(slice->end_bound.stmt,
+				 VY_STMT_EXCLUSIVE_BOUND);
 	} else {
 		slice->end_bound = vy_entry_key_from_msgpack(
 			env->key_format, range->cmp_def,
