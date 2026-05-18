@@ -278,9 +278,10 @@ struct tuple *
 vy_stmt_dup(struct tuple *stmt)
 {
 	/*
-	 * We don't use tuple_new() to avoid the initializing of
-	 * tuple field map. This map can be simple memcopied from
-	 * the original tuple.
+	 * Avoid tuple_new() to skip rebuilding the field offset
+	 * map; copy it verbatim from the source. The base tuple
+	 * header is left as set by tuple_create -- copying it
+	 * would clobber the dup's cord-bound TUPLE_TX_LOCAL flag.
 	 */
 	struct tuple *res = vy_stmt_alloc(tuple_format(stmt),
 					  tuple_data_offset(stmt),
@@ -289,8 +290,9 @@ vy_stmt_dup(struct tuple *stmt)
 		return NULL;
 	assert(tuple_size(res) == tuple_size(stmt));
 	assert(tuple_data_offset(res) == tuple_data_offset(stmt));
-	memcpy(res, stmt, tuple_size(stmt));
-	tuple_ref_init(res, 1);
+	size_t base = sizeof(struct tuple);
+	memcpy((char *)res + base, (char *)stmt + base,
+	       tuple_size(stmt) - base);
 	return res;
 }
 

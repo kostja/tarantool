@@ -295,6 +295,22 @@ tuple_bigref_tuple_count()
 	return tuple_uploaded_refs->size;
 }
 
+#ifndef NDEBUG
+void
+tuple_set_tx_local(struct tuple *tuple)
+{
+	if (cord_is_main_dont_create())
+		tuple->flags |= 1 << TUPLE_TX_LOCAL;
+}
+
+void
+tuple_assert_tx_local(struct tuple *tuple)
+{
+	assert(!tuple_has_flag(tuple, TUPLE_TX_LOCAL) ||
+	       cord_is_main_dont_create());
+}
+#endif
+
 struct tuple_format *
 runtime_tuple_format_new(struct tuple_dictionary *dict)
 {

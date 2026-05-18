@@ -368,8 +368,38 @@ enum tuple_flag {
 	 * immediately while a snapshot is in progress.
 	 */
 	TUPLE_IS_TEMPORARY = 2,
+	/**
+	 * Set in tuple_create() when the allocating cord is main. The
+	 * tuple's refcount may only be modified on the main cord; the
+	 * asserts in tuple_ref / tuple_unref enforce this in debug
+	 * builds. Worker cords (dump / compaction / coio) must never
+	 * tuple_ref or tuple_unref such a tuple -- their mems / caches
+	 * already hold the refs they need, and a cross-cord refcount
+	 * touch on the non-atomic local_refs field is a race.
+	 *
+	 * Set unconditionally in debug builds; never set in release.
+	 */
+	TUPLE_TX_LOCAL = 3,
 	tuple_flag_MAX,
 };
+
+#ifndef NDEBUG
+/**
+ * Debug-only: stamp TUPLE_TX_LOCAL on a tuple allocated on the
+ * main (tx) cord. Out-of-line so tuple.h does not need fiber.h
+ * for cord_is_main_dont_create().
+ */
+void
+tuple_set_tx_local(struct tuple *tuple);
+
+/**
+ * Debug-only: assert that a TX-local tuple's refcount is only
+ * touched on the main cord. Out-of-line so the inline tuple_ref /
+ * tuple_unref do not pull in fiber.h.
+ */
+void
+tuple_assert_tx_local(struct tuple *tuple);
+#endif
 
 /**
  * An atom of Tarantool storage. Represents MsgPack Array.
@@ -515,6 +545,9 @@ tuple_create(struct tuple *tuple, uint8_t refs, uint16_t format_id,
 	assert(data_offset <= INT16_MAX);
 	tuple->local_refs = refs;
 	tuple->flags = 0;
+#ifndef NDEBUG
+	tuple_set_tx_local(tuple);
+#endif
 	tuple->format_id = format_id;
 	if (make_compact) {
 		assert(tuple_can_be_compact(data_offset, bsize));
@@ -1383,6 +1416,9 @@ tuple_acquire_refs(struct tuple *tuple);
 static inline void
 tuple_ref(struct tuple *tuple)
 {
+#ifndef NDEBUG
+	tuple_assert_tx_local(tuple);
+#endif
 	if (unlikely(tuple->local_refs >= TUPLE_LOCAL_REF_MAX))
 		tuple_upload_refs(tuple);
 	tuple->local_refs++;
@@ -1396,6 +1432,9 @@ tuple_ref(struct tuple *tuple)
 static inline void
 tuple_unref(struct tuple *tuple)
 {
+#ifndef NDEBUG
+	tuple_assert_tx_local(tuple);
+#endif
 	assert(tuple->local_refs >= 1);
 	if (--tuple->local_refs == 0) {
 		if (unlikely(tuple_has_flag(tuple, TUPLE_HAS_UPLOADED_REFS)))
