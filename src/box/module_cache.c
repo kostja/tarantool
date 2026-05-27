@@ -4,6 +4,8 @@
  * Copyright 2010-2021, Tarantool AUTHORS, please see AUTHORS file.
  */
 
+#include <errno.h>
+#include <inttypes.h>
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
@@ -24,6 +26,10 @@
 
 #include "lua/utils.h"
 #include "libeio/eio.h"
+#include "coio_task.h"
+
+#include <openssl/evp.h>
+#include <openssl/sha.h>
 
 static struct mh_strnptr_t *module_cache = NULL;
 
@@ -271,14 +277,190 @@ module_attr_fill(struct module_attr *attr, struct stat *st)
 }
 
 /**
- * Copy shared library to temp directory and load from there,
- * then remove it from this temp place leaving in memory. This
- * is because there was a bug in libc which screw file updates
- * detection properly such that next dlopen call simply return
- * a cached version instead of rereading a library from the disk.
+ * coio worker: SHA256 of the file at @a fd. @a out_digest must
+ * have room for SHA256_DIGEST_LENGTH (32) bytes. Reports failure
+ * via errno (read errors keep the syscall's errno; allocation
+ * and crypto failures use ENOMEM / EINVAL). On success returns 0.
  *
- * We keep own copy of file attributes and reload the library
- * on demand.
+ * The fd is rewound to offset 0 before reading. After the call
+ * its position is at end-of-file; callers that want to re-read
+ * via the same fd must lseek().
+ */
+static ssize_t
+module_file_sha256_f(va_list ap)
+{
+	int fd = va_arg(ap, int);
+	unsigned char *out_digest = va_arg(ap, unsigned char *);
+
+	if (lseek(fd, 0, SEEK_SET) == (off_t)-1)
+		return -1;
+
+	EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+	if (ctx == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+		EVP_MD_CTX_free(ctx);
+		errno = EINVAL;
+		return -1;
+	}
+	char buf[64 * 1024];
+	ssize_t n;
+	int read_err = 0;
+	while ((n = read(fd, buf, sizeof(buf))) > 0) {
+		if (EVP_DigestUpdate(ctx, buf, n) != 1) {
+			EVP_MD_CTX_free(ctx);
+			errno = EINVAL;
+			return -1;
+		}
+	}
+	if (n < 0)
+		read_err = errno;
+	unsigned int len = SHA256_DIGEST_LENGTH;
+	int ok = EVP_DigestFinal_ex(ctx, out_digest, &len) == 1;
+	EVP_MD_CTX_free(ctx);
+	if (read_err != 0) {
+		errno = read_err;
+		return -1;
+	}
+	if (!ok) {
+		errno = EINVAL;
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * Compute the SHA256 hash of the file open on @a fd and write it
+ * as a 64-character lowercase hex string into @a out_hex (which
+ * must have room for 64 chars + NUL).
+ *
+ * Hashing a large shared library takes milliseconds so we run it
+ * in a coio worker; the calling fiber yields, the tx event loop
+ * keeps spinning.
+ *
+ * On success returns 0. On failure returns -1 with the diag set.
+ */
+static int
+module_file_sha256(int fd, char *out_hex)
+{
+	unsigned char digest[SHA256_DIGEST_LENGTH];
+	if (coio_call(module_file_sha256_f, fd, digest) < 0) {
+		diag_set(SystemError, "failed to hash module");
+		return -1;
+	}
+	tt_bin2hex(digest, SHA256_DIGEST_LENGTH, out_hex);
+	out_hex[SHA256_DIGEST_LENGTH * 2] = '\0';
+	return 0;
+}
+
+/**
+ * coio worker: sendfile @a source_fd into @a tmp_fd, then fchmod
+ * @a tmp_fd to @a mode. Source position is reset to 0 first so
+ * the worker can be called after the hash worker has read
+ * through the same fd. Reports failure via errno.
+ */
+static ssize_t
+module_copy_f(va_list ap)
+{
+	int source_fd = va_arg(ap, int);
+	int tmp_fd = va_arg(ap, int);
+	off_t size = va_arg(ap, off_t);
+	mode_t mode = va_arg(ap, mode_t);
+
+	if (lseek(source_fd, 0, SEEK_SET) == (off_t)-1)
+		return -1;
+
+	off_t ret = eio_sendfile_sync(tmp_fd, source_fd, 0, size);
+	if (ret != size) {
+		if (errno == 0)
+			errno = EIO;
+		return -1;
+	}
+	if (fchmod(tmp_fd, mode) != 0)
+		return -1;
+	return 0;
+}
+
+/**
+ * Copy the file open on @a source_fd to @a load_name atomically:
+ * mkstemp(3) a sibling, sendfile + fchmod in a coio worker (so
+ * the tx fiber yields for the duration of the copy), then
+ * rename(2) into place. Concurrent tarantool processes that
+ * race to populate the same content-hash cache slot see either
+ * no file or a complete file -- never a torn one.
+ */
+static int
+module_copy(int source_fd, const char *load_name,
+	    const struct stat *st)
+{
+	char tmp_name[PATH_MAX];
+	int rc = snprintf(tmp_name, sizeof(tmp_name), "%s.XXXXXX",
+			  load_name);
+	if (rc < 0 || (size_t)rc >= sizeof(tmp_name)) {
+		diag_set(SystemError, "failed to generate path to dso");
+		return -1;
+	}
+	int dest_fd = mkstemp(tmp_name);
+	if (dest_fd < 0) {
+		diag_set(SystemError, "failed to create temp file %s",
+			 tmp_name);
+		return -1;
+	}
+
+	if (coio_call(module_copy_f, source_fd, dest_fd,
+		      (off_t)st->st_size, (mode_t)(st->st_mode & 0777)) < 0) {
+		diag_set(SystemError, "failed to copy module to %s",
+			 tmp_name);
+		close(dest_fd);
+		unlink(tmp_name);
+		return -1;
+	}
+	close(dest_fd);
+
+	if (rename(tmp_name, load_name) != 0) {
+		diag_set(SystemError, "failed to rename %s to %s",
+			 tmp_name, load_name);
+		unlink(tmp_name);
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * Load a shared library at @a source_path by way of a stable,
+ * content-addressed copy in a per-uid module cache directory.
+ *
+ * We dlopen a copy rather than the original because POSIX makes
+ * no promise that dlclose unloads -- dlopening the same path
+ * with replaced content is UB. Naming the copy after SHA256 of
+ * its content makes "same path" imply "same bytes", so the
+ * second dlopen is safe.
+ *
+ * Threat model
+ * ------------
+ * In scope: local users with a different uid from tarantool's
+ * euid (e.g. tenants on a shared /tmp host).
+ * Out of scope: same-euid users (they already own the process)
+ * and root.
+ *
+ * Defenses:
+ *   1. Cache dir $TMPDIR/tnt-<euid> is mode 0700 owned by euid;
+ *      lstat() verified after mkdir-or-EEXIST to catch a hostile
+ *      pre-creator (symlink, foreign owner, permissive mode).
+ *   2. SHA256 names the cached file by its content, so even if
+ *      (1) is bypassed an attacker cannot fabricate a colliding
+ *      malicious module.
+ *   3. Source opened once; same fd feeds hash and copy -- no
+ *      TOCTOU between them.
+ *   4. Atomic mkstemp + sendfile + fchmod + rename in a coio
+ *      worker; concurrent loaders never see a torn file.
+ *
+ * Residual risks:
+ *   - TOCTOU between the dir lstat and the mkstemp in it; only
+ *     a same-euid attacker can exploit (out of scope).
+ *   - Cached files persist in $TMPDIR -- deliberate, for perf.
  */
 static struct module *
 module_new(const char *package, size_t package_len,
@@ -293,79 +475,99 @@ module_new(const char *package, size_t package_len,
 
 	m->package_len = package_len;
 	m->refs = 0;
-
 	memcpy(m->package, package, package_len);
 	m->package[package_len] = 0;
+
+	/*
+	 * Open the source once. The same fd is used for the hash
+	 * and the copy so they describe the same inode even if the
+	 * file on disk is replaced between the two operations.
+	 */
+	int source_fd = open(source_path, O_RDONLY);
+	if (source_fd < 0) {
+		diag_set(SystemError, "failed to open module: %s",
+			 source_path);
+		goto error_free;
+	}
+
+	struct stat st;
+	if (fstat(source_fd, &st) < 0) {
+		diag_set(SystemError, "failed to fstat() module: %s",
+			 source_path);
+		goto error_close;
+	}
+	module_attr_fill(&m->attr, &st);
+
+	char hex[SHA256_DIGEST_LENGTH * 2 + 1];
+	if (module_file_sha256(source_fd, hex) != 0)
+		goto error_close;
+
 	char *tmpdir = getenv_safe("TMPDIR", NULL, 0);
-	char *print_dir = tmpdir;
-	if (print_dir == NULL)
-		print_dir = "/tmp";
+	const char *print_dir = tmpdir != NULL ? tmpdir : "/tmp";
 
 	char dir_name[PATH_MAX];
-	int rc = snprintf(dir_name, sizeof(dir_name),
-			  "%s/tntXXXXXX", print_dir);
+	int rc = snprintf(dir_name, sizeof(dir_name), "%s/tnt-%u",
+			  print_dir, (unsigned)geteuid());
 	free(tmpdir);
 	if (rc < 0 || (size_t)rc >= sizeof(dir_name)) {
 		diag_set(SystemError, "failed to generate path to tmp dir");
-		goto error;
+		goto error_close;
 	}
 
-	if (mkdtemp(dir_name) == NULL) {
-		diag_set(SystemError, "failed to create unique dir name: %s",
-			 dir_name);
-		goto error;
+	if (mkdir(dir_name, 0700) != 0) {
+		if (errno != EEXIST) {
+			diag_set(SystemError, "failed to create module "
+				 "cache dir: %s", dir_name);
+			goto error_close;
+		}
+		/*
+		 * Pre-existing entry: verify it is actually a directory
+		 * (lstat -- so we never follow a symlink left by another
+		 * user), owned by our euid, with no group/other access.
+		 * Otherwise refuse to use it.
+		 */
+		struct stat ds;
+		if (lstat(dir_name, &ds) != 0) {
+			diag_set(SystemError, "failed to stat module cache "
+				 "dir: %s", dir_name);
+			goto error_close;
+		}
+		if (!S_ISDIR(ds.st_mode) || ds.st_uid != geteuid() ||
+		    (ds.st_mode & 0077) != 0) {
+			diag_set(SystemError, "module cache dir %s is not "
+				 "safe (not a directory, foreign owner, or "
+				 "group/other accessible)", dir_name);
+			goto error_close;
+		}
 	}
 
 	char load_name[PATH_MAX];
 	rc = snprintf(load_name, sizeof(load_name),
-		      "%s/%.*s." TARANTOOL_LIBEXT,
-		      dir_name, (int)package_len, package);
-	if (rc < 0 || (size_t)rc >= sizeof(dir_name)) {
+		      "%s/%.*s.%s." TARANTOOL_LIBEXT,
+		      dir_name, (int)package_len, package, hex);
+	if (rc < 0 || (size_t)rc >= sizeof(load_name)) {
 		diag_set(SystemError, "failed to generate path to dso");
-		goto error;
+		goto error_close;
 	}
 
-	struct stat st;
-	if (stat(source_path, &st) < 0) {
-		diag_set(SystemError, "failed to stat() module: %s",
-			 source_path);
-		goto error;
-	}
-	module_attr_fill(&m->attr, &st);
+	/*
+	 * SHA256 matches imply byte-identical content, so an
+	 * existing file at @a load_name is safe to reuse without
+	 * recopying. The dir's 0700/euid guarantee from above is
+	 * what makes that trust well-founded.
+	 */
+	if (access(load_name, F_OK) != 0 &&
+	    module_copy(source_fd, load_name, &st) != 0)
+		goto error_close;
 
-	int source_fd = open(source_path, O_RDONLY);
-	if (source_fd < 0) {
-		diag_set(SystemError, "failed to open module %s "
-			 "file for reading", source_path);
-		goto error;
-	}
-	int dest_fd = open(load_name, O_WRONLY | O_CREAT | O_TRUNC,
-			   st.st_mode & 0777);
-	if (dest_fd < 0) {
-		diag_set(SystemError, "failed to open file %s "
-			 "for writing ", load_name);
-		close(source_fd);
-		goto error;
-	}
-
-	off_t ret = eio_sendfile_sync(dest_fd, source_fd, 0, st.st_size);
 	close(source_fd);
-	close(dest_fd);
-	if (ret != st.st_size) {
-		diag_set(SystemError, "failed to copy dso %s to %s",
-			 source_path, load_name);
-		goto error;
-	}
+	source_fd = -1;
 
 	m->handle = dlopen(load_name, RTLD_NOW | RTLD_LOCAL);
-	if (unlink(load_name) != 0)
-		say_warn("failed to unlink dso link: %s", load_name);
-	if (rmdir(dir_name) != 0)
-		say_warn("failed to delete temporary dir: %s", dir_name);
 	if (m->handle == NULL) {
 		diag_set(ClientError, ER_LOAD_MODULE, package_len,
 			  package, dlerror());
-		goto error;
+		goto error_free;
 	}
 
 	struct errinj *e = errinj(ERRINJ_DYN_MODULE_COUNT, ERRINJ_INT);
@@ -375,7 +577,9 @@ module_new(const char *package, size_t package_len,
 	module_ref(m);
 	return m;
 
-error:
+error_close:
+	close(source_fd);
+error_free:
 	free(m);
 	return NULL;
 }

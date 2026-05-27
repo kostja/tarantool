@@ -606,6 +606,13 @@ void *
 memrchr(const void *s, int c, size_t n);
 #endif /* HAVE_MEMRCHR */
 
+/**
+ * Convert @a in_size bytes from @a in into 2 * @a in_size lower-
+ * case hex characters in @a out. Does NOT write a NUL terminator.
+ */
+void
+tt_bin2hex(const unsigned char *in, size_t in_size, char *out);
+
 #include <time.h>
 #include <sys/time.h>
 #ifndef HAVE_CLOCK_GETTIME_DECL

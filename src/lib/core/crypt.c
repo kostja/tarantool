@@ -31,19 +31,6 @@
 
 #include <string.h>
 
-/** Convert bytes to hex values. */
-static void
-bytes_to_hex(const uint8_t in[static 16], char out[static 32])
-{
-	static const char *hex = "0123456789abcdef";
-	int q, w;
-
-	for (q = 0, w = 0; q < 16; q++) {
-		out[w++] = hex[(in[q] >> 4) & 0x0F];
-		out[w++] = hex[in[q] & 0x0F];
-	}
-}
-
 /**
  * Calculates the MD5 sum of the bytes in a buffer.
  *
@@ -69,7 +56,7 @@ md5_hash(const void *buf, size_t len, char out[static 32])
 	cryptohash_init(ctx);
 	cryptohash_update(ctx, buf, len);
 	cryptohash_final(ctx, sum, sizeof(sum));
-	bytes_to_hex(sum, out);
+	tt_bin2hex(sum, MD5_DIGEST_LENGTH, out);
 	cryptohash_free(ctx);
 }
 

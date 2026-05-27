@@ -169,6 +169,16 @@ int2str(long long int val)
 	return buf;
 }
 
+void
+tt_bin2hex(const unsigned char *in, size_t in_size, char *out)
+{
+	static const char hex[] = "0123456789abcdef";
+	for (size_t i = 0; i < in_size; i++) {
+		out[2 * i] = hex[(in[i] >> 4) & 0xf];
+		out[2 * i + 1] = hex[in[i] & 0xf];
+	}
+}
+
 #ifndef HAVE_STRLCPY
 size_t
 strlcpy(char *dst, const char *src, size_t size)
