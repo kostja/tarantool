@@ -137,6 +137,20 @@ space_foreach(int (*func)(struct space *sp, void *udata), void *udata)
 	return 0;
 }
 
+static int
+refresh_space_wal_ext_cb(struct space *sp, void *unused)
+{
+	(void)unused;
+	sp->wal_ext = space_wal_ext_by_name(space_name(sp));
+	return 0;
+}
+
+void
+space_cache_refresh_wal_ext(void)
+{
+	space_foreach(refresh_space_wal_ext_cb, NULL);
+}
+
 /**
  * If the @a old_space space is pinned, relink holders of that space to
  * the @a new_space.

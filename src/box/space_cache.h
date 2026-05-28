@@ -133,6 +133,24 @@ int
 space_foreach(int (*func)(struct space *sp, void *udata), void *udata);
 
 /**
+ * Re-bind every existing space's cached wal_ext pointer to
+ * whatever the current global wal_ext configuration says.
+ *
+ * Without this, only spaces created or altered after a dynamic
+ * `box.cfg.wal_ext` change would pick up the new configuration
+ * -- existing spaces would keep their stale pointer for the
+ * rest of their lifetime.
+ *
+ * Safe to call unsynchronized: space_wal_ext_by_name() returns
+ * either NULL or the address of a static singleton, never a
+ * dynamically-allocated object, so an aligned pointer store is
+ * visible atomically and there is no use-after-free risk on
+ * hot-path readers of `space->wal_ext`.
+ */
+void
+space_cache_refresh_wal_ext(void);
+
+/**
  * Update contents of the space cache.
  *
  * If @old_space is NULL, insert @new_space into the cache.

@@ -4,20 +4,76 @@ local replica_set = require('luatest.replica_set')
 
 local g = t.group()
 
-g.test_wal_ext_not_dynamic = function()
-        -- first configure with wal_ext = nil
+g.test_wal_ext_dynamic = function()
+    -- Boot with wal_ext = nil.
     g.server = server:new({ alias = 'master', box_cfg = { wal_ext = nil } })
     g.server:start()
 
     g.server:exec(function()
-        -- then try to change it
-        local res, err = pcall(function()
-            box.cfg { wal_ext = { new_old = true } }
-        end)
+        local fio = require('fio')
+        local xlog = require('xlog').pairs
 
-        -- verify that tarantool refuses to change it
-        t.assert(res == false)
-        t.assert(err:match("Can't set option 'wal_ext' dynamically"))
+        -- Create a space *before* enabling wal_ext; the dynamic
+        -- handler is responsible for re-binding its cached
+        -- wal_ext pointer.
+        local s = box.schema.space.create('test')
+        s:create_index('pk')
+
+        -- Pre-snapshot to anchor what follows in the xlog.
+        box.snapshot()
+
+        local function last_checkpoint_signature()
+            local ck = box.info.gc().checkpoints
+            return ck[#ck].signature
+        end
+        local sig_before = last_checkpoint_signature()
+        -- Write something so the auto-snapshot has new state to
+        -- record (otherwise gc_checkpoint() may no-op).
+        s:replace{0, 'seed'}
+
+        -- Enable wal_ext dynamically. false -> true must
+        -- succeed and must auto-trigger a checkpoint.
+        box.cfg { wal_ext = { new_old = true } }
+        t.assert(last_checkpoint_signature() > sig_before,
+                 'enabling wal_ext must auto-snapshot')
+
+        -- Write into the pre-existing space and verify the
+        -- WAL row carries IPROTO_OLD_TUPLE on UPDATE.
+        s:replace{1, 'a'}
+        s:update({1}, {{'=', 2, 'b'}})
+
+        local last_xlog = fio.glob(
+            fio.pathjoin(box.cfg.wal_dir, '*.xlog'))
+        table.sort(last_xlog)
+        last_xlog = last_xlog[#last_xlog]
+        local rows = {}
+        for _, v in xlog(last_xlog) do
+            table.insert(rows, v)
+        end
+        local update_row
+        for _, v in ipairs(rows) do
+            if v.HEADER.type == 'UPDATE' and
+               v.BODY.space_id == s.id then
+                update_row = v
+                break
+            end
+        end
+        t.assert(update_row ~= nil, 'no UPDATE row in xlog')
+        t.assert(update_row.BODY.old_tuple ~= nil,
+                 'UPDATE row must carry old_tuple after wal_ext flip')
+
+        -- Disabling: also dynamic, but no auto-snapshot.
+        sig_before = last_checkpoint_signature()
+        box.cfg { wal_ext = { new_old = false } }
+        t.assert(last_checkpoint_signature() == sig_before,
+                 'disabling wal_ext must NOT auto-snapshot')
+
+        -- Idempotent re-set: no snapshot.
+        box.cfg { wal_ext = { new_old = false } }
+        t.assert(last_checkpoint_signature() == sig_before,
+                 'unchanged wal_ext must NOT auto-snapshot')
+
+        s:drop()
     end)
 
     g.server:stop()

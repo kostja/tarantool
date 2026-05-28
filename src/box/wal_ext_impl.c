@@ -117,12 +117,19 @@ luaT_wal_ext_config_create(struct lua_State *L, int idx,
 	return 0;
 }
 
+bool
+wal_ext_is_enabled(void)
+{
+	return global_extensions.new_old;
+}
+
 void
 wal_ext_set_cfg(struct wal_extensions_config *ext_config)
 {
-	if (ext_config->new_old)
-		say_info("Enabling new_old WAL extension");
-
+	if (ext_config->new_old != global_extensions.new_old) {
+		say_info("%s new_old WAL extension",
+			 ext_config->new_old ? "Enabling" : "Disabling");
+	}
 	global_extensions = *ext_config;
 }
 

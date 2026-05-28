@@ -29,6 +29,10 @@ luaT_wal_ext_config_create(struct lua_State *L, int idx,
 void
 wal_ext_set_cfg(struct wal_extensions_config *ext_config);
 
+/** True if any WAL extension is currently enabled. */
+bool
+wal_ext_is_enabled(void);
+
 struct space_wal_ext;
 struct txn_stmt;
 struct request;
