@@ -131,6 +131,37 @@ new_module:unload()
 -- Cleanup the generated symlink.
 _ = pcall(fio.unlink(cfunc_path))
 
+--
+-- Fully unload the module, swap the on-disk file, then load again.
+-- This exercises the cache-miss path in module_load (vs the
+-- cache-update path above, where the old module was still live
+-- when the new content arrived). The fresh load goes through
+-- module_new with the new content.
+--
+fio.symlink(cfunc1_path, cfunc_path)
+mod = box.lib.load('cfunc')
+fn = mod:load('cfunc_sum')
+fn(1) -- cfunc1.cfunc_sum accepts any arg count and returns nothing
+fn:unload()
+mod:unload()
+
+-- Replace the file while no live references remain.
+_ = pcall(fio.unlink(cfunc_path))
+fio.symlink(cfunc2_path, cfunc_path)
+
+-- Fresh load. cfunc2.cfunc_sum requires exactly 2 args, so a
+-- single-arg call must error -- proving we are running the new
+-- content, not a stale cached copy.
+mod = box.lib.load('cfunc')
+fn = mod:load('cfunc_sum')
+_, err = pcall(fn, 1)
+assert(err ~= nil)
+fn(1, 2)
+fn:unload()
+mod:unload()
+
+_ = pcall(fio.unlink(cfunc_path))
+
 -- Test double hashing: create function
 -- in box.schema.fun so that it should
 -- appear in box.lib hash.
