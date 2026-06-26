@@ -3870,14 +3870,25 @@ vinyl_index_create_iterator(struct index *base, enum iterator_type type,
 		trigger_add(&tx->on_destroy, &it->on_tx_destroy);
 	} else {
 		tx = &it->tx_autocommit;
-		vy_tx_create(env->xm, tx);
+		/* Read-only autocommit statement; see vy_tx::is_ro_stmt. */
+		vy_tx_create(env->xm, tx, TXN_ISOLATION_SNAPSHOT,
+			     /*is_ro_stmt=*/true);
 	}
 	it->tx = tx;
 
 	lsm->stat.lookup++;
+	/*
+	 * Pass the tx's read view slot, not the view itself. A tx
+	 * assigns its read view lazily, at the first actual read;
+	 * resolving the slot here would freeze the view at iterator
+	 * open and hide a write committed between the open and the
+	 * first read, which memtx iterators do see. This holds for
+	 * explicit transactions as much as for autocommit reads:
+	 * opening an iterator is not yet a read.
+	 */
 	vy_read_iterator_open_after(
 		&it->iterator, lsm, tx, type, it->key, last,
-		vy_tx_read_view(tx));
+		(const struct vy_read_view **)&tx->read_view);
 	return (struct iterator *)it;
 err_pos:
 	tuple_unref(it->key.stmt);
@@ -3903,7 +3914,9 @@ vinyl_index_get(struct index *index, const char *key,
 	struct vy_tx tx_autocommit;
 	if (tx == NULL) {
 		tx = &tx_autocommit;
-		vy_tx_create(env->xm, tx);
+		/* Read-only autocommit statement; see vy_tx::is_ro_stmt. */
+		vy_tx_create(env->xm, tx, TXN_ISOLATION_SNAPSHOT,
+			     /*is_ro_stmt=*/true);
 	}
 	int rc = vy_get_by_raw_key(lsm, tx, vy_tx_read_view(tx),
 				   key, part_count, ret);

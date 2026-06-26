@@ -688,6 +688,106 @@ g.test_read_only_snapshot_no_leak = function(cg)
     end)
 end
 
+-- A read-only autocommit transaction -- an iterator opened outside an
+-- explicit transaction -- runs as snapshot isolation unconditionally, not
+-- the configured default. It takes a point-in-time read view and registers
+-- nothing in the read set, so it does no read tracking, which would be pure
+-- CPU cost for a read that can never conflict.
+g.test_autocommit_readonly_is_snapshot = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        for i = 1, 10 do s:replace{i} end
+
+        -- An autocommit iterator keeps its transaction alive between steps,
+        -- so its read view shows up in box.stat.vinyl(). A snapshot TX takes
+        -- a read view and, by construction, registers nothing in the read
+        -- set; a read-confirmed TX does neither. Measure the delta this
+        -- iterator adds, not the absolute count -- a read view leaked by an
+        -- earlier test would otherwise let a read-confirmed regression pass.
+        local before = box.stat.vinyl().tx.read_views
+
+        local gen, param, state = s:pairs()
+        local tuple
+        state, tuple = gen(param, state)
+        t.assert_not_equals(tuple, nil)
+        local during = box.stat.vinyl().tx.read_views
+
+        -- Drain the iterator before asserting; exhausting it closes the
+        -- autocommit transaction and releases the read view, so a failed
+        -- assertion below can't leak it into later tests.
+        while state ~= nil do
+            state = gen(param, state)
+        end
+
+        t.assert_ge(during - before, 1,
+                    'read-only autocommit iterator runs as snapshot')
+    end)
+end
+
+-- An iterator pins its read view at the first actual read, not at
+-- open. A write committed between the open and the first step is
+-- visible; a write committed after the first step is not.
+g.test_autocommit_iterator_pins_view_at_first_read = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1}
+
+        local gen, param, state = s:pairs()
+        s:replace{2} -- committed before the first read: visible
+        local tuple
+        state, tuple = gen(param, state)
+        t.assert_equals(tuple, {1})
+        s:replace{3} -- committed after the first read: invisible
+        local rest = {}
+        while true do
+            state, tuple = gen(param, state)
+            if state == nil then break end
+            table.insert(rest, tuple)
+        end
+        t.assert_equals(rest, {{2}})
+    end)
+end
+
+-- Same as the previous test, but for an iterator opened inside an
+-- explicit transaction: the transaction's read view is assigned at
+-- its first read, so a write committed after the iterator was opened
+-- but before the transaction read anything is visible to it.
+g.test_explicit_tx_iterator_pins_view_at_first_read = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1}
+
+        local function commit_async(tuple)
+            local ch = fiber.channel(1)
+            fiber.create(function()
+                s:replace(tuple)
+                ch:put(true)
+            end)
+            ch:get()
+        end
+
+        box.begin()
+        local gen, param, state = s:pairs()
+        commit_async({2}) -- before the first read: visible
+        local tuple
+        state, tuple = gen(param, state)
+        t.assert_equals(tuple, {1})
+        commit_async({3}) -- after the first read: invisible
+        local rest = {}
+        while true do
+            state, tuple = gen(param, state)
+            if state == nil then break end
+            table.insert(rest, tuple)
+        end
+        box.commit()
+        t.assert_equals(rest, {{2}})
+    end)
+end
+
 -- ---------------------------------------------------------------
 -- A snapshot TX whose read view is far behind the current LSN
 -- (many concurrent commits happened since it started) must

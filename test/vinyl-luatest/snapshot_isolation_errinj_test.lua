@@ -132,6 +132,51 @@ g.test_errinj_readonly_tx_aborted_on_wal_failure = function(cg)
     end)
 end
 
+-- An implicit (autocommit) read-only statement has no commit point
+-- at which it could be cascade-aborted the way the explicit TX above
+-- is: vinyl serves it from a throwaway transaction that is destroyed
+-- as soon as the read returns. It must therefore take the committed
+-- read view and never observe a concurrent prepared (not yet
+-- committed) write -- otherwise it could return data that is about to
+-- be rolled back.
+g.test_errinj_autocommit_read_excludes_prepared = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'init'}
+        box.snapshot()
+
+        -- TX_A prepares {1, 'doomed'} but its WAL write is delayed.
+        box.error.injection.set('ERRINJ_WAL_DELAY', true)
+        local stmts = box.stat.vinyl().tx.statements
+        local ch_a = fiber.channel(1)
+        fiber.create(function()
+            local ok = pcall(s.replace, s, {1, 'doomed'})
+            ch_a:put(ok)
+        end)
+        -- Wait until the write is prepared and suspended in the delayed
+        -- WAL write: the replace fills the transaction write set
+        -- before committing, and once the statement count grows the
+        -- only yield left on its way is the WAL write itself.
+        t.helpers.retrying({}, function()
+            t.assert_gt(box.stat.vinyl().tx.statements, stmts)
+        end)
+
+        -- Autocommit reads must see the committed value, not the
+        -- prepared one.
+        t.assert_equals(s:get(1), {1, 'init'})
+        t.assert_equals(s:select(), {{1, 'init'}})
+
+        -- Fail TX_A's WAL: the reads were right to ignore it.
+        box.error.injection.set('ERRINJ_WAL_WRITE_DISK', true)
+        box.error.injection.set('ERRINJ_WAL_DELAY', false)
+        t.assert_not(ch_a:get(), 'TX_A must fail WAL')
+        box.error.injection.set('ERRINJ_WAL_WRITE_DISK', false)
+        t.assert_equals(s:get(1), {1, 'init'})
+    end)
+end
+
 -- The autocommit counterpart of the secondary-read cache guard.
 -- An autocommit read through a unique secondary index resolves the
 -- full tuple from the primary index. It runs at the committed read
