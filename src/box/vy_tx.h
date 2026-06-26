@@ -187,6 +187,17 @@ struct vy_tx {
 	size_t write_size;
 	/** Transaction isolation level. */
 	enum txn_isolation_level isolation;
+	/**
+	 * Set for the throwaway tx that serves a read-only autocommit
+	 * statement (the engine-side counterpart of txn_begin_ro_stmt,
+	 * which starts no engine tx for autocommit reads). Such a tx
+	 * takes its snapshot read view at the last committed LSN rather
+	 * than at "read prepared": it never reaches commit to be
+	 * validated or cascade-aborted, so it must not observe the
+	 * statements of concurrent not-yet-committed transactions the
+	 * way a read-write snapshot TX may.
+	 */
+	bool is_ro_stmt;
 	/** Current state of the transaction.*/
 	enum tx_state state;
 	/** Set if the transaction was started by an applier. */
@@ -432,9 +443,14 @@ vy_tx_manager_abort_writers_for_ddl(struct vy_tx_manager *xm,
 void
 vy_tx_manager_abort_writers_for_ro(struct vy_tx_manager *xm);
 
-/** Initialize a tx object. */
+/**
+ * Initialize a tx object with the given isolation level.
+ * is_ro_stmt marks a read-only autocommit statement tx -- see
+ * the field of the same name.
+ */
 void
-vy_tx_create(struct vy_tx_manager *xm, struct vy_tx *tx);
+vy_tx_create(struct vy_tx_manager *xm, struct vy_tx *tx,
+	     enum txn_isolation_level isolation, bool is_ro_stmt);
 
 /** Destroy a tx object. */
 void

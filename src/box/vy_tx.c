@@ -333,15 +333,21 @@ vy_tx_read_set_free_cb(vy_tx_read_set_t *read_set,
 }
 
 void
-vy_tx_create(struct vy_tx_manager *xm, struct vy_tx *tx)
+vy_tx_create(struct vy_tx_manager *xm, struct vy_tx *tx,
+	     enum txn_isolation_level isolation, bool is_ro_stmt)
 {
+	assert(isolation < txn_isolation_level_MAX &&
+	       isolation != TXN_ISOLATION_DEFAULT);
+	/* A read-only autocommit statement is always a snapshot read. */
+	assert(!is_ro_stmt || isolation == TXN_ISOLATION_SNAPSHOT);
 	tx->last_stmt_space = NULL;
 	stailq_create(&tx->log);
 	write_set_new(&tx->write_set);
 	tx->write_set_version = 0;
 	tx->write_size = 0;
 	tx->xm = xm;
-	tx->isolation = TXN_ISOLATION_READ_CONFIRMED;
+	tx->isolation = isolation;
+	tx->is_ro_stmt = is_ro_stmt;
 	tx->state = VINYL_TX_READY;
 	tx->is_applier_session = false;
 	tx->read_view = (struct vy_read_view *)xm->p_global_read_view;
@@ -486,16 +492,13 @@ vy_tx_abort_readers(struct vy_tx *tx, struct txv *v)
 struct vy_tx *
 vy_tx_begin(struct vy_tx_manager *xm, enum txn_isolation_level isolation)
 {
-	assert(isolation < txn_isolation_level_MAX &&
-	       isolation != TXN_ISOLATION_DEFAULT);
 	struct vy_tx *tx = xmempool_alloc(&xm->tx_mempool);
-	vy_tx_create(xm, tx);
+	vy_tx_create(xm, tx, isolation, /*is_ro_stmt=*/false);
 
 	struct session *session = fiber_get_session(fiber());
 	if (session != NULL && session->type == SESSION_TYPE_APPLIER)
 		tx->is_applier_session = true;
 
-	tx->isolation = isolation;
 	/*
 	 * Snapshot TXs start with the global read view. The
 	 * read view is assigned lazily on the first read via
@@ -514,7 +517,15 @@ vy_tx_read_view(struct vy_tx *tx)
 	if (tx->isolation == TXN_ISOLATION_SNAPSHOT &&
 	    tx->read_view->vlsn == INT64_MAX) {
 		struct vy_tx_manager *xm = tx->xm;
-		tx->read_view = vy_tx_manager_read_view(xm, INT64_MAX);
+		/*
+		 * A read-only autocommit statement (is_ro_stmt) takes the
+		 * committed boundary (MAX_LSN -> vlsn = xm->lsn) so it
+		 * observes only committed data; a read-write snapshot TX
+		 * reads prepared (INT64_MAX) so it sees concurrent prepared
+		 * writes and can conflict on them.
+		 */
+		int64_t plsn = tx->is_ro_stmt ? MAX_LSN : INT64_MAX;
+		tx->read_view = vy_tx_manager_read_view(xm, plsn);
 		/*
 		 * Append to tail: xm->lsn is monotonic, so the
 		 * list stays sorted by vlsn. This ordering is
