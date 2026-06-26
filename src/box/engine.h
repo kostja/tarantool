@@ -196,9 +196,11 @@ struct engine_vtab {
 	int (*begin_hot_standby)(struct engine *);
 	/**
 	 * Inform the engine about the end of recovery from the
-	 * binary log.
+	 * binary log. recovery_vclock is the instance vclock the
+	 * recovery (local or remote join) ended at.
 	 */
-	int (*end_recovery)(struct engine *);
+	int (*end_recovery)(struct engine *engine,
+			    const struct vclock *recovery_vclock);
 	/**
 	 * Begin a two-phase checkpoint creation in this
 	 * engine (snapshot is a memtx idea of a checkpoint).
@@ -467,10 +469,11 @@ int
 engine_begin_hot_standby(void);
 
 /**
- * Called at the end of recovery.
+ * Called at the end of recovery. recovery_vclock is the instance
+ * vclock the recovery (local or remote join) ended at.
  */
 int
-engine_end_recovery(void);
+engine_end_recovery(const struct vclock *recovery_vclock);
 
 int
 engine_prepare_join(struct engine_join_ctx *ctx);
@@ -528,7 +531,7 @@ int generic_engine_begin_initial_recovery(struct engine *,
 					  const struct vclock *);
 int generic_engine_begin_final_recovery(struct engine *);
 int generic_engine_begin_hot_standby(struct engine *);
-int generic_engine_end_recovery(struct engine *);
+int generic_engine_end_recovery(struct engine *, const struct vclock *);
 int generic_engine_begin_checkpoint(struct engine *, bool);
 int generic_engine_wait_checkpoint(struct engine *, const struct vclock *);
 void generic_engine_commit_checkpoint(struct engine *, const struct vclock *);
@@ -622,9 +625,9 @@ engine_begin_hot_standby_xc(void)
 }
 
 static inline void
-engine_end_recovery_xc(void)
+engine_end_recovery_xc(const struct vclock *recovery_vclock)
 {
-	if (engine_end_recovery() != 0)
+	if (engine_end_recovery(recovery_vclock) != 0)
 		diag_raise();
 }
 

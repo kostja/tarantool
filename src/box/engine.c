@@ -135,7 +135,7 @@ engine_begin_hot_standby(void)
 }
 
 int
-engine_end_recovery(void)
+engine_end_recovery(const struct vclock *recovery_vclock)
 {
 	recovery_state = FINISHED_RECOVERY;
 	/*
@@ -144,7 +144,7 @@ engine_end_recovery(void)
 	 */
 	struct engine *engine;
 	engine_foreach(engine) {
-		if (engine->vtab->end_recovery(engine) != 0)
+		if (engine->vtab->end_recovery(engine, recovery_vclock) != 0)
 			return -1;
 	}
 	return 0;
@@ -377,9 +377,11 @@ generic_engine_begin_hot_standby(struct engine *engine)
 }
 
 int
-generic_engine_end_recovery(struct engine *engine)
+generic_engine_end_recovery(struct engine *engine,
+			    const struct vclock *recovery_vclock)
 {
 	(void)engine;
+	(void)recovery_vclock;
 	return 0;
 }
 

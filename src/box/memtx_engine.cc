@@ -528,8 +528,10 @@ memtx_engine_begin_hot_standby(struct engine *engine)
 }
 
 static int
-memtx_engine_end_recovery(struct engine *engine)
+memtx_engine_end_recovery(struct engine *engine,
+			  const struct vclock *recovery_vclock)
 {
+	(void)recovery_vclock;
 	struct memtx_engine *memtx = (struct memtx_engine *)engine;
 	/*
 	 * Secondary keys have already been built in the following cases:

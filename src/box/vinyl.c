@@ -3137,7 +3137,8 @@ vinyl_engine_begin_hot_standby(struct engine *engine)
 }
 
 static int
-vinyl_engine_end_recovery(struct engine *engine)
+vinyl_engine_end_recovery(struct engine *engine,
+			  const struct vclock *recovery_vclock)
 {
 	struct vy_env *e = vy_env(engine);
 	switch (e->status) {
@@ -3165,13 +3166,34 @@ vinyl_engine_end_recovery(struct engine *engine)
 		 * because we use it while building an index to
 		 * skip statements inserted after build began -
 		 * see vinyl_space_build_index() - so we reset
-		 * it upon recovery completion.
+		 * it upon recovery completion. recovery_vclock
+		 * is deliberately unused here: local recovery
+		 * saved its own copy at begin_initial_recovery,
+		 * and the two are expected to agree - see
+		 * local_recovery().
 		 */
 		e->xm->lsn = vclock_sum(e->recovery_vclock);
 		e->recovery_vclock = NULL;
 		vy_env_complete_recovery(e);
 		break;
 	case VINYL_FINAL_RECOVERY_REMOTE:
+		/*
+		 * A remote join applies the master's data as ordinary
+		 * inserts, but the WAL is not enabled yet, so every
+		 * transaction is committed with signature 0: the
+		 * statements settle at LSN 0 and vy_tx_manager::lsn
+		 * stays at 0. The state is self-consistent -- a read
+		 * view at vlsn 0 sees all the LSN-0 statements -- but
+		 * the lsn no longer means the instance's committed
+		 * replication position: a restart right after the
+		 * join would recover the same data through the local
+		 * path above and reset the lsn to the join vclock.
+		 * Install the same value here. A remote join has no
+		 * recovery_vclock (begin_initial_recovery is passed
+		 * NULL), so use the vclock passed in, which the join
+		 * has advanced to the master's position.
+		 */
+		e->xm->lsn = vclock_sum(recovery_vclock);
 		break;
 	default:
 		unreachable();
