@@ -1451,7 +1451,6 @@ iterate_over(iter_obj_sp2)
 ---
 - 0: [5]
   1: [6]
-  2: [8]
 ...
 space2:truncate()
 ---
@@ -1465,7 +1464,6 @@ iterate_over(iter_obj_sp3)
 - 0: [4]
   1: [5]
   2: [6]
-  3: [8]
 ...
 space3:truncate()
 ---

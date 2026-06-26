@@ -1003,6 +1003,13 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result)
 {
 	assert(itr->tx == NULL || itr->tx->state == VINYL_TX_READY);
 
+	/*
+	 * Take the read view on the first read for lazy positioning;
+	 * vy_tx_read_view() is a no-op once assigned. See it for details.
+	 */
+	if (itr->tx != NULL)
+		vy_tx_read_view(itr->tx);
+
 	struct vy_entry entry;
 next_key:
 	if (vy_read_iterator_advance(itr) != 0)
