@@ -13,6 +13,9 @@ g.before_all(function(cg)
         box_cfg = {txn_isolation = 'snapshot'},
     })
     cg.server:start()
+    cg.vinyl_cache = cg.server:exec(function()
+        return box.cfg.vinyl_cache
+    end)
 end)
 
 g.after_all(function(cg)
@@ -22,7 +25,7 @@ g.after_all(function(cg)
 end)
 
 g.after_each(function(cg)
-    cg.server:exec(function()
+    cg.server:exec(function(vinyl_cache)
         box.error.injection.set(
             'ERRINJ_VY_POINT_LOOKUP_DELAY', false)
         box.error.injection.set(
@@ -30,10 +33,14 @@ g.after_each(function(cg)
         box.error.injection.set('ERRINJ_WAL_DELAY', false)
         box.error.injection.set('ERRINJ_WAL_IO', false)
         box.error.injection.set('ERRINJ_WAL_WRITE_DISK', false)
+        -- Tests lower vinyl_cache (often to zero, disabling the
+        -- cache); restore the default so later tests exercise
+        -- the cache.
+        box.cfg{vinyl_cache = vinyl_cache}
         if box.space.test ~= nil then
             box.space.test:drop()
         end
-    end)
+    end, {cg.vinyl_cache})
 end)
 
 -- WAL delay: a concurrent TX is prepared but not yet committed.
@@ -1222,13 +1229,13 @@ end
 -- unrelated TX (psn pB > pA) fails its WAL.
 --
 -- Interleaving:
---   1. Writer A prepares key 10 @ pseudo-LSN pA, parks on WAL delay
+--   1. Writer A prepares key 10 @ pseudo-LSN pA, yields on WAL delay
 --      (stays prepared for the whole scenario).
 --   2. Snapshot reader S's first read pins its read view at MAX_LSN + pA
 --      (A is the only prepared TX) -- S "saw" only A.
 --   3. Writer B prepares key 20 @ pseudo-LSN pB > pA, then fails its WAL
 --      synchronously via ERRINJ_WAL_IO (checked in the TX thread, before
---      the delayed WAL pipe, so A stays parked). B's rollback runs the
+--      the delayed WAL pipe, so A stays suspended). B's rollback runs the
 --      cascading abort loop.
 --   4. A's WAL is released and A commits successfully, converting S's
 --      read view to a real LSN.
@@ -1242,7 +1249,7 @@ g.test_unrelated_reader_not_aborted_on_wal_failure = function(cg)
         s:replace{1, 'committed'}
         box.snapshot()
 
-        -- (1) Writer A prepares (pseudo-LSN pA), parks on WAL delay.
+        -- (1) Writer A prepares (pseudo-LSN pA), yields on WAL delay.
         box.error.injection.set('ERRINJ_WAL_DELAY', true)
         local a_ch = fiber.channel(1)
         fiber.create(function()
@@ -1296,7 +1303,7 @@ g.test_dependent_reader_still_aborted_on_wal_failure = function(cg)
         s:replace{1, 'committed'}
         box.snapshot()
 
-        -- Single writer B prepares (pseudo-LSN pB), parks on WAL delay.
+        -- Single writer B prepares (pseudo-LSN pB), yields on WAL delay.
         box.error.injection.set('ERRINJ_WAL_DELAY', true)
         local b_ch = fiber.channel(1)
         fiber.create(function()
@@ -1331,5 +1338,93 @@ g.test_dependent_reader_still_aborted_on_wal_failure = function(cg)
                      .. 'must be aborted')
 
         t.assert_equals(s:get{10}, nil)
+    end)
+end
+
+-- A scan must not resurrect its last cached statement. The chain
+-- link machinery re-inserts the previous node into the cache; if the
+-- key was overwritten and invalidated between two iterator steps,
+-- that re-insert brings a superseded value back as the latest. The
+-- overwrite is invisible to the anchor check when the anchor was
+-- read prepared: results built from in-memory statements are
+-- duplicates whose pseudo-LSN is never confirmed in place, and no
+-- real LSN exceeds a pseudo-LSN.
+g.test_scan_does_not_resurrect_overwritten_anchor = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'v1'}
+        s:replace{2, 'w'}
+
+        -- Suspend {1,'v2'} prepared: the snapshot reader will read it
+        -- and anchor its cache chain on the pseudo-LSN duplicate.
+        local stmts = box.stat.vinyl().tx.statements
+        box.error.injection.set('ERRINJ_WAL_DELAY', true)
+        local ch_w = fiber.channel(1)
+        fiber.create(function()
+            local ok = pcall(s.replace, s, {1, 'v2'})
+            ch_w:put(ok)
+        end)
+        t.helpers.retrying({}, function()
+            t.assert_gt(box.stat.vinyl().tx.statements, stmts)
+        end)
+
+        -- The reader iterates step by step: each step returns to this
+        -- fiber, so the writes below land between the anchor and the
+        -- next cached statement.
+        box.begin({txn_isolation = 'snapshot'})
+        local gen, param, state = s:pairs()
+        local r1, r2, r3
+        state, r1 = gen(param, state)
+
+        -- The write commits and is overwritten; the invalidations
+        -- purge key 1 from the cache.
+        box.error.injection.set('ERRINJ_WAL_DELAY', false)
+        t.assert(ch_w:get(), 'writer must commit')
+        local ch_w2 = fiber.channel(1)
+        fiber.create(function()
+            local ok = pcall(s.replace, s, {1, 'v3'})
+            ch_w2:put(ok)
+        end)
+        t.assert(ch_w2:get(), 'overwriter must commit')
+
+        -- The next steps cache {2,'w'} chained to the anchor and the
+        -- end-of-scan boundary.
+        state, r2 = gen(param, state)
+        r3 = select(2, gen(param, state))
+        box.commit()
+        t.assert_equals(r1, {1, 'v2'})
+        t.assert_equals(r2, {2, 'w'})
+        t.assert_equals(r3, nil)
+
+        -- No reader may see a resurrected {1,'v2'}. A node brought
+        -- back by the scan carries a pseudo LSN, so the vulnerable
+        -- reader is one whose view also lies at a pseudo LSN: a
+        -- snapshot transaction begun while any newer write sits
+        -- prepared. It must be the first reader to touch the key: a
+        -- read at a committed view would repair the node instead.
+        stmts = box.stat.vinyl().tx.statements
+        box.error.injection.set('ERRINJ_WAL_DELAY', true)
+        local ch_w3 = fiber.channel(1)
+        fiber.create(function()
+            local ok = pcall(s.replace, s, {5, 'z'})
+            ch_w3:put(ok)
+        end)
+        t.helpers.retrying({}, function()
+            t.assert_gt(box.stat.vinyl().tx.statements, stmts)
+        end)
+        box.begin({txn_isolation = 'snapshot'})
+        local poisoned = s:get(1)
+        -- The reader observed a prepared write, so its commit waits
+        -- for the writer's WAL confirmation: release the WAL first.
+        box.error.injection.set('ERRINJ_WAL_DELAY', false)
+        box.commit()
+        t.assert_equals(poisoned, {1, 'v3'})
+        t.assert(ch_w3:get(), 'last writer must commit')
+
+        t.assert_equals(s:get(1), {1, 'v3'})
+        t.assert_equals(s:select(),
+                        {{1, 'v3'}, {2, 'w'}, {5, 'z'}})
     end)
 end

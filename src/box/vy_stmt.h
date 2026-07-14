@@ -239,6 +239,30 @@ enum {
 	 * persisted, not included in VY_STMT_FLAGS_ALL.
 	 */
 	VY_STMT_SUPREMUM		= 1 << 7,
+	/**
+	 * The tuple cache's shared heat, a 3-bit saturating use
+	 * counter of the row. A statement is shared between the
+	 * primary and the secondary caches of its space, so a read
+	 * through any index heats it, and the primary cache's
+	 * eviction hand cools it -- the row's temperature, as
+	 * opposed to the per-entry heat each cache keeps for its
+	 * own entries. The cooling is weighted by the row's size,
+	 * see vy_cache_env_gc(). See vy_cache. Transient: never
+	 * persisted, not included in VY_STMT_FLAGS_ALL.
+	 */
+	VY_STMT_HEAT_SHIFT		= 8,
+	VY_STMT_HEAT_MASK		= 7 << VY_STMT_HEAT_SHIFT,
+	/**
+	 * The statement is held by its space's primary tuple
+	 * cache. Set when the primary cache admits the statement,
+	 * cleared when the entry leaves it on any path: eviction,
+	 * invalidation, a proven-dead drop, a cache drop. A
+	 * secondary cache admits a tuple only while the bit is
+	 * set, and serves it only while vy_stmt_maybe_stale() is
+	 * false -- see vy_cache. Transient: never persisted, not
+	 * included in VY_STMT_FLAGS_ALL.
+	 */
+	VY_STMT_PK_CACHED		= 1 << 11,
 };
 
 /**
@@ -371,6 +395,47 @@ static inline bool
 vy_stmt_has_flag(struct tuple *stmt, uint16_t flag)
 {
 	return vy_stmt_flags(stmt) & flag;
+}
+
+/** The statement's shared cache heat, see VY_STMT_HEAT_MASK. */
+static inline uint8_t
+vy_stmt_heat(struct tuple *stmt)
+{
+	return (vy_stmt_flags(stmt) & VY_STMT_HEAT_MASK) >>
+		VY_STMT_HEAT_SHIFT;
+}
+
+/** A use raises the statement's shared heat, saturating. */
+static inline void
+vy_stmt_inc_heat(struct tuple *stmt)
+{
+	if ((vy_stmt_flags(stmt) & VY_STMT_HEAT_MASK) != VY_STMT_HEAT_MASK)
+		((struct vy_stmt *)stmt)->flags += 1 << VY_STMT_HEAT_SHIFT;
+}
+
+/** Raise the statement's shared heat to at least @a heat. */
+static inline void
+vy_stmt_raise_heat(struct tuple *stmt, unsigned heat)
+{
+	unsigned cur = (vy_stmt_flags(stmt) & VY_STMT_HEAT_MASK) >>
+		VY_STMT_HEAT_SHIFT;
+	if (cur < heat)
+		((struct vy_stmt *)stmt)->flags +=
+			(heat - cur) << VY_STMT_HEAT_SHIFT;
+}
+
+/**
+ * The eviction hand cools the statement's shared heat by @a dec
+ * laps, to zero.
+ */
+static inline void
+vy_stmt_dec_heat(struct tuple *stmt, unsigned dec)
+{
+	unsigned heat = (vy_stmt_flags(stmt) & VY_STMT_HEAT_MASK) >>
+		VY_STMT_HEAT_SHIFT;
+	if (dec > heat)
+		dec = heat;
+	((struct vy_stmt *)stmt)->flags -= dec << VY_STMT_HEAT_SHIFT;
 }
 
 /** Check if the entry is the infimum of its key. */
@@ -987,9 +1052,10 @@ vy_stmt_is_bound(struct tuple *stmt)
 /**
  * Make the bound a scan of @a order starts from -- a private
  * copy of @a key marked with the order's bound flag, see
- * vy_bound_flag(). For keys the caller does not own; a freshly
- * created key is marked in place instead.
- * @param key the key, a plain statement.
+ * vy_bound_flag(). The key may itself be a bound (a search key
+ * carries the side its scan enters from); the copy takes the
+ * requested side regardless.
+ * @param key the key.
  * @param order the scan order the bound positions.
  * @retval the bound entry, referenced.
  * @retval none allocation failed.
@@ -997,12 +1063,12 @@ vy_stmt_is_bound(struct tuple *stmt)
 static inline struct vy_entry
 vy_bound_new(struct vy_entry key, enum iterator_type order)
 {
-	assert(!vy_stmt_is_bound(key.stmt));
 	struct vy_entry bound;
 	bound.stmt = vy_stmt_dup(key.stmt);
 	if (bound.stmt == NULL)
 		return vy_entry_none();
 	bound.hint = key.hint;
+	vy_stmt_del_flag(bound.stmt, VY_STMT_INFIMUM | VY_STMT_SUPREMUM);
 	vy_stmt_add_flag(bound.stmt, vy_bound_flag(order));
 	/*
 	 * A bound key's main function is to mark the start or the

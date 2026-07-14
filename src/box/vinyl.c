@@ -467,13 +467,15 @@ vinyl_index_stat(struct index *index, struct info_handler *h)
 
 	info_table_begin(h, "cache");
 	vy_info_append_stmt_counter(h, NULL, &cache_stat->count);
+	vy_info_append_stmt_counter(h, "overhead", &cache_stat->overhead);
 	info_append_int(h, "lookup", cache_stat->lookup);
 	vy_info_append_stmt_counter(h, "get", &cache_stat->get);
 	vy_info_append_stmt_counter(h, "put", &cache_stat->put);
+	info_append_int(h, "reject", cache_stat->reject);
 	vy_info_append_stmt_counter(h, "invalidate", &cache_stat->invalidate);
 	vy_info_append_stmt_counter(h, "evict", &cache_stat->evict);
 	info_append_int(h, "index_size",
-			vy_cache_tree_mem_used(&lsm->cache.cache_tree));
+			vy_cache_tree_mem_used(lsm->cache.tree));
 	info_table_end(h); /* cache */
 
 	info_table_begin(h, "txw");
@@ -547,6 +549,7 @@ vinyl_index_reset_stat(struct index *index)
 	cache_stat->lookup = 0;
 	vy_stmt_counter_reset(&cache_stat->get);
 	vy_stmt_counter_reset(&cache_stat->put);
+	cache_stat->reject = 0;
 	vy_stmt_counter_reset(&cache_stat->invalidate);
 	vy_stmt_counter_reset(&cache_stat->evict);
 
@@ -1458,7 +1461,6 @@ vy_get(struct vy_lsm *lsm, struct vy_tx *tx,
 
 	int rc;
 	struct vy_entry partial, entry;
-	int64_t skipped_lsn = 0;
 
 	struct vy_entry key;
 	key.stmt = key_stmt;
@@ -1476,27 +1478,18 @@ vy_get(struct vy_lsm *lsm, struct vy_tx *tx,
 				    &partial) != 0)
 			goto fail;
 		if (lsm->index_id > 0 && partial.stmt != NULL) {
+			int64_t unused = 0;
 			rc = vy_get_by_secondary_tuple(lsm, tx, rv, partial,
-						       &entry, &skipped_lsn);
+						       &entry, &unused);
+			if (rc == 0 && entry.stmt == NULL)
+				vy_cache_evict(&lsm->cache, partial);
 			tuple_unref(partial.stmt);
 			if (rc != 0)
 				goto fail;
 		} else {
 			entry = partial;
 		}
-		/*
-		 * Cache the result if it equals the latest version.
-		 * The global read view always sees the latest, so
-		 * its results are always cacheable. For non-global
-		 * read views, VY_STMT_STALE on the result means a
-		 * newer version was skipped. NULL results can't
-		 * carry the flag, so they are only cached for the
-		 * global read view.
-		 */
-		if ((*rv)->vlsn == INT64_MAX ||
-		    (entry.stmt != NULL &&
-		     !vy_stmt_has_flag(entry.stmt, VY_STMT_STALE)))
-			vy_cache_add_point(&lsm->cache, entry, key);
+		vy_cache_add(&lsm->cache, entry);
 		goto out;
 	}
 
@@ -2676,12 +2669,18 @@ vy_env_new(const char *path, size_t memory,
 	struct slab_cache *slab_cache = cord_slab_cache();
 	mempool_create(&e->iterator_pool, slab_cache,
 	               sizeof(struct vinyl_iterator));
-	vy_cache_env_create(&e->cache_env, slab_cache);
+	if (vy_cache_env_create(&e->cache_env,
+				e->stmt_env.key_format) != 0)
+		goto error_cache_env;
+	e->cache_env.xm = e->xm;
 	vy_run_env_create(&e->run_env, e->stmt_env.key_format,
 			  read_threads);
 	vy_log_init(e->path);
 	return e;
 
+error_cache_env:
+	mempool_destroy(&e->iterator_pool);
+	vy_lsm_env_destroy(&e->lsm_env);
 error_lsm_env:
 	/*
 	 * Tuple allocators draw from the mem env's arena, so stop the
@@ -2711,6 +2710,12 @@ vy_env_delete(struct vy_env *e)
 	vy_run_env_destroy(&e->run_env);
 	vy_lsm_env_destroy(&e->lsm_env);
 	/*
+	 * The cache env goes before the statement env: releasing
+	 * the dropped caches stowed on it unreferences statements,
+	 * which must still be alive.
+	 */
+	vy_cache_env_destroy(&e->cache_env);
+	/*
 	 * Tear down the statement env before the mem env: the TX
 	 * thread's tuple allocator draws from the mem env's arena.
 	 * Worker and reader cords have already dropped their tuple
@@ -2719,7 +2724,6 @@ vy_env_delete(struct vy_env *e)
 	 */
 	vy_stmt_env_destroy(&e->stmt_env);
 	vy_mem_env_destroy(&e->mem_env);
-	vy_cache_env_destroy(&e->cache_env);
 	vy_quota_destroy(&e->quota);
 	if (e->recovery != NULL)
 		vy_recovery_delete(e->recovery);

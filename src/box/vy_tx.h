@@ -382,6 +382,25 @@ size_t
 vy_tx_manager_mem_used(struct vy_tx_manager *xm);
 
 /**
+ * LSN of the oldest read view in the system, INT64_MAX if there is
+ * none. Read views are born at the current LSN, so the horizon only
+ * grows: nothing below it can ever be read again. Without a tx
+ * manager the horizon is zero: no LSN is assumed unreadable.
+ */
+static inline int64_t
+vy_tx_manager_horizon(struct vy_tx_manager *xm)
+{
+	if (xm == NULL)
+		return 0;
+	if (rlist_empty(&xm->read_views))
+		return INT64_MAX;
+	struct vy_read_view *rv = rlist_first_entry(&xm->read_views,
+						    struct vy_read_view,
+						    in_read_views);
+	return rv->vlsn;
+}
+
+/**
  * Create or reuse an instance of a read view whose vlsn is less than the given
  * prepared statement LSN. Never fails (never returns NULL).
  */

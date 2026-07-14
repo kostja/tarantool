@@ -142,14 +142,18 @@ istat()
       bytes: 0
     index_size: 0
     rows: 0
-    evict:
+    overhead:
       rows: 0
       bytes: 0
     put:
       rows: 0
       bytes: 0
-    lookup: 0
+    reject: 0
+    evict:
+      rows: 0
+      bytes: 0
     bytes: 0
+    lookup: 0
     get:
       rows: 0
       bytes: 0
@@ -274,7 +278,7 @@ gstat()
     tx: 0
     bloom_filter: 0
     page_index: 0
-    tuple: 320
+    tuple: 480
   disk:
     data_compacted: 0
     data: 0
@@ -431,8 +435,8 @@ stat_diff(istat(), st)
 - cache:
     index_size: 49152
     rows: 1
-    bytes: 1053
     lookup: 1
+    bytes: 1053
     put:
       rows: 1
       bytes: 1053
@@ -470,9 +474,6 @@ stat_diff(istat(), st)
 ---
 - cache:
     lookup: 1
-    put:
-      rows: 1
-      bytes: 1053
     get:
       rows: 1
       bytes: 1053
@@ -520,8 +521,8 @@ s:get(1) ~= nil
 stat_diff(istat(), st)
 ---
 - cache:
-    bytes: 1053
     lookup: 1
+    bytes: 1053
     rows: 1
     put:
       rows: 1
@@ -625,14 +626,15 @@ for i = 1, 100 do s:get(i) end
 stat_diff(istat(), st, 'cache')
 ---
 - rows: 14
+  reject: 30
+  lookup: 100
   bytes: 14742
   evict:
-    rows: 86
-    bytes: 90558
-  lookup: 100
+    rows: 56
+    bytes: 58968
   put:
-    rows: 100
-    bytes: 105300
+    rows: 70
+    bytes: 73710
 ...
 -- range split
 for i = 1, 100 do put(i) end
@@ -690,15 +692,19 @@ st = istat()
 stat_diff(istat(), st)
 ---
 - cache:
-    rows: 13
-    bytes: 13689
+    lookup: 17
+    rows: 15
+    reject: 15
+    bytes: 14767
     evict:
-      rows: 37
-      bytes: 38961
-    lookup: 1
+      rows: 21
+      bytes: 22113
     put:
-      rows: 51
-      bytes: 53703
+      rows: 35
+      bytes: 36855
+    overhead:
+      rows: 1
+      bytes: 25
   disk:
     iterator:
       read:
@@ -756,9 +762,6 @@ stat_diff(istat(), st)
 ---
 - cache:
     lookup: 1
-    put:
-      rows: 5
-      bytes: 5265
     get:
       rows: 5
       bytes: 5265
@@ -816,7 +819,7 @@ _ = s:get(1)
 ...
 stat_diff(gstat(), st, 'memory.tuple_cache')
 ---
-- 1117
+- 1077
 ...
 s:delete(1)
 ---
@@ -1062,15 +1065,19 @@ istat()
       rows: 0
       bytes: 0
     index_size: 49152
-    rows: 13
-    evict:
-      rows: 0
-      bytes: 0
+    rows: 15
+    overhead:
+      rows: 1
+      bytes: 25
     put:
       rows: 0
       bytes: 0
+    reject: 0
+    evict:
+      rows: 0
+      bytes: 0
+    bytes: 14767
     lookup: 0
-    bytes: 13689
     get:
       rows: 0
       bytes: 0
@@ -1191,11 +1198,11 @@ gstat()
     gap_locks: 0
     read_views: 0
   memory:
-    tuple_cache: 14521
+    tuple_cache: 15127
     tx: 0
     bloom_filter: 140
     page_index: 2684
-    tuple: 220608
+    tuple: 220672
   disk:
     data_compacted: 105949
     data: 104900

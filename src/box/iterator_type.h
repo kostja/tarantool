@@ -92,6 +92,18 @@ iterator_direction(enum iterator_type type)
 	return (reverse & (1u << type)) ? -1 : 1;
 }
 
+/**
+ * The iterator type that resumes an interrupted iteration of the
+ * given type: it continues strictly past the last returned tuple
+ * -- an exclusive restart, GT for a forward iteration, LT for a
+ * reverse one.
+ */
+static inline enum iterator_type
+iterator_resume_order(enum iterator_type type)
+{
+	return iterator_direction(type) > 0 ? ITER_GT : ITER_LT;
+}
+
 static inline bool
 iterator_type_is_reverse(enum iterator_type type)
 {

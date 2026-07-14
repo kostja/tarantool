@@ -31,7 +31,9 @@ i2:stat().rows -- ditto
 
 -- Although there are only 5 tuples in the space, we have to look up
 -- overwritten tuples in the primary index hence 15 lookups per SELECT
--- in a secondary index.
+-- in a secondary index. The rows the first SELECT leaves resident in
+-- the primary cache are served as is, so the second one resolves only
+-- the overwritten tuples.
 i1:select()
 i1:stat().get.rows -- 5
 i1:stat().skip.rows -- 10
@@ -41,24 +43,25 @@ pk:stat().skip.rows -- 10
 i2:select()
 i2:stat().get.rows -- 5
 i2:stat().skip.rows -- 10
-pk:stat().lookup -- 30
-pk:stat().get.rows -- 10
+pk:stat().lookup -- 25
+pk:stat().get.rows -- 5
 pk:stat().skip.rows -- 20
 
--- Overwritten/deleted tuples are not stored in the cache so calling
--- SELECT for a second time does only 5 lookups.
+-- Overwritten/deleted tuples are not stored in the cache and cached
+-- rows are served without resolution, so calling SELECT for a second
+-- time does no primary lookups at all.
 box.stat.reset()
 i1:select()
 i1:stat().get.rows -- 5
 i1:stat().skip.rows -- 0
-pk:stat().lookup -- 5
-pk:stat().get.rows -- 5
+pk:stat().lookup -- 0
+pk:stat().get.rows -- 0
 pk:stat().skip.rows -- 0
 i2:select()
 i2:stat().get.rows -- 5
 i2:stat().skip.rows -- 0
-pk:stat().lookup -- 10
-pk:stat().get.rows -- 10
+pk:stat().lookup -- 0
+pk:stat().get.rows -- 0
 pk:stat().skip.rows -- 0
 
 -- Cleanup the cache.

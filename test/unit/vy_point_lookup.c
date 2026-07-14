@@ -79,7 +79,8 @@ test_basic()
 	vy_run_env_create(&run_env, stmt_env.key_format, 0);
 
 	struct vy_cache_env cache_env;
-	vy_cache_env_create(&cache_env, slab_cache);
+	if (vy_cache_env_create(&cache_env, stmt_env.key_format) != 0)
+		panic("failed to create the cache environment");
 	vy_cache_env_set_quota(&cache_env, QUOTA);
 
 	struct vy_cache cache;
