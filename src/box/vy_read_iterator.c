@@ -37,6 +37,7 @@
 #include "vy_history.h"
 #include "vy_lsm.h"
 #include "vy_point_lookup.h"
+#include "errcode.h"
 #include "vy_stat.h"
 
 /**
@@ -682,14 +683,16 @@ vy_read_iterator_add_tx(struct vy_read_iterator *itr)
 
 /** Add the cache source to the read iterator. */
 static void
-vy_read_iterator_add_cache(struct vy_read_iterator *itr, bool is_prepared_ok)
+vy_read_iterator_add_cache(struct vy_read_iterator *itr)
 {
-	enum iterator_type iterator_type = (itr->iterator_type != ITER_REQ ?
-					    itr->iterator_type : ITER_LE);
+	/*
+	 * Unlike the other sources, the cache iterator handles
+	 * ITER_REQ itself.
+	 */
 	struct vy_read_src *sub_src = vy_read_iterator_add_src(itr);
 	vy_cache_iterator_open(&sub_src->cache_iterator, &itr->lsm->cache,
-			       iterator_type, itr->key, itr->read_view,
-			       is_prepared_ok);
+			       itr->iterator_type, itr->key, itr->read_view,
+			       &itr->cache_builder);
 }
 
 /** Add the memory level source to the read iterator. */
@@ -796,8 +799,6 @@ vy_read_iterator_open_after(struct vy_read_iterator *itr, struct vy_lsm *lsm,
 	itr->key = key;
 	itr->read_view = rv;
 	itr->last = last;
-	itr->last_cached = vy_entry_none();
-	itr->is_first_cached = (itr->last.stmt == NULL);
 
 	if (vy_stmt_is_empty_key(key.stmt)) {
 		/*
@@ -833,6 +834,10 @@ vy_read_iterator_open_after(struct vy_read_iterator *itr, struct vy_lsm *lsm,
 		itr->need_check_eq = true;
 	}
 
+	/* After the iterator type normalizations above. */
+	vy_cache_builder_create(&itr->cache_builder, &lsm->cache,
+				itr->iterator_type, key, last, rv);
+
 	itr->check_exact_match =
 		(iterator_type == ITER_EQ || iterator_type == ITER_REQ ||
 		 iterator_type == ITER_GE || iterator_type == ITER_LE) &&
@@ -867,7 +872,7 @@ vy_read_iterator_restore(struct vy_read_iterator *itr)
 	}
 
 	itr->cache_src = itr->src_count;
-	vy_read_iterator_add_cache(itr, is_prepared_ok);
+	vy_read_iterator_add_cache(itr);
 
 	itr->mem_src = itr->src_count;
 	vy_read_iterator_add_mem(itr, is_prepared_ok);
@@ -980,8 +985,9 @@ vy_read_iterator_track_read(struct vy_read_iterator *itr, struct vy_entry entry)
 
 /**
  * Count bytes contributed by disk sources that participated in the
- * current merge step.  Must be called before apply_history splices
+ * current merge step. Must be called before apply_history splices
  * the per-source histories.
+ * @return the byte count.
  */
 static int64_t
 vy_read_iterator_disk_bytes(struct vy_read_iterator *itr)
@@ -1000,8 +1006,10 @@ vy_read_iterator_disk_bytes(struct vy_read_iterator *itr)
 }
 
 /**
- * Get the next key of the scanned index: the raw merge step.
- * A secondary index key is returned unresolved.
+ * Get the next key in the iterator's own LSM tree: for a
+ * secondary index this is the indexed statement, not the full
+ * tuple. Consumed committed DELETEs are fed to the cache builder
+ * as chain points.
  * @param itr         Read iterator.
  * @param[out] result The found statement is stored here.
  *
@@ -1038,16 +1046,16 @@ next_key:
 		 */
 		vy_lsm_acct_read_amp(itr->lsm, itr->curr_range,
 				     disk_bytes, NULL);
-		if (vy_stmt_lsn(entry.stmt) == INT64_MAX) {
-			if (itr->last_cached.stmt != NULL)
-				tuple_unref(itr->last_cached.stmt);
-			itr->last_cached = vy_entry_none();
-			itr->is_first_cached = false;
-			itr->cache_link_lsn = 0;
-		} else {
-			itr->cache_link_lsn = MAX(itr->cache_link_lsn,
-						  vy_stmt_lsn(entry.stmt));
-		}
+		/*
+		 * Record the DELETE in the chain: it states its
+		 * key's absence, and a reader whose view is below
+		 * it finds it invisible and descends to the deeper
+		 * sources. The builder itself breaks the chain
+		 * instead when the DELETE is retractable -- still
+		 * prepared or in a tx write set.
+		 */
+		vy_cache_builder_add_delete(&itr->cache_builder, entry,
+					    vy_stmt_lsn(entry.stmt));
 		goto next_key;
 	}
 	assert(entry.stmt == NULL ||
@@ -1061,62 +1069,6 @@ next_key:
 	return 0;
 }
 
-/**
- * Add the last returned tuple to the cache. A secondary index
- * caches the resolved full tuple, not the partial key: the same
- * statement then backs both the primary and the secondary index
- * cache, saving memory.
- * @param itr   Read iterator
- * @param entry Last tuple returned by the iterator.
- * @param skipped_lsn Max LSN among all full statements skipped because
- *                    they didn't match the partial tuple key.
- *
- * The skipped_lsn is used for the cache chain link. Basically, it's the max
- * LSN over all deferred DELETE statements that fall between the previous and
- * the current cache nodes.
- */
-static void
-vy_read_iterator_cache_add(struct vy_read_iterator *itr, struct vy_entry entry,
-			   int64_t skipped_lsn)
-{
-	if ((**itr->read_view).vlsn != INT64_MAX) {
-		if (itr->last_cached.stmt != NULL)
-			tuple_unref(itr->last_cached.stmt);
-		itr->last_cached = vy_entry_none();
-		return;
-	}
-	struct vy_entry prev;
-	bool is_first;
-	int64_t link_lsn;
-	if (vy_lsn_is_prepared(skipped_lsn)) {
-		/*
-		 * Do not create a cache chain link if we skipped a tuple
-		 * overwritten by a prepared (not yet confirmed by WAL)
-		 * statement, because if the statement is rolled back due
-		 * to a WAL error, the secondary index cache won't be
-		 * invalidated (since the secondary index DELETE is deferred
-		 * hence not present in the transaction write set) therefore
-		 * the link wouldn't be deleted.
-		 */
-		prev = vy_entry_none();
-		is_first = false;
-		link_lsn = 0;
-	} else {
-		prev = itr->last_cached;
-		is_first = itr->is_first_cached;
-		link_lsn = MAX(itr->cache_link_lsn, skipped_lsn);
-	}
-	vy_cache_add(&itr->lsm->cache, entry, prev, is_first, link_lsn,
-		     itr->key, itr->iterator_type);
-	if (entry.stmt != NULL)
-		tuple_ref(entry.stmt);
-	if (itr->last_cached.stmt != NULL)
-		tuple_unref(itr->last_cached.stmt);
-	itr->last_cached = entry;
-	itr->is_first_cached = false;
-	itr->cache_link_lsn = 0;
-}
-
 /** See the comment in vy_read_iterator.h. */
 NODISCARD int
 vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result)
@@ -1126,7 +1078,6 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result)
 		itr->pk_entry = vy_entry_none();
 	}
 	struct vy_entry entry;
-	int64_t skipped_lsn = 0;
 	while (true) {
 		if (vy_read_iterator_next_key(itr, &entry) != 0)
 			return -1;
@@ -1138,30 +1089,29 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result)
 		 * the primary index.
 		 */
 		struct vy_entry full;
+		int64_t delete_lsn = 0;
 		if (vy_get_by_secondary_tuple(itr->lsm, itr->tx,
 					      itr->read_view, entry, &full,
-					      &skipped_lsn) != 0)
+					      &delete_lsn) != 0)
 			return -1;
 		if (full.stmt != NULL) {
 			itr->pk_entry = full;
 			entry = full;
 			break;
 		}
+		/* Report the proven-dead key to the chain. */
+		vy_cache_builder_add_delete(&itr->cache_builder, entry,
+					    delete_lsn);
 		/*
-		 * The key is dead: its tuple was overwritten or
-		 * deleted in the primary index. The resolution may
-		 * yield: bail out if the transaction was aborted
-		 * meanwhile. The other cursor-level failures (the
-		 * transaction ended or changed hands) cannot occur
-		 * within one call: a transaction is driven by its
-		 * own fiber.
+		 * The resolution may yield: bail out if the
+		 * transaction was aborted meanwhile.
 		 */
 		if (itr->tx != NULL && itr->tx->state == VINYL_TX_ABORT) {
 			diag_set(ClientError, ER_READ_VIEW_ABORTED);
 			return -1;
 		}
 	}
-	vy_read_iterator_cache_add(itr, entry, skipped_lsn);
+	vy_cache_builder_add(&itr->cache_builder, entry);
 	*result = entry;
 	return 0;
 }
@@ -1176,8 +1126,7 @@ vy_read_iterator_close(struct vy_read_iterator *itr)
 		tuple_unref(itr->last.stmt);
 	if (itr->pk_entry.stmt != NULL)
 		tuple_unref(itr->pk_entry.stmt);
-	if (itr->last_cached.stmt != NULL)
-		tuple_unref(itr->last_cached.stmt);
+	vy_cache_builder_destroy(&itr->cache_builder);
 	vy_read_iterator_cleanup(itr);
 	free(itr->src);
 	TRASH(itr);

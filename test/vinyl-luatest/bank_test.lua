@@ -23,6 +23,10 @@ function BankTest.new(params)
     self.duration = params.duration or 5
     self.ddl_nemesis = params.ddl_nemesis ~= false
     self.wal_chaos = params.wal_chaos ~= false
+    self.snapshots = params.snapshots ~= false
+    self.pk_readers = params.pk_readers
+    self.sk_readers = params.sk_readers
+    self.mixed_readers = params.mixed_readers
 
     self.s = box.schema.space.create('account', {engine = 'vinyl'})
     self.s:create_index('pk')
@@ -179,6 +183,7 @@ end
 -- chain building with gaps.
 function BankTest:start_mixed_reader()
     local self_ = self
+    local mode = os.getenv('VINYL_STRESS_MIXED_MODE') or 'all'
     table.insert(self.fibers, fiber.create(function()
         while not self_.stop do
             local ok = pcall(function()
@@ -187,28 +192,37 @@ function BankTest:start_mixed_reader()
                 local start = math.random(1, self_.accounts)
                 local total_ge = 0
                 local count_ge = 0
-                for _, tuple in self_.s:pairs(start, {iterator = 'GE'}) do
-                    total_ge = total_ge + tuple[2]
-                    count_ge = count_ge + 1
+                if mode == 'all' or mode == 'ge' then
+                    for _, tuple in
+                            self_.s:pairs(start, {iterator = 'GE'}) do
+                        total_ge = total_ge + tuple[2]
+                        count_ge = count_ge + 1
+                    end
                 end
                 -- Reverse scan (LE from the same key).
                 local total_le = 0
                 local count_le = 0
-                for _, tuple in self_.s:pairs(start, {iterator = 'LT'}) do
-                    total_le = total_le + tuple[2]
-                    count_le = count_le + 1
+                if mode == 'all' or mode == 'lt' then
+                    for _, tuple in
+                            self_.s:pairs(start, {iterator = 'LT'}) do
+                        total_le = total_le + tuple[2]
+                        count_le = count_le + 1
+                    end
                 end
                 -- Point reads for min/max.
-                local mn = self_.s.index.pk:min()
-                local mx = self_.s.index.pk:max()
-                if mn == nil or mx == nil then
-                    table.insert(self_.reader_errors,
-                        'min/max returned nil')
+                if mode == 'all' or mode == 'minmax' then
+                    local mn = self_.s.index.pk:min()
+                    local mx = self_.s.index.pk:max()
+                    if mn == nil or mx == nil then
+                        table.insert(self_.reader_errors,
+                            'min/max returned nil')
+                    end
                 end
                 -- GE includes start, LT excludes it.
                 -- Together they cover all accounts.
                 local combined = total_ge + total_le
-                if count_ge + count_le ~= self_.accounts then
+                if mode == 'all' and
+                   count_ge + count_le ~= self_.accounts then
                     table.insert(self_.reader_errors,
                         string.format(
                             'mixed: GE(%d)+LT(%d)=%d, expected %d',
@@ -216,7 +230,8 @@ function BankTest:start_mixed_reader()
                             count_ge + count_le,
                             self_.accounts))
                 end
-                if combined ~= self_.expected_total then
+                if mode == 'all' and
+                   combined ~= self_.expected_total then
                     table.insert(self_.reader_errors,
                         string.format(
                             'mixed: GE+LT total %d, expected %d',
@@ -292,14 +307,18 @@ end
 function BankTest:run()
     for _ = 1, self.writers do self:start_writer() end
     -- Split readers across PK scan, SK scan, and mixed scan.
-    local pk_readers = math.max(1, math.floor(self.readers / 3))
-    local sk_readers = math.max(1, math.floor(self.readers / 3))
-    local mixed_readers = math.max(0,
+    local pk_readers = self.pk_readers or
+        math.max(1, math.floor(self.readers / 3))
+    local sk_readers = self.sk_readers or
+        math.max(1, math.floor(self.readers / 3))
+    local mixed_readers = self.mixed_readers or math.max(0,
         self.readers - pk_readers - sk_readers)
     for _ = 1, pk_readers do self:start_reader() end
     for _ = 1, sk_readers do self:start_sk_reader() end
     for _ = 1, mixed_readers do self:start_mixed_reader() end
-    self:start_snapshot()
+    if self.snapshots then
+        self:start_snapshot()
+    end
     if self.ddl_nemesis then
         self:start_ddl_nemesis()
     end

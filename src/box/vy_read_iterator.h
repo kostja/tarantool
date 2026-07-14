@@ -36,6 +36,7 @@
 
 #include "iterator_type.h"
 #include "trivia/util.h"
+#include "vy_cache.h"
 #include "vy_entry.h"
 
 #if defined(__cplusplus)
@@ -74,21 +75,11 @@ struct vy_read_iterator {
 	/** Set to true on the first iteration. */
 	bool is_started;
 	/**
-	 * Set to true if the statement that is about to be added to
-	 * the cache is the first one matching the iteration criteria.
-	 * See vy_read_iterator_cache_add().
+	 * The reader's half of the cache protocol, see struct
+	 * vy_cache_builder.
 	 */
-	bool is_first_cached;
-	/**
-	 * LSN of the cache chain link following the last cached statement.
-	 * Used by vy_read_iterator_cache_add().
-	 */
-	int64_t cache_link_lsn;
-	/**
-	 * The last key returned by the raw merge step, see
-	 * vy_read_iterator_next_key(): for a secondary index,
-	 * the unresolved reference statement.
-	 */
+	struct vy_cache_builder cache_builder;
+	/** Last statement returned by vy_read_iterator_next(). */
 	struct vy_entry last;
 	/**
 	 * The full tuple the last returned secondary index
@@ -96,11 +87,6 @@ struct vy_read_iterator {
 	 * iterator until the next call.
 	 */
 	struct vy_entry pk_entry;
-	/**
-	 * Last statement added to the tuple cache by
-	 * vy_read_iterator_cache_add().
-	 */
-	struct vy_entry last_cached;
 	/**
 	 * Copy of lsm->range_tree_version.
 	 * Used for detecting range tree changes.
@@ -184,8 +170,8 @@ vy_read_iterator_open(struct vy_read_iterator *itr, struct vy_lsm *lsm,
  * if it wasn't started. For a secondary index the statement is
  * resolved into the full tuple stored in the primary index; keys
  * the resolution proves dead are consumed internally. Every
- * result, including the end of the scan, is offered to the
- * cache; only reads at the latest read view are cached.
+ * result, including the end of the scan, is fed to the cache
+ * builder.
  * @param itr         Read iterator.
  * @param[out] result Found statement is stored here. Owned by
  *                    the iterator: valid until the next call or

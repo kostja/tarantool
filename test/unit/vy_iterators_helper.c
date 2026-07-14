@@ -30,6 +30,10 @@ vy_quota_acct(struct vy_quota_acct *a, enum vy_quota_consumer_type type,
 }
 
 struct vy_stmt_env stmt_env;
+
+/** The latest read view, for driving the cache builder. */
+static struct vy_read_view test_read_view_value = { .vlsn = INT64_MAX };
+const struct vy_read_view *test_read_view = &test_read_view_value;
 struct vy_mem_env mem_env;
 /* Accounting target for the mem env; see the quota stubs above. */
 static struct vy_quota_acct mem_quota_acct;
@@ -49,7 +53,8 @@ vy_iterator_C_test_init(size_t cache_size)
 	size_t mem_size = 64 * 1024 * 1024;
 	vy_mem_env_create(&mem_env, mem_size, &mem_quota_acct, NULL);
 	vy_stmt_env_create(&stmt_env, &mem_env);
-	vy_cache_env_create(&cache_env, cord_slab_cache());
+	if (vy_cache_env_create(&cache_env, stmt_env.key_format) != 0)
+		panic("failed to create the cache environment");
 	vy_cache_env_set_quota(&cache_env, cache_size);
 	mempool_create(&history_node_pool, cord_slab_cache(),
 		       sizeof(struct vy_history_node));
@@ -59,9 +64,9 @@ void
 vy_iterator_C_test_finish()
 {
 	mempool_destroy(&history_node_pool);
+	vy_cache_env_destroy(&cache_env);
 	vy_stmt_env_destroy(&stmt_env);
 	vy_mem_env_destroy(&mem_env);
-	vy_cache_env_destroy(&cache_env);
 	tuple_free();
 	fiber_free();
 	memory_free();
@@ -192,22 +197,25 @@ vy_cache_insert_templates_chain(struct vy_cache *cache,
 {
 	struct vy_entry key = vy_new_simple_stmt(format, cache->cmp_def,
 						 key_templ);
-	struct vy_entry prev_entry = vy_entry_none();
-	struct vy_entry entry = vy_entry_none();
-	bool is_first = true;
 
+	/*
+	 * Emulate a full scan, the way the read iterator drives the
+	 * cache: insert the starting key entry, add every result,
+	 * insert the end key entry. Supports EQ keys and empty-key
+	 * range scans.
+	 */
+	struct vy_cache_builder builder;
+	vy_cache_builder_create(&builder, cache, order, key,
+				/*last=*/vy_entry_none(), &test_read_view);
 	for (uint i = 0; i < length; ++i) {
-		entry = vy_new_simple_stmt(format, cache->cmp_def, &chain[i]);
-		vy_cache_add(cache, entry, prev_entry, is_first, 0, key, order);
-		if (i != 0)
-			tuple_unref(prev_entry.stmt);
-		prev_entry = entry;
-		entry = vy_entry_none();
-		is_first = false;
+		struct vy_entry entry =
+			vy_new_simple_stmt(format, cache->cmp_def, &chain[i]);
+		vy_cache_builder_add(&builder, entry);
+		tuple_unref(entry.stmt);
 	}
+	vy_cache_builder_add(&builder, vy_entry_none());
+	vy_cache_builder_destroy(&builder);
 	tuple_unref(key.stmt);
-	if (prev_entry.stmt != NULL)
-		tuple_unref(prev_entry.stmt);
 }
 
 void

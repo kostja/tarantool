@@ -594,6 +594,15 @@ vy_mem_iterator_should_skip_curr(struct vy_mem_iterator *itr)
 	if (vy_stmt_flags(stmt) & VY_STMT_SKIP_READ)
 		return true;
 	if (!itr->is_prepared_ok && vy_stmt_is_prepared(stmt)) {
+		/*
+		 * Skipping a prepared statement sends the reader to a
+		 * read view (see min_skipped_plsn), which protects the
+		 * reader's results -- but not its cache claims: the
+		 * result is shadowed by the skipped statement and must
+		 * not be cached as the latest, so the skip taints it
+		 * like any skip of an invisible newer version.
+		 */
+		itr->is_stale = true;
 		itr->min_skipped_plsn = MIN(itr->min_skipped_plsn,
 					    vy_stmt_lsn(stmt));
 		return true;

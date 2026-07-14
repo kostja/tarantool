@@ -936,7 +936,7 @@ vy_read_view_merge(struct vy_write_iterator *stream, struct vy_entry prev,
 	 * statements so as not to generate the same DELETEs on
 	 * the next compaction.
 	 */
-	uint8_t flags = vy_stmt_flags(rv->entry.stmt);
+	uint16_t flags = vy_stmt_flags(rv->entry.stmt);
 	if ((flags & VY_STMT_DEFERRED_DELETE) != 0 &&
 	    !vy_entry_is_equal(rv->entry, stream->deferred_delete)) {
 		/*

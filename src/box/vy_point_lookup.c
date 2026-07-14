@@ -74,14 +74,14 @@ vy_point_lookup_scan_txw(struct vy_lsm *lsm, struct vy_tx *tx,
  */
 static int
 vy_point_lookup_scan_cache(struct vy_lsm *lsm, const struct vy_read_view **rv,
-			   bool is_prepared_ok, struct vy_entry key,
-			   struct vy_history *history)
+			   struct vy_entry key, struct vy_history *history)
 {
 	lsm->cache.stat.lookup++;
 	struct vy_entry entry = vy_cache_get(&lsm->cache, key);
 
-	if (entry.stmt == NULL || vy_stmt_lsn(entry.stmt) > (*rv)->vlsn ||
-	    (!is_prepared_ok && vy_stmt_is_prepared(entry.stmt)))
+	/* Unconfirmed data never enters the cache: see vy_cache_insert(). */
+	assert(entry.stmt == NULL || !vy_stmt_is_prepared(entry.stmt));
+	if (entry.stmt == NULL || vy_stmt_lsn(entry.stmt) > (*rv)->vlsn)
 		return 0;
 
 	vy_stmt_counter_acct_tuple(&lsm->cache.stat.get, entry.stmt);
@@ -239,7 +239,7 @@ vy_point_lookup(struct vy_lsm *lsm, struct vy_tx *tx,
 		goto done;
 
 	bool is_prepared_ok = tx != NULL ? vy_tx_is_prepared_ok(tx) : false;
-	rc = vy_point_lookup_scan_cache(lsm, rv, is_prepared_ok, key, &history);
+	rc = vy_point_lookup_scan_cache(lsm, rv, key, &history);
 	if (rc != 0 || vy_history_is_terminal(&history))
 		goto done;
 
@@ -341,8 +341,7 @@ vy_point_lookup_mem(struct vy_lsm *lsm, const struct vy_read_view **rv,
 	struct vy_history history;
 	vy_history_create(&history, &lsm->env->history_node_pool);
 
-	rc = vy_point_lookup_scan_cache(lsm, rv, /*is_prepared_ok=*/true,
-					key, &history);
+	rc = vy_point_lookup_scan_cache(lsm, rv, key, &history);
 	if (rc != 0 || vy_history_is_terminal(&history))
 		goto done;
 
@@ -444,7 +443,7 @@ vy_lsm_check_concurrent_write(struct vy_lsm *lsm, struct vy_tx *tx,
 	/* Check the tuple cache. */
 	struct vy_history history;
 	vy_history_create(&history, &lsm->env->history_node_pool);
-	rc = vy_point_lookup_scan_cache(lsm, rv, true, key, &history);
+	rc = vy_point_lookup_scan_cache(lsm, rv, key, &history);
 	if (rc != 0)
 		goto done_cleanup;
 	if (!rlist_empty(&history.stmts)) {
@@ -532,10 +531,33 @@ int
 vy_get_by_secondary_tuple(struct vy_lsm *lsm, struct vy_tx *tx,
 			  const struct vy_read_view **rv,
 			  struct vy_entry entry, struct vy_entry *result,
-			  int64_t *skipped_lsn)
+			  int64_t *delete_lsn)
 {
 	int rc = 0;
 	assert(lsm->index_id > 0);
+
+	/*
+	 * A full tuple that is not maybe stale is the primary
+	 * cache's resident object: the newest committed version
+	 * of its row, found under the row's own key. Serve it
+	 * without the resolving lookup. The read is still
+	 * tracked against the primary index: a DELETE of the
+	 * row may be deferred -- written to the primary alone --
+	 * and the secondary read set would never see it.
+	 */
+	if (!vy_stmt_is_key(entry.stmt) &&
+	    !vy_stmt_maybe_stale(entry.stmt, /*is_primary=*/false)) {
+		if (tx != NULL) {
+			struct vy_entry pk_entry;
+			pk_entry.stmt = entry.stmt;
+			pk_entry.hint = vy_stmt_hint(entry.stmt,
+						     lsm->pk->cmp_def);
+			vy_tx_track_point(tx, lsm->pk, pk_entry);
+		}
+		tuple_ref(entry.stmt);
+		*result = entry;
+		return 0;
+	}
 
 	/*
 	 * Lookup the full tuple by a secondary statement.
@@ -619,17 +641,9 @@ vy_get_by_secondary_tuple(struct vy_lsm *lsm, struct vy_tx *tx,
 		if (pk_entry.stmt != NULL) {
 			vy_stmt_counter_acct_tuple(&lsm->pk->stat.skip,
 						   pk_entry.stmt);
-			*skipped_lsn = MAX(*skipped_lsn,
-					   vy_stmt_lsn(pk_entry.stmt));
+			*delete_lsn = vy_stmt_lsn(pk_entry.stmt);
 			tuple_unref(pk_entry.stmt);
 		}
-		/*
-		 * We must purge stale tuples from the cache before
-		 * storing the resulting interval in order to avoid
-		 * chain intersections, which are not tolerated by
-		 * the tuple cache implementation.
-		 */
-		vy_cache_on_write(&lsm->cache, entry, NULL);
 		*result = vy_entry_none();
 		goto out;
 	}
@@ -645,8 +659,7 @@ vy_get_by_secondary_tuple(struct vy_lsm *lsm, struct vy_tx *tx,
 	if (tx != NULL)
 		vy_tx_track_point(tx, lsm->pk, pk_entry);
 
-	if ((*rv)->vlsn == INT64_MAX)
-		vy_cache_add_point(&lsm->pk->cache, pk_entry, key);
+	vy_cache_add(&lsm->pk->cache, pk_entry);
 
 	vy_stmt_counter_acct_tuple(&lsm->pk->stat.get, pk_entry.stmt);
 	*result = full_entry;

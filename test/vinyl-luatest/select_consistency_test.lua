@@ -81,7 +81,8 @@ g.test_select_consistency = function(cg)
             local MAX_VAL = 10
             local MAX_MULTIKEY_COUNT = 10
             local MAX_PADDING_SIZE = 1000
-            local TEST_TIME = 5
+            local TEST_TIME =
+                tonumber(os.getenv('VINYL_STRESS_TEST_TIME')) or 5
 
             local s = box.space.test
 

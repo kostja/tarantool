@@ -238,12 +238,22 @@ struct vy_lsm_stat {
 struct vy_cache_stat {
 	/** Number of statements in the cache. */
 	struct vy_stmt_counter count;
+	/**
+	 * The share of the cache spent on structure rather than
+	 * payload: resident key entries and consumed DELETEs.
+	 */
+	struct vy_stmt_counter overhead;
 	/** Number of lookups in the cache. */
 	int64_t lookup;
 	/** Number of reads from the cache. */
 	struct vy_stmt_counter get;
 	/** Number of writes to the cache. */
 	struct vy_stmt_counter put;
+	/**
+	 * Number of admissions refused because the caches did
+	 * not fit the quota even after an eviction walk.
+	 */
+	int64_t reject;
 	/**
 	 * Number of statements removed from the cache
 	 * due to overwrite.
