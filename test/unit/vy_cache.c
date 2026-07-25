@@ -83,17 +83,10 @@ test_basic(void)
 	struct vy_read_view rv;
 	rv.vlsn = INT64_MAX;
 	const struct vy_read_view *rv_p = &rv;
-	/*
-	 * The iterator borrows its start bound from a builder.
-	 * A below-latest builder builds no chain, leaving the
-	 * cache under test unchanged.
-	 */
-	struct vy_read_view gated_rv;
-	gated_rv.vlsn = 0;
-	const struct vy_read_view *gated_rv_p = &gated_rv;
+	/* The iterator borrows its start bound from a builder. */
 	struct vy_cache_builder builder;
 	vy_cache_builder_create(&builder, &cache, ITER_GE, select_all,
-				vy_entry_none(), &gated_rv_p);
+				vy_entry_none());
 	vy_cache_iterator_open(&itr, &cache, ITER_GE, select_all,
 			       &rv_p, &builder);
 
@@ -192,17 +185,10 @@ test_iterator_helper(
 	vy_history_create(&history, &history_node_pool);
 	struct vy_entry key = vy_new_simple_stmt(format, key_def,
 						 key_template);
-	/*
-	 * The iterator borrows its start bound from a builder.
-	 * A below-latest builder builds no chain, leaving the
-	 * cache under test unchanged.
-	 */
-	struct vy_read_view gated_rv;
-	gated_rv.vlsn = 0;
-	const struct vy_read_view *gated_rv_p = &gated_rv;
+	/* The iterator borrows its start bound from a builder. */
 	struct vy_cache_builder builder;
 	vy_cache_builder_create(&builder, cache, type, key,
-				vy_entry_none(), &gated_rv_p);
+				vy_entry_none());
 	vy_cache_iterator_open(&it, cache, type, key, &prv, &builder);
 	int i;
 	bool stop;
@@ -360,10 +346,10 @@ test_pending_link(void)
 	/* No interference: the pending link survives, the link forms. */
 	struct vy_cache_builder builder;
 	vy_cache_builder_create(&builder, &cache, ITER_GE, key,
-				/*last=*/vy_entry_none(), &test_read_view);
+				/*last=*/vy_entry_none());
 	fail_unless(builder.last.stmt != NULL);
-	vy_cache_builder_add(&builder, a);
-	vy_cache_builder_add(&builder, b);
+	vy_cache_builder_add(&builder, a, /*is_stale=*/false);
+	vy_cache_builder_add(&builder, b, /*is_stale=*/false);
 	vy_cache_builder_destroy(&builder);
 	struct test_iterator_expected linked[] = {
 		{STMT_TEMPLATE(10, REPLACE, 100), true},
@@ -385,12 +371,12 @@ test_pending_link(void)
 	a = vy_new_simple_stmt(format, key_def, &a_templ);
 	b = vy_new_simple_stmt(format, key_def, &b_templ);
 	vy_cache_builder_create(&builder, &cache, ITER_GE, key,
-				/*last=*/vy_entry_none(), &test_read_view);
+				/*last=*/vy_entry_none());
 	fail_unless(builder.last.stmt != NULL);
-	vy_cache_builder_add(&builder, a);
+	vy_cache_builder_add(&builder, a, /*is_stale=*/false);
 	struct vy_stmt_template w_templ = STMT_TEMPLATE(15, REPLACE, 200);
 	vy_cache_on_write_template(&cache, format, &w_templ);
-	vy_cache_builder_add(&builder, b);
+	vy_cache_builder_add(&builder, b, /*is_stale=*/false);
 	vy_cache_builder_destroy(&builder);
 	/*
 	 * The write into (a, b) destroyed a's pending link: no link

@@ -1480,14 +1480,12 @@ vy_cache_on_rollback(struct vy_cache *cache, struct vy_entry entry)
 void
 vy_cache_builder_create(struct vy_cache_builder *builder,
 			struct vy_cache *cache, enum iterator_type order,
-			struct vy_entry key, struct vy_entry last,
-			const struct vy_read_view **rv)
+			struct vy_entry key, struct vy_entry last)
 {
 	builder->cache = cache;
 	builder->order = order;
 	builder->key = key;
 	tuple_ref(key.stmt);
-	builder->rv = rv;
 	builder->last = vy_entry_none();
 	builder->last_pos = vy_cache_tree_invalid_iterator();
 	builder->chain_length = 0;
@@ -1503,11 +1501,6 @@ vy_cache_builder_create(struct vy_cache_builder *builder,
 	if (cache->env->mem_quota == 0)
 		return;
 	/*
-	 * The start bound, made ahead of the view gate below: a
-	 * reader it excludes from building -- a snapshot read
-	 * below the latest data -- still positions its first
-	 * seek with it (see vy_cache_iterator_seek()).
-	 *
 	 * A fresh scan starts at its search key's bound per the
 	 * iterator type. A resumed scan -- a paginated read
 	 * continuing after the position returned by the previous
@@ -1530,9 +1523,6 @@ vy_cache_builder_create(struct vy_cache_builder *builder,
 		start_order = iterator_resume_order(order);
 	}
 	builder->start_bound = vy_bound_new(start_key, start_order);
-	/* No chain below the latest data. */
-	if ((**rv).vlsn != INT64_MAX)
-		return;
 	/*
 	 * A full-key EQ does not need a lower or an upper bound
 	 * to identify its range, since it matches at most one
@@ -1600,14 +1590,11 @@ static void
 vy_cache_builder_close(struct vy_cache_builder *builder)
 {
 	/*
-	 * Only a latest observation completes a chain: a
-	 * displaced reader may have silently skipped statements
-	 * above its view anywhere in its range, so its end key
-	 * would witness a range it never fully saw. A disabled
-	 * cache completes nothing either.
+	 * A disabled cache completes nothing. A tainted tail
+	 * never reaches this point: vy_cache_builder_add()
+	 * breaks the chain instead of closing it.
 	 */
-	if (builder->cache->env->mem_quota == 0 ||
-	    (**builder->rv).vlsn != INT64_MAX) {
+	if (builder->cache->env->mem_quota == 0) {
 		vy_cache_builder_break_link(builder);
 		return;
 	}
@@ -1639,7 +1626,8 @@ vy_cache_builder_close(struct vy_cache_builder *builder)
 
 /** See the comment in vy_cache.h. */
 void
-vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr)
+vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr,
+		     bool is_stale)
 {
 	struct vy_cache *cache = builder->cache;
 	/* The cache is disabled. */
@@ -1647,7 +1635,17 @@ vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr)
 		return;
 	/* The end of matches: not an admission, close the chain. */
 	if (curr.stmt == NULL) {
-		vy_cache_builder_close(builder);
+		/*
+		 * A tainted tail -- the walk from the last result
+		 * to the end of matches crossed a statement above
+		 * the read view -- ends the chain without an end
+		 * bound: the tail was not proven empty for every
+		 * reader.
+		 */
+		if (is_stale)
+			vy_cache_builder_break_link(builder);
+		else
+			vy_cache_builder_close(builder);
 		return;
 	}
 	/*
@@ -1665,13 +1663,23 @@ vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr)
 	assert(vy_stmt_type(curr.stmt) != IPROTO_DELETE);
 	/*
 	 * A prepared result is retractable and never admitted --
-	 * see the prepared-data contract in vy_cache_insert() --
-	 * and a reader that does not see the latest data may have
-	 * read a point newer writes overtook: the chain breaks,
+	 * see the prepared-data contract in vy_cache_insert().
+	 */
+	if (vy_lsn_is_prepared(vy_stmt_lsn(curr.stmt))) {
+		vy_cache_builder_break_link(builder);
+		return;
+	}
+	/*
+	 * A stale result is shadowed by a version above the read
+	 * view: it is not the latest and must not be cached, and
+	 * the advance that produced it crossed the shadow, so no
+	 * link may span the gap either (see
+	 * vy_read_iterator::is_stale; VY_STMT_STALE carries the
+	 * same verdict for a primary tuple resolved from a
+	 * secondary key after the advance). The chain breaks,
 	 * exactly as it does in vy_cache_builder_add_delete().
 	 */
-	if (vy_lsn_is_prepared(vy_stmt_lsn(curr.stmt)) ||
-	    (**builder->rv).vlsn != INT64_MAX) {
+	if (is_stale || vy_stmt_has_flag(curr.stmt, VY_STMT_STALE)) {
 		vy_cache_builder_break_link(builder);
 		return;
 	}
@@ -1688,7 +1696,7 @@ vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr)
 void
 vy_cache_builder_add_delete(struct vy_cache_builder *builder,
 			    struct vy_entry delete_key,
-			    int64_t delete_lsn)
+			    int64_t delete_lsn, bool is_stale)
 {
 	struct vy_cache *cache = builder->cache;
 	/* The cache is disabled. */
@@ -1696,16 +1704,14 @@ vy_cache_builder_add_delete(struct vy_cache_builder *builder,
 		return;
 	/*
 	 * No link may span a retractable shadow (see vy_cache.h),
-	 * and a reader that does not see the latest data may have
-	 * been overtaken by newer writes: the chain breaks. The
-	 * cached entry, if any, is left alone -- the verdict is
-	 * tentative (a prepared shadow may roll back, a displaced
-	 * reader's knowledge is outdated), and once the key is
-	 * proven dead at the latest view, the recorded DELETE
-	 * replaces the stale row in place.
+	 * and a stale verdict is shadowed by a version above the
+	 * read view: the chain breaks. The cached entry, if any,
+	 * is left alone -- the verdict is tentative (a prepared
+	 * shadow may roll back, a stale reader's knowledge is
+	 * outdated), and once the key is proven dead, the
+	 * recorded DELETE replaces the stale row in place.
 	 */
-	if (vy_lsn_is_prepared(delete_lsn) ||
-	    (**builder->rv).vlsn != INT64_MAX) {
+	if (vy_lsn_is_prepared(delete_lsn) || is_stale) {
 		vy_cache_builder_break_link(builder);
 		return;
 	}
@@ -1817,9 +1823,13 @@ vy_cache_builder_on_read(struct vy_cache_builder *builder,
 	/* The cache is disabled. */
 	if (cache->env->mem_quota == 0)
 		return;
-	/* A reader below the latest data forms no links. */
-	if ((**builder->rv).vlsn != INT64_MAX)
-		return;
+	/*
+	 * A result served over observed links consulted no deeper
+	 * source in the gap it rode over, and the chain proves the
+	 * gap empty at every version: nothing above any read view
+	 * can have been skipped, so the links extend for every
+	 * reader.
+	 */
 	/*
 	 * Open the pending link in place: the entry is at hand --
 	 * under the cache iterator's cursor, or just inserted --
@@ -2395,11 +2405,10 @@ vy_cache_iterator_restore(struct vy_cache_iterator *itr, struct vy_entry last,
 	 * a hop from it -- no tree descent -- re-examining the
 	 * range between the reader and its next candidate
 	 * against the new content. A reader whose chain is dead
-	 * -- broken, refused, or never built (a read below the
-	 * latest data) -- re-seeks instead. The re-seek is cheap
-	 * in context: such a reader is mid-descent into the
-	 * deeper sources, whose cost dwarfs the seek, or on a
-	 * rare path.
+	 * -- broken, refused, or never built -- re-seeks
+	 * instead. The re-seek is cheap in context: such a
+	 * reader is mid-descent into the deeper sources, whose
+	 * cost dwarfs the seek, or on a rare path.
 	 */
 	struct vy_cache_builder *builder = itr->builder;
 	struct vy_cache_entry *front = NULL;
