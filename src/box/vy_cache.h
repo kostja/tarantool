@@ -628,21 +628,11 @@ struct vy_cache_builder {
 	 * space for a range reader. Made at creation, inserted at
 	 * close, when a completed walk links its last result to
 	 * it (see vy_cache_builder_close()). Owns a reference.
-	 * None in three cases: no chain is being built at all --
-	 * the cache is disabled, or the reader does not see the
-	 * latest data; a full-key EQ, which inserts no bounds;
+	 * None in three cases: the cache is disabled and no
+	 * chain is built; a full-key EQ, which inserts no bounds;
 	 * creation failure, when the chain simply ends unlinked.
 	 */
 	struct vy_entry end_bound;
-	/**
-	 * The reader's view. Only the newest version of a key
-	 * may enter the cache; the builder gates on
-	 * vlsn == INT64_MAX, where every result is the newest by
-	 * definition. The gate is sufficient, not necessary: a
-	 * snapshot read below the latest data can also witness
-	 * that its result is the newest.
-	 */
-	const struct vy_read_view **rv;
 	/** The chain's frontier: the last added point, referenced. */
 	struct vy_entry last;
 	/**
@@ -671,13 +661,13 @@ struct vy_cache_builder {
 
 /**
  * Initialize a builder: issue its scan id and open the chain's
- * leading pending link, unless the reader does not see the
- * latest data. A read from the start inserts the bound key of
- * its search key and opens the pending link on it (a full-key
- * EQ does not insert it, the bound key only positions the
- * cache iterator). A read resumed after @a last inserts the
- * bound key of the resume position instead: the range before
- * it was not observed, and nothing is recorded about it. The
+ * leading pending link. A read from the start inserts the
+ * bound key of its search key and opens the pending link on it
+ * (a full-key EQ does not insert it, the bound key only
+ * positions the cache iterator). A read resumed after @a last
+ * inserts the bound key of the resume position instead: the
+ * range before it was not observed, and nothing is recorded
+ * about it. The
  * builder is created before the reader's first advance, and so
  * before its first yield: the first added point links back
  * unless a write in between destroys the pending link.
@@ -685,8 +675,7 @@ struct vy_cache_builder {
 void
 vy_cache_builder_create(struct vy_cache_builder *builder,
 			struct vy_cache *cache, enum iterator_type order,
-			struct vy_entry key, struct vy_entry last,
-			const struct vy_read_view **rv);
+			struct vy_entry key, struct vy_entry last);
 
 /** Release the builder. */
 void
@@ -699,13 +688,20 @@ vy_cache_builder_destroy(struct vy_cache_builder *builder);
  * completed. A none result is the end of matches: the chain is
  * completed with the bound key it ends at -- the search key for
  * an EQ reader, the empty key for a range reader that ran out of
- * tuples. A reader that does not see the latest data may have
- * read a point newer tuples overwrite: it is not added, and the
- * chain breaks instead. Consumed DELETEs take their own path,
+ * tuples. A stale result -- one shadowed by a version above the
+ * reader's view, per @a is_stale or the VY_STMT_STALE flag --
+ * is not the latest: it is not added, and the chain breaks
+ * instead. Consumed DELETEs take their own path,
  * vy_cache_builder_add_delete().
+ * @param builder the reader's chain.
+ * @param curr the result, none at the end of matches.
+ * @param is_stale the advance that produced the result crossed
+ *        a statement above the reader's view, see
+ *        vy_read_iterator::is_stale.
  */
 void
-vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr);
+vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr,
+		     bool is_stale);
 
 /**
  * Record a consumed DELETE in the chain. A DELETE at or below
@@ -744,11 +740,14 @@ vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr);
  * @param delete_key the dead key statement.
  * @param delete_lsn the LSN of the statement that deleted the
  * key, 0 if unknown.
+ * @param is_stale the advance that produced the verdict crossed
+ * a statement above the reader's view: the chain breaks, see
+ * vy_cache_builder_add().
  */
 void
 vy_cache_builder_add_delete(struct vy_cache_builder *builder,
 			    struct vy_entry delete_key,
-			    int64_t delete_lsn);
+			    int64_t delete_lsn, bool is_stale);
 
 /**
  * Register a cache entry the reader produced: the entry becomes

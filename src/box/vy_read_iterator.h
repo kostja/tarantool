@@ -102,6 +102,47 @@ struct vy_read_iterator {
 	 * Used for detecting changes in the current range.
 	 */
 	uint32_t range_version;
+	/**
+	 * Set when the result of the current advance may be shadowed by a
+	 * version invisible in the read view: the result is not the
+	 * latest. A stale result must not be cached, or a later latest
+	 * read would be served the old value from the cache; a fresh one
+	 * equals the latest result and may be cached even at a non-global
+	 * read view.
+	 *
+	 * The exact, all-information way to compute staleness is to have
+	 * every source emit every version of every key, including
+	 * invisible ones, and let the merge mark the result stale iff it
+	 * saw a version above the read view. As an optimization the
+	 * sources instead skip invisible statements and report two bits
+	 * in their place: is_stale, an exact verdict about the one key
+	 * the skip provably matches, and is_stale_link, recording a skip
+	 * that may shadow any key in the traversed interval. The second
+	 * bit is weaker than the tuple: it loses which key was skipped,
+	 * so it can only over-approximate, but always in the safe
+	 * direction -- at worst a fresh value is needlessly not cached.
+	 *
+	 * A shadowing version may live in the same source as the result
+	 * (if that source resolved the result's key, its exact is_stale
+	 * applies and is taken from the sources at the merge front once
+	 * the result is settled) or in a different source (which skipped
+	 * the key entirely and stopped past it -- from its point of view
+	 * a whole-key skip, so only is_stale_link testifies; it is ORed
+	 * in from every source on every advance and persists while the
+	 * source stays where it is). This flag is the merge-level verdict on
+	 * the current result, recomputed on every advance and consumed
+	 * by vy_cache_builder_add(). The cache source needs no
+	 * bits of its own: the cache is a read-through subset of the
+	 * memory and disk levels, so any version it would skip is also
+	 * skipped -- and flagged -- by a mem or run.
+	 *
+	 * Gap staleness tracking needs no extra state: is_stale_link
+	 * poisons the gap too, and the cache chain is broken right at
+	 * the discovery point, so no link can span the skipped statement
+	 * no matter how the result is consumed -- cached, dropped, or
+	 * lost to a restart.
+	 */
+	bool is_stale;
 	/** Range the iterator is currently positioned at. */
 	struct vy_range *curr_range;
 	/**

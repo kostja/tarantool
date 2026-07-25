@@ -524,12 +524,21 @@ struct vy_mem_iterator {
 	 */
 	int64_t min_skipped_plsn;
 	/**
-	 * Set to true if any statement was skipped because its LSN
-	 * exceeds the read view's vlsn. Used to decide whether a
-	 * snapshot TX's lookup result is safe to cache: if nothing
-	 * was skipped, the result equals the global result.
+	 * Set to true if a newer version of the resolved key was
+	 * skipped as invisible in the read view. Used to decide
+	 * whether the result is safe to cache: if nothing was
+	 * skipped, it equals the latest result.
 	 */
 	bool is_stale;
+	/**
+	 * Set to true if a skipped invisible statement may shadow any
+	 * key in the traversed interval, not just the resolved one: a
+	 * whole key stepped past, or a sibling under a partial EQ key.
+	 * A range scan must account for it in addition to is_stale,
+	 * for values and cache chain links both.
+	 * See vy_read_iterator::is_stale.
+	 */
+	bool is_stale_link;
 };
 
 /**

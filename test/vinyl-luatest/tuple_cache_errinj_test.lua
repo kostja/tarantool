@@ -523,6 +523,68 @@ g.test_scan_does_not_claim_row_inserted_while_suspended = function(cg)
     end)
 end
 
+-- A reader below a committed insert finds it invisible and
+-- descends to the lower sources -- the mem and the runs. The
+-- link that would span the insert must not form: the read
+-- iterator marks the link to-be stale, and the mark must
+-- survive a dump that rotates the source holding the insert
+-- mid-scan: the reader yields on a disk read, the invisible
+-- statement moves from memory to a run, and the resumed walk
+-- completes the chain. A lost mark would let the chain claim
+-- the range over the insert, and a later reader at the latest
+-- view would be served the claim without the key.
+g.test_stale_mark_survives_dump_rotation = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {unique = false,
+                              parts = {{2, 'unsigned'},
+                                       {3, 'unsigned'}}})
+        s:replace{10, 6, 9}
+        s:replace{30, 6, 9}
+        s:replace{99, 1, 1}
+        box.snapshot()
+        -- The reader pins its view below the insert.
+        local pinned = fiber.channel(1)
+        local go = fiber.channel(1)
+        local done = fiber.channel(1)
+        local reader = fiber.create(function()
+            box.begin({txn_isolation = 'snapshot'})
+            s:get{99}
+            pinned:put(true)
+            go:get()
+            done:put(s.index.sk:select({6}, {iterator = 'GE'}))
+            box.commit()
+        end)
+        reader:set_joinable(true)
+        t.assert(pinned:get())
+        s:replace{20, 6, 9}
+        -- Delay the reader's disk reads: it finds {20} invisible
+        -- in memory and suspends before returning {30} from the
+        -- run.
+        box.error.injection.set('ERRINJ_VY_READ_PAGE_DELAY', true)
+        go:put(true)
+        -- One yield runs the reader until it blocks on the
+        -- delayed disk read.
+        fiber.yield()
+        -- Rotate: the dump moves {20} into a run while the
+        -- reader is suspended mid-scan. The join returns when the
+        -- checkpoint -- the rotation included -- is complete.
+        local dumper = fiber.create(function()
+            box.snapshot()
+        end)
+        dumper:set_joinable(true)
+        t.assert_equals({dumper:join()}, {true})
+        box.error.injection.set('ERRINJ_VY_READ_PAGE_DELAY', false)
+        t.assert_equals(done:get(), {{10, 6, 9}, {30, 6, 9}})
+        reader:join()
+        -- The latest view must see the inserted row.
+        t.assert_equals(s.index.sk:select({6}, {iterator = 'GE'}),
+                        {{10, 6, 9}, {20, 6, 9}, {30, 6, 9}})
+    end)
+end
+
 --
 -- 3. Dead keys under concurrent change.
 --

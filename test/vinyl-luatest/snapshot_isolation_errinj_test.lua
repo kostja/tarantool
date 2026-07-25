@@ -132,6 +132,285 @@ g.test_errinj_readonly_tx_aborted_on_wal_failure = function(cg)
     end)
 end
 
+-- The autocommit counterpart of the secondary-read cache guard.
+-- An autocommit read through a unique secondary index resolves the
+-- full tuple from the primary index. It runs at the committed read
+-- view, so it never observes a concurrent prepared (not yet
+-- committed) primary write -- it returns the committed tuple. Because
+-- a newer version was skipped, the resolved primary tuple must not
+-- populate the primary cache, or a later read could get the old
+-- tuple after the prepared write commits.
+g.test_errinj_autocommit_secondary_read_excludes_prepared = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {parts = {2, 'unsigned'}, unique = true})
+        s:replace{1, 100, 'init'}
+        box.snapshot()
+
+        -- TX_A prepares a new version of key 1 but its WAL is delayed.
+        -- The secondary key (100) is unchanged.
+        box.error.injection.set('ERRINJ_WAL_DELAY', true)
+        local stmts = box.stat.vinyl().tx.statements
+        local ch_a = fiber.channel(1)
+        fiber.create(function()
+            local ok = pcall(s.replace, s, {1, 100, 'doomed'})
+            ch_a:put(ok)
+        end)
+        -- Wait until the write is prepared and suspended in the delayed
+        -- WAL write: the replace fills the transaction write set
+        -- before committing, and once the statement count grows the
+        -- only yield left on its way is the WAL write itself.
+        t.helpers.retrying({}, function()
+            t.assert_gt(box.stat.vinyl().tx.statements, stmts)
+        end)
+
+        -- The autocommit secondary read sees the committed value and
+        -- must not cache it (the prepared version was skipped).
+        local before = s.index.pk:stat().cache.put.rows
+        t.assert_equals(s.index.sk:get(100), {1, 100, 'init'})
+        local after = s.index.pk:stat().cache.put.rows
+        t.assert_equals(after - before, 0,
+            'an autocommit secondary read that skipped a prepared '
+            .. 'primary write must not populate the cache')
+
+        -- Fail TX_A's WAL: the read was right to ignore it.
+        box.error.injection.set('ERRINJ_WAL_WRITE_DISK', true)
+        box.error.injection.set('ERRINJ_WAL_DELAY', false)
+        t.assert_not(ch_a:get(), 'TX_A must fail WAL')
+        box.error.injection.set('ERRINJ_WAL_WRITE_DISK', false)
+        t.assert_equals(s.index.sk:get(100), {1, 100, 'init'})
+    end)
+end
+
+-- An autocommit scan that skips a prepared (not yet committed) write
+-- still returns and caches the latest committed value. Skipping a
+-- prepared statement does not make the committed result stale -- the
+-- prepared version is not newer committed data -- so caching is correct
+-- and safe: the prepared version shadows the cached one for prepared-ok
+-- readers, and the prepared TX's commit would invalidate the cache. The
+-- cache must stay correct after the prepared TX rolls back.
+g.test_errinj_autocommit_scan_skipping_prepared_not_cached = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'committed'}
+        box.snapshot()
+
+        -- TX_A prepares a newer version of key 1 with WAL delayed.
+        box.error.injection.set('ERRINJ_WAL_DELAY', true)
+        local stmts = box.stat.vinyl().tx.statements
+        local ch_a = fiber.channel(1)
+        fiber.create(function()
+            local ok = pcall(s.replace, s, {1, 'prepared'})
+            ch_a:put(ok)
+        end)
+        -- Wait until the write is prepared and suspended in the delayed
+        -- WAL write: the replace fills the transaction write set
+        -- before committing, and once the statement count grows the
+        -- only yield left on its way is the WAL write itself.
+        t.helpers.retrying({}, function()
+            t.assert_gt(box.stat.vinyl().tx.statements, stmts)
+        end)
+
+        local before = s.index.pk:stat().cache.put.rows
+        -- An autocommit scan sees the committed value, skipping
+        -- prepared. It must not cache: a chain claim would cross the
+        -- in-flight statement, which a read-committed scan may have
+        -- cached as a chained node.
+        t.assert_equals(s:select(), {{1, 'committed'}})
+        local after = s.index.pk:stat().cache.put.rows
+        t.assert_equals(after - before, 0,
+            'a scan that skipped a prepared write does not cache '
+            .. 'while the write is in flight')
+
+        -- Fail TX_A's WAL so the prepared write is rolled back.
+        box.error.injection.set('ERRINJ_WAL_WRITE_DISK', true)
+        box.error.injection.set('ERRINJ_WAL_DELAY', false)
+        t.assert_not(ch_a:get(), 'TX_A must fail WAL')
+        box.error.injection.set('ERRINJ_WAL_WRITE_DISK', false)
+
+        -- The cache still serves the committed value.
+        t.assert_equals(s:get(1), {1, 'committed'})
+        t.assert_equals(s:select(), {{1, 'committed'}})
+    end)
+end
+
+g.after_test('test_errinj_autocommit_scan_skipping_prepared_not_cached',
+             function(cg)
+    cg.server:exec(function()
+        box.error.injection.set('ERRINJ_WAL_DELAY', false)
+        box.error.injection.set('ERRINJ_WAL_WRITE_DISK', false)
+    end)
+end)
+
+-- A scan sent to a pseudo-LSN read view by prepared writes must not
+-- cache a chain link across a prepared statement it silently skips.
+-- A read-committed scan may have cached that statement as a chained
+-- node; the link would cross it. Two suspended writers: the newer one
+-- sends the reader to a read view right above the older one, so the
+-- older statement is skipped as prepared, not by LSN.
+g.test_read_view_scan_does_not_link_across_prepared = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{10, 'a'}
+        s:replace{30, 'b'}
+        s:replace{40, 'c'}
+
+        -- Suspend three prepared writes, oldest first. The oldest, {50},
+        -- keeps the read view sent below {20} on a pseudo LSN, so the
+        -- scan cannot recover by re-reading at a committed view.
+        box.error.injection.set('ERRINJ_WAL_DELAY', true)
+        local ch = fiber.channel(3)
+        for _, row in ipairs({{50, 'w'}, {20, 'prepared'},
+                              {40, 'new'}}) do
+            local stmts = box.stat.vinyl().tx.statements
+            fiber.create(function()
+                local ok = pcall(s.replace, s, row)
+                ch:put(ok)
+            end)
+            t.helpers.retrying({}, function()
+                t.assert_gt(box.stat.vinyl().tx.statements, stmts)
+            end)
+        end
+
+        -- A read-committed scan caches the prepared statements as
+        -- chained nodes.
+        box.begin({txn_isolation = 'read-committed'})
+        t.assert_equals(s:select(), {{10, 'a'}, {20, 'prepared'},
+                                     {30, 'b'}, {40, 'new'},
+                                     {50, 'w'}})
+        box.commit()
+
+        -- The reader: a read-only best-effort transaction starts at
+        -- the global read view but does not see prepared statements.
+        -- Reading {40}, shadowed by the newer prepared write, sends
+        -- it to a read view right above the older one. The scan then
+        -- skips {20} as prepared and must not claim the gap between
+        -- {10} and {30} is empty.
+        box.begin({txn_isolation = 'best-effort'})
+        t.assert_equals(s:get(40), {40, 'c'})
+        t.assert_equals(s:select(), {{10, 'a'}, {30, 'b'}, {40, 'c'}})
+        box.commit()
+
+        -- Let the writers commit; every reader must see their writes.
+        box.error.injection.set('ERRINJ_WAL_DELAY', false)
+        for _ = 1, 3 do
+            t.assert(ch:get(), 'writer must commit')
+        end
+        t.assert_equals(s:select(), {{10, 'a'}, {20, 'prepared'},
+                                     {30, 'b'}, {40, 'new'},
+                                     {50, 'w'}})
+        t.assert_equals(s:get(20), {20, 'prepared'})
+    end)
+end
+
+-- A scan at the committed boundary must not cache a chain link across
+-- a concurrently prepared statement. The prepared statement is the
+-- only content of the active in-memory level, which the scan prunes
+-- as entirely invisible -- yet a read-committed scan may have already
+-- cached that statement as a chained node, and a link crossing it
+-- corrupts the cache.
+g.test_committed_scan_does_not_link_across_prepared = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{10, 'a'}
+        s:replace{30, 'b'}
+        box.snapshot()
+
+        -- Suspend {20} prepared: the active mem holds only this statement.
+        local stmts = box.stat.vinyl().tx.statements
+        box.error.injection.set('ERRINJ_WAL_DELAY', true)
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            local ok = pcall(s.replace, s, {20, 'prepared'})
+            ch:put(ok)
+        end)
+        t.helpers.retrying({}, function()
+            t.assert_gt(box.stat.vinyl().tx.statements, stmts)
+        end)
+
+        -- A read-committed scan sees the prepared statement and caches
+        -- it as a chained node.
+        box.begin({txn_isolation = 'read-committed'})
+        t.assert_equals(s:select(),
+                        {{10, 'a'}, {20, 'prepared'}, {30, 'b'}})
+        box.commit()
+
+        -- A committed-boundary scan does not see {20} and must not
+        -- claim the gap between {10} and {30} is empty.
+        t.assert_equals(s:select(), {{10, 'a'}, {30, 'b'}})
+
+        -- Let the writer commit; every reader must see {20} now.
+        box.error.injection.set('ERRINJ_WAL_DELAY', false)
+        t.assert(ch:get(), 'writer must commit')
+        t.assert_equals(s:select(),
+                        {{10, 'a'}, {20, 'prepared'}, {30, 'b'}})
+        t.assert_equals(s:get(20), {20, 'prepared'})
+    end)
+end
+
+-- A read-confirmed scan runs at the global read view and skips
+-- prepared statements explicitly (a pseudo-LSN is still below the
+-- global view's infinity). The skip suppresses caching: a
+-- read-committed scan may have cached the skipped statement as a
+-- chained node, and a chain link cached across it would corrupt the
+-- cache -- confirm-time invalidation cannot heal such a link.
+g.test_read_confirmed_scan_skipping_prepared_not_cached = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'old'}
+        s:replace{2, 'keep'}
+        box.snapshot()
+        -- A committed row in the same in-memory level as the prepared
+        -- statement, so the level is scanned rather than pruned as
+        -- entirely invisible.
+        s:replace{3, 'mem'}
+
+        local stmts = box.stat.vinyl().tx.statements
+        box.error.injection.set('ERRINJ_WAL_DELAY', true)
+        local ch_a = fiber.channel(1)
+        fiber.create(function()
+            local ok = pcall(s.replace, s, {1, 'new'})
+            ch_a:put(ok)
+        end)
+        -- Wait until the write is prepared and suspended in the delayed
+        -- WAL write: the replace fills the transaction write set
+        -- before committing, and once the statement count grows the
+        -- only yield left on its way is the WAL write itself.
+        t.helpers.retrying({}, function()
+            t.assert_gt(box.stat.vinyl().tx.statements, stmts)
+        end)
+
+        local before = s.index.pk:stat().cache.put.rows
+        box.begin({txn_isolation = 'read-confirmed'})
+        t.assert_equals(s:select(),
+                        {{1, 'old'}, {2, 'keep'}, {3, 'mem'}})
+        box.commit()
+        local after = s.index.pk:stat().cache.put.rows
+        t.assert_equals(after - before, 0,
+            'a read-confirmed scan that skipped a prepared statement '
+            .. 'does not populate the cache while the write is in '
+            .. 'flight')
+
+        -- Let the writer commit: its confirm invalidates the cached
+        -- old version, so a latest read sees the new one.
+        box.error.injection.set('ERRINJ_WAL_DELAY', false)
+        t.assert(ch_a:get(), 'writer must commit')
+        t.assert_equals(s:get(1), {1, 'new'})
+        t.assert_equals(s:select(),
+                        {{1, 'new'}, {2, 'keep'}, {3, 'mem'}})
+    end)
+end
+
 -- WAL write failure: concurrent TX's write fails and is
 -- rolled back. SNAPSHOT TX writing a different key should
 -- not be affected.
@@ -997,6 +1276,233 @@ g.test_scan_cache_with_concurrent_insert = function(cg)
     end)
 end
 
+-- A secondary index scan resolves each secondary key to a full tuple
+-- via a lookup in the primary index, which yields on a disk read. That
+-- yield happens between vy_read_iterator_next() (which fixed the scan's
+-- staleness state) and vy_read_iterator_cache_add() (which caches the
+-- gap). A concurrent
+-- write during the yield lands an invisible key in the gap the scan already
+-- traversed; the scan does not restore across this yield, so it caches a gap
+-- link spanning that key -- a cache chain intersection.
+g.test_secondary_scan_caches_gap_over_concurrent_insert = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        -- Deferred deletes avoid a synchronous lookup of the old tuple
+        -- in the primary index on REPLACE, which would otherwise also
+        -- block on the injected delay.
+        local defer_deletes = box.cfg.vinyl_defer_deletes
+        box.cfg{vinyl_defer_deletes = true}
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {unique = false, parts = {{2, 'unsigned'}}})
+
+        -- Second key's primary (pk 2, sk 30) lives on disk only, so its
+        -- point lookup reaches the disk scan and blocks.
+        s:replace{2, 30}
+        box.snapshot()
+        -- First key's primary (pk 1, sk 10) stays in memory, so its point
+        -- lookup is terminal before the disk scan and does not block.
+        s:replace{1, 10}
+
+        box.error.injection.set('ERRINJ_VY_POINT_LOOKUP_DELAY', true)
+
+        local lookups = s.index.pk:stat().lookup
+        local done = fiber.channel(1)
+        fiber.create(function()
+            box.begin({txn_isolation = 'read-committed'})
+            -- Caches sk 10 (primary in memory), then blocks resolving sk 30.
+            local r = s.index.sk:select({}, {fullscan = true})
+            box.commit()
+            done:put(r)
+        end)
+        -- Wait until the scan blocks on the second key's primary
+        -- lookup: the lookup counter is bumped before the injected
+        -- delay and nothing yields in between.
+        t.helpers.retrying({}, function()
+            t.assert_ge(s.index.pk:stat().lookup, lookups + 2)
+        end)
+
+        -- Insert an invisible key in the already-traversed gap (sk 20, between
+        -- sk 10 and sk 30) and cache its secondary node via a latest read.
+        s:replace{3, 20}
+        t.assert_equals(s.index.sk:select({20}), {{3, 20}})
+
+        -- Resume: the scan caches sk 10 -> sk 30 across the cached sk 20.
+        box.error.injection.set('ERRINJ_VY_POINT_LOOKUP_DELAY', false)
+        local r = done:get(5)
+        -- sk 20 was invisible to the read-committed view; the scan yields the
+        -- two committed keys and must not have corrupted the cache.
+        t.assert_equals(r, {{1, 10}, {2, 30}})
+        box.cfg{vinyl_defer_deletes = defer_deletes}
+    end)
+end
+
+-- Same restore-path gap as the previous test, but on a multikey
+-- index: a concurrent multikey write during the yield in the
+-- primary-index lookup lands an index entry in the gap the scan
+-- already traversed. The gap
+-- must not be cached as empty.
+g.test_multikey_scan_caches_gap_over_concurrent_insert = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local defer_deletes = box.cfg.vinyl_defer_deletes
+        box.cfg{vinyl_defer_deletes = true}
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('mk', {unique = false,
+                              parts = {{'[5][*]', 'unsigned'}}})
+
+        -- Second key (mk 30, pk 2) on disk only; its primary-index
+        -- lookup blocks.
+        s:replace{2, 1, 1, 1, {30}}
+        box.snapshot()
+        -- First key (mk 10, pk 1) in memory; its primary-index lookup
+        -- is terminal.
+        s:replace{1, 1, 1, 1, {10}}
+
+        box.error.injection.set('ERRINJ_VY_POINT_LOOKUP_DELAY', true)
+
+        local lookups = s.index.pk:stat().lookup
+        local done = fiber.channel(1)
+        fiber.create(function()
+            box.begin({txn_isolation = 'read-committed'})
+            local r = s.index.mk:select({}, {fullscan = true})
+            box.commit()
+            done:put(r)
+        end)
+        -- Wait until the scan blocks on the second key's primary
+        -- lookup: the lookup counter is bumped before the injected
+        -- delay and nothing yields in between.
+        t.helpers.retrying({}, function()
+            t.assert_ge(s.index.pk:stat().lookup, lookups + 2)
+        end)
+
+        -- Concurrent multikey write: mk 20 falls between mk 10 and mk 30.
+        s:replace{3, 1, 1, 1, {20}}
+        t.assert_equals(s.index.mk:select({20}), {{3, 1, 1, 1, {20}}})
+
+        box.error.injection.set('ERRINJ_VY_POINT_LOOKUP_DELAY', false)
+        local r = done:get(5)
+        t.assert_equals(r, {{1, 1, 1, 1, {10}}, {2, 1, 1, 1, {30}}})
+        box.cfg{vinyl_defer_deletes = defer_deletes}
+    end)
+end
+
+-- Same yield as the chain-link case above, but on the scan's FIRST
+-- result: the cached node carries a "first matching" boundary claiming
+-- nothing precedes it. A concurrent insert below it during the yield
+-- must not be hidden from later readers by that boundary.
+g.test_secondary_scan_first_boundary_over_concurrent_insert = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local defer_deletes = box.cfg.vinyl_defer_deletes
+        box.cfg{vinyl_defer_deletes = true}
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {unique = false, parts = {{2, 'unsigned'}}})
+
+        -- The first key's primary lives on disk, so resolving it blocks.
+        s:replace{1, 10}
+        box.snapshot()
+
+        box.error.injection.set('ERRINJ_VY_POINT_LOOKUP_DELAY', true)
+
+        local lookups = s.index.pk:stat().lookup
+        local done = fiber.channel(1)
+        fiber.create(function()
+            box.begin({txn_isolation = 'read-committed'})
+            local r = s.index.sk:select({}, {fullscan = true})
+            box.commit()
+            done:put(r)
+        end)
+        -- Wait until the scan blocks on the first key's primary
+        -- lookup: the lookup counter is bumped before the injected
+        -- delay and nothing yields in between.
+        t.helpers.retrying({}, function()
+            t.assert_ge(s.index.pk:stat().lookup, lookups + 1)
+        end)
+
+        -- Insert a key below the blocked first result. No read after
+        -- it: the key must stay out of the cache so a stale "first"
+        -- boundary cannot be masked by the key's own cache node.
+        s:replace{2, 5}
+
+        box.error.injection.set('ERRINJ_VY_POINT_LOOKUP_DELAY', false)
+        local r = done:get(5)
+        -- sk 5 was invisible to the scan's view.
+        t.assert_equals(r, {{1, 10}})
+
+        -- A latest reader must see sk 5; a cached "first" boundary on
+        -- sk 10 would hide it.
+        t.assert_equals(s.index.sk:select({}, {fullscan = true}),
+                        {{2, 5}, {1, 10}})
+        box.cfg{vinyl_defer_deletes = defer_deletes}
+    end)
+end
+
+-- Same restore-path gap as the plain secondary index scan, but a dump
+-- moves the concurrently inserted key to a run during the yield. The dump
+-- rotates the in-memory level, so a walk of the mems can no longer see the
+-- key -- only the mem-list version bump catches it, and the walk itself is
+-- then unsafe (the rotated mem's tree is gone). If the scan still caches the
+-- gap as empty, a later latest scan follows the cached chain, never reads the
+-- run, and hides the dumped key.
+g.test_secondary_scan_caches_gap_over_dumped_insert = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local defer_deletes = box.cfg.vinyl_defer_deletes
+        box.cfg{vinyl_defer_deletes = true}
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {unique = false, parts = {{2, 'unsigned'}}})
+
+        -- Second key's primary (pk 2, sk 30) lives on disk only, so its
+        -- point lookup reaches the disk scan and blocks.
+        s:replace{2, 30}
+        box.snapshot()
+        -- First key's primary (pk 1, sk 10) stays in memory, so its point
+        -- lookup is terminal before the disk scan and does not block.
+        s:replace{1, 10}
+
+        box.error.injection.set('ERRINJ_VY_POINT_LOOKUP_DELAY', true)
+
+        local lookups = s.index.pk:stat().lookup
+        local done = fiber.channel(1)
+        fiber.create(function()
+            box.begin({txn_isolation = 'read-committed'})
+            -- Caches sk 10, then blocks resolving sk 30.
+            local r = s.index.sk:select({}, {fullscan = true})
+            box.commit()
+            done:put(r)
+        end)
+        -- Wait until the scan blocks on the second key's primary
+        -- lookup: the lookup counter is bumped before the injected
+        -- delay and nothing yields in between.
+        t.helpers.retrying({}, function()
+            t.assert_ge(s.index.pk:stat().lookup, lookups + 2)
+        end)
+
+        -- Insert an invisible key in the already-traversed gap (sk 20,
+        -- between sk 10 and sk 30) and dump it to a run, rotating the
+        -- in-memory level so sk 20 lives on disk, invisible to a mem walk.
+        s:replace{3, 20}
+        box.snapshot()
+
+        -- Resume: the scan caches sk 30 and must not link it back to sk 10
+        -- across the dumped sk 20.
+        box.error.injection.set('ERRINJ_VY_POINT_LOOKUP_DELAY', false)
+        local r = done:get(5)
+        -- sk 20 was invisible to the read-committed view.
+        t.assert_equals(r, {{1, 10}, {2, 30}})
+
+        -- A latest scan must see sk 20: the gap must not have been cached
+        -- as empty across the dumped key.
+        t.assert_equals(s.index.sk:select({}, {fullscan = true}),
+                        {{1, 10}, {3, 20}, {2, 30}})
+        box.cfg{vinyl_defer_deletes = defer_deletes}
+    end)
+end
+
 -- Snapshot scan where a concurrent writer deletes a key
 -- in the scan range. The delete is invisible to the snapshot
 -- but must be visible to autocommit.
@@ -1426,5 +1932,108 @@ g.test_scan_does_not_resurrect_overwritten_anchor = function(cg)
         t.assert_equals(s:get(1), {1, 'v3'})
         t.assert_equals(s:select(),
                         {{1, 'v3'}, {2, 'w'}, {5, 'z'}})
+    end)
+end
+
+-- A snapshot scan below the latest data must not claim that the
+-- gaps it walks are empty. The write of {2} commits after the
+-- reader's view is pinned and before the reader's scan runs, so
+-- write-path invalidation precedes the scan's own chain and
+-- cannot protect it: only the scan's refusal to link over a
+-- statement above its view (is_stale) does. A false link from
+-- {1} to {3} would grant later readers a skip over {2}.
+g.test_stale_snapshot_scan_does_not_link_over_invisible_write =
+        function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 100}
+        s:replace{3, 300}
+        box.snapshot()
+
+        -- Pin the snapshot view before the write.
+        box.begin()
+        t.assert_equals(s:get(1), {1, 100})
+
+        -- The write commits after the view is pinned: invisible
+        -- to this transaction.
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            local ok = pcall(s.replace, s, {2, 200})
+            ch:put(ok)
+        end)
+        t.assert(ch:get(), 'writer must commit')
+
+        -- The snapshot scan does not see {2} and must not link
+        -- {1} to {3} across it.
+        t.assert_equals(s:select(), {{1, 100}, {3, 300}})
+        box.commit()
+
+        -- A latest scan must see the write the snapshot scan
+        -- could not.
+        t.assert_equals(s:select(), {{1, 100}, {2, 200}, {3, 300}})
+    end)
+end
+
+-- A scan that found nothing takes its start bound back at close,
+-- and the pending links facing the bound survive the removal: a
+-- pending link is aborted by any write into the range it is
+-- extended over, the bound's position included, so a link still
+-- pending when the bound goes proves its range write-free. The
+-- suspended scan's chain completes over the widened adjacency and
+-- serves repeat scans; a write inside it still splits it.
+g.test_pending_link_survives_start_bound_removal = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {parts = {{1, 'unsigned'},
+                                       {2, 'unsigned'}}})
+        s:replace{10, 0}
+        s:replace{30, 0}
+        box.snapshot()
+
+        -- The scanning transaction yields between its two results
+        -- on a fiber channel, leaving its pending link open at
+        -- {10, 0}.
+        local suspended = fiber.channel(1)
+        local resume = fiber.channel(1)
+        local done = fiber.channel(1)
+        fiber.create(function()
+            box.begin()
+            local rows = {}
+            for _, tuple in s:pairs() do
+                table.insert(rows, tuple:totable())
+                if #rows == 1 then
+                    suspended:put(true)
+                    resume:get()
+                end
+            end
+            box.commit()
+            done:put(rows)
+        end)
+        t.assert(suspended:get())
+
+        -- An empty partial-key EQ scan inserts its start bound
+        -- [20]- inside the pending span and takes it back at
+        -- close.
+        t.assert_equals(s:select({20}, {iterator = 'EQ'}), {})
+
+        -- The suspended scan resumes and completes its chain: no
+        -- write landed in its span.
+        resume:put(true)
+        t.assert_equals(done:get(), {{10, 0}, {30, 0}})
+
+        -- The chain serves a repeat scan without touching disk.
+        local lookups = s.index.pk:stat().disk.iterator.lookup
+        t.assert_equals(s:select(), {{10, 0}, {30, 0}})
+        t.assert_equals(s.index.pk:stat().disk.iterator.lookup,
+                        lookups,
+                        'a repeat scan is served from the cache')
+
+        -- A write inside the chain splits the link: the new key
+        -- must not be hidden.
+        s:replace{20, 0}
+        t.assert_equals(s:select(), {{10, 0}, {20, 0}, {30, 0}})
     end)
 end

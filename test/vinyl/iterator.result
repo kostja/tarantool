@@ -1,6 +1,6 @@
 --
--- Verify that the iterator uses the state of the space before the iterator
--- was created.
+-- Verify that the iterator uses the state of the space at the time
+-- of its first read, and does not see writes committed after it.
 --
 env = require('test_run')
 ---

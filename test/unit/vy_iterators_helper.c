@@ -206,14 +206,14 @@ vy_cache_insert_templates_chain(struct vy_cache *cache,
 	 */
 	struct vy_cache_builder builder;
 	vy_cache_builder_create(&builder, cache, order, key,
-				/*last=*/vy_entry_none(), &test_read_view);
+				/*last=*/vy_entry_none());
 	for (uint i = 0; i < length; ++i) {
 		struct vy_entry entry =
 			vy_new_simple_stmt(format, cache->cmp_def, &chain[i]);
-		vy_cache_builder_add(&builder, entry);
+		vy_cache_builder_add(&builder, entry, /*is_stale=*/false);
 		tuple_unref(entry.stmt);
 	}
-	vy_cache_builder_add(&builder, vy_entry_none());
+	vy_cache_builder_add(&builder, vy_entry_none(), /*is_stale=*/false);
 	vy_cache_builder_destroy(&builder);
 	tuple_unref(key.stmt);
 }

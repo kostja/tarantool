@@ -897,14 +897,20 @@ vy_cache_evict(struct vy_cache *cache, struct vy_entry entry)
  *   delete{20}, recorded right above the linked bound an
  *   earlier GE{15} scan left, raises that bound's LSN to its
  *   own and vanishes -- one entry now covers both deletes.
- * - The DELETE's predecessor is a tuple, e.g. delete{20} lands
- *   right above {10}: an LSN cannot attach to a tuple. If some
- *   reader's view is below the LSN -- the reader may still see
- *   key 20 alive -- the entry stays and splits the link in
- *   two. Invisible to that reader, it sends it to the deeper
- *   sources; for everyone else {10}-{20} and {20}-{40} stay
- *   linked. With no such reader the LSN protects nobody and
- *   the entry fuses away after all.
+ * - The DELETE's predecessor is a tuple: an LSN cannot attach
+ *   to a tuple. With no reader below the DELETE's LSN the
+ *   entry protects nobody and fuses away. With such a reader
+ *   the entry must not stay either. E.g. {10} is linked to a
+ *   bound key at LSN 2000, delete{15} at 2000 and delete{20}
+ *   at 1000 fused into it, and a reader at read view 1500
+ *   records delete{20} -- the one DELETE it sees. Kept as an
+ *   entry, {20} would split the link in two, and the {10}-{20}
+ *   half would keep the link flag with no LSN to guard it: the
+ *   recording reader itself would then cross from {20} to {10}
+ *   and miss {15}, alive at 1500. The link stays whole and
+ *   keeps gating every crossing by its ends: the DELETE fuses
+ *   into its successor when that is a bound key or a DELETE,
+ *   and is refused otherwise.
  * - A tuple lands between linked entries: the link promised an
  *   empty range and is now false -- destroy both halves. In
  *   practice this cannot happen: committing {20} invalidates
@@ -926,6 +932,7 @@ vy_cache_evict(struct vy_cache *cache, struct vy_entry entry)
  *        the survivor when the entry fuses away.
  * @param node the entry.
  * @retval the surviving entry.
+ * @retval NULL the entry was refused and removed.
  */
 static struct vy_cache_entry *
 vy_cache_relink(struct vy_cache *cache, struct vy_cache_tree_iterator *pos,
@@ -951,14 +958,54 @@ vy_cache_relink(struct vy_cache *cache, struct vy_cache_tree_iterator *pos,
 	} else if (vy_stmt_lsn(node->entry.stmt) >
 		   vy_tx_manager_horizon(cache->env->xm)) {
 		/*
-		 * A guarded DELETE above a tuple that cannot
-		 * carry the LSN: the entry stays, keeping the
-		 * (node, successor) half of the link, the
-		 * predecessor the (below, node) half.
+		 * A DELETE whose predecessor is a tuple, which
+		 * cannot carry an LSN. Keeping the DELETE as an
+		 * entry would split the claim in two, and a
+		 * reader crossing only the tuple's half would
+		 * never pass the entry guarding the whole claim.
+		 * Instead the DELETE fuses into its successor
+		 * when the successor is a bound key or a DELETE:
+		 * the successor's LSN is raised to the newer of
+		 * the two, the new entry is removed, and the
+		 * claim stays whole, gated by the successor for
+		 * this key too. E.g. a reverse scan paginated at
+		 * {21} fused delete{20} at LSN 1500 and
+		 * delete{15} at LSN 2000 into its start bound
+		 * and linked the tuple {10} to it. A reader at
+		 * read view 1700 does not see the bound at 2000,
+		 * descends, and records the one DELETE it does
+		 * see, delete{20}: the record lands between {10}
+		 * and the bound and fuses back into it -- the
+		 * bound's LSN, already above, needs no raise --
+		 * and the {10}-bound claim stays whole. A raise
+		 * is safe: it only narrows the successor's
+		 * visibility, sending more readers to the
+		 * sources. When the successor is a tuple too,
+		 * there is nowhere to put the guard: the DELETE
+		 * is refused and only the recording scan's own
+		 * chain breaks -- the claim it crossed stays as
+		 * it was.
 		 */
-		node->is_linked = true;
+		struct vy_cache_tree_iterator next_pos = *pos;
+		struct vy_cache_entry *next =
+			vy_cache_tree_step(cache->tree, &next_pos, 1);
+		int64_t lsn = vy_stmt_lsn(node->entry.stmt);
+		bool fuse_next = next != NULL &&
+			vy_stmt_is_cache_meta(next->entry.stmt);
+		if (fuse_next && vy_stmt_lsn(next->entry.stmt) < lsn)
+			vy_stmt_set_lsn(next->entry.stmt, lsn);
+		struct vy_entry surv = fuse_next ?
+			next->entry : vy_entry_none();
+		struct vy_cache_entry victim = *node;
+		vy_cache_tree_delete(cache->tree, victim);
+		vy_cache_unacct_entry(cache, &victim);
 		cache->version++;
-		return node;
+		if (!fuse_next)
+			return NULL;
+		bool exact;
+		*pos = vy_cache_tree_lower_bound(cache->tree, surv, &exact);
+		assert(exact);
+		return vy_cache_tree_iterator_get_elem(cache->tree, pos);
 	}
 	/*
 	 * The entry is redundant and fuses into the predecessor,
@@ -1266,6 +1313,8 @@ vy_cache_insert(struct vy_cache *cache, struct vy_entry curr,
 			vy_stmt_counter_acct_tuple(&cache->stat.put,
 						   curr.stmt);
 		node = vy_cache_relink(cache, &pos, node);
+		if (node == NULL)
+			return NULL;
 	} else {
 		/*
 		 * The caches stayed full of hot entries: refuse
@@ -1462,14 +1511,12 @@ vy_cache_on_rollback(struct vy_cache *cache, struct vy_entry entry)
 void
 vy_cache_builder_create(struct vy_cache_builder *builder,
 			struct vy_cache *cache, enum iterator_type order,
-			struct vy_entry key, struct vy_entry last,
-			const struct vy_read_view **rv)
+			struct vy_entry key, struct vy_entry last)
 {
 	builder->cache = cache;
 	builder->order = order;
 	builder->key = key;
 	tuple_ref(key.stmt);
-	builder->rv = rv;
 	builder->last = vy_entry_none();
 	builder->last_pos = vy_cache_tree_invalid_iterator();
 	builder->chain_length = 0;
@@ -1485,11 +1532,6 @@ vy_cache_builder_create(struct vy_cache_builder *builder,
 	if (cache->env->mem_quota == 0)
 		return;
 	/*
-	 * The start bound, made ahead of the view gate below: a
-	 * reader it excludes from building -- a snapshot read
-	 * below the latest data -- still positions its first
-	 * seek with it (see vy_cache_iterator_seek()).
-	 *
 	 * A fresh scan starts at its search key's bound per the
 	 * iterator type. A resumed scan -- a paginated read
 	 * continuing after the position returned by the previous
@@ -1512,9 +1554,6 @@ vy_cache_builder_create(struct vy_cache_builder *builder,
 		start_order = iterator_resume_order(order);
 	}
 	builder->start_bound = vy_bound_new(start_key, start_order);
-	/* No chain below the latest data. */
-	if ((**rv).vlsn != INT64_MAX)
-		return;
 	/*
 	 * A full-key EQ does not need a lower or an upper bound
 	 * to identify its range, since it matches at most one
@@ -1582,14 +1621,11 @@ static void
 vy_cache_builder_close(struct vy_cache_builder *builder)
 {
 	/*
-	 * Only a latest observation completes a chain: a
-	 * displaced reader may have silently skipped statements
-	 * above its view anywhere in its range, so its end key
-	 * would witness a range it never fully saw. A disabled
-	 * cache completes nothing either.
+	 * A disabled cache completes nothing. A tainted tail
+	 * never reaches this point: vy_cache_builder_add()
+	 * breaks the chain instead of closing it.
 	 */
-	if (builder->cache->env->mem_quota == 0 ||
-	    (**builder->rv).vlsn != INT64_MAX) {
+	if (builder->cache->env->mem_quota == 0) {
 		vy_cache_builder_break_link(builder);
 		return;
 	}
@@ -1621,7 +1657,8 @@ vy_cache_builder_close(struct vy_cache_builder *builder)
 
 /** See the comment in vy_cache.h. */
 void
-vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr)
+vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr,
+		     bool is_stale)
 {
 	struct vy_cache *cache = builder->cache;
 	/* The cache is disabled. */
@@ -1629,7 +1666,17 @@ vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr)
 		return;
 	/* The end of matches: not an admission, close the chain. */
 	if (curr.stmt == NULL) {
-		vy_cache_builder_close(builder);
+		/*
+		 * A tainted tail -- the walk from the last result
+		 * to the end of matches crossed a statement above
+		 * the read view -- ends the chain without an end
+		 * bound: the tail was not proven empty for every
+		 * reader.
+		 */
+		if (is_stale)
+			vy_cache_builder_break_link(builder);
+		else
+			vy_cache_builder_close(builder);
 		return;
 	}
 	/*
@@ -1647,13 +1694,23 @@ vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr)
 	assert(vy_stmt_type(curr.stmt) != IPROTO_DELETE);
 	/*
 	 * A prepared result is retractable and never admitted --
-	 * see the prepared-data contract in vy_cache_insert() --
-	 * and a reader that does not see the latest data may have
-	 * read a point newer writes overtook: the chain breaks,
+	 * see the prepared-data contract in vy_cache_insert().
+	 */
+	if (vy_lsn_is_prepared(vy_stmt_lsn(curr.stmt))) {
+		vy_cache_builder_break_link(builder);
+		return;
+	}
+	/*
+	 * A stale result is shadowed by a version above the read
+	 * view: it is not the latest and must not be cached, and
+	 * the advance that produced it crossed the shadow, so no
+	 * link may span the gap either (see
+	 * vy_read_iterator::is_stale; VY_STMT_STALE carries the
+	 * same verdict for a primary tuple resolved from a
+	 * secondary key after the advance). The chain breaks,
 	 * exactly as it does in vy_cache_builder_add_delete().
 	 */
-	if (vy_lsn_is_prepared(vy_stmt_lsn(curr.stmt)) ||
-	    (**builder->rv).vlsn != INT64_MAX) {
+	if (is_stale || vy_stmt_has_flag(curr.stmt, VY_STMT_STALE)) {
 		vy_cache_builder_break_link(builder);
 		return;
 	}
@@ -1670,7 +1727,7 @@ vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr)
 void
 vy_cache_builder_add_delete(struct vy_cache_builder *builder,
 			    struct vy_entry delete_key,
-			    int64_t delete_lsn)
+			    int64_t delete_lsn, bool is_stale)
 {
 	struct vy_cache *cache = builder->cache;
 	/* The cache is disabled. */
@@ -1678,16 +1735,14 @@ vy_cache_builder_add_delete(struct vy_cache_builder *builder,
 		return;
 	/*
 	 * No link may span a retractable shadow (see vy_cache.h),
-	 * and a reader that does not see the latest data may have
-	 * been overtaken by newer writes: the chain breaks. The
-	 * cached entry, if any, is left alone -- the verdict is
-	 * tentative (a prepared shadow may roll back, a displaced
-	 * reader's knowledge is outdated), and once the key is
-	 * proven dead at the latest view, the recorded DELETE
-	 * replaces the stale row in place.
+	 * and a stale verdict is shadowed by a version above the
+	 * read view: the chain breaks. The cached entry, if any,
+	 * is left alone -- the verdict is tentative (a prepared
+	 * shadow may roll back, a stale reader's knowledge is
+	 * outdated), and once the key is proven dead, the
+	 * recorded DELETE replaces the stale row in place.
 	 */
-	if (vy_lsn_is_prepared(delete_lsn) ||
-	    (**builder->rv).vlsn != INT64_MAX) {
+	if (vy_lsn_is_prepared(delete_lsn) || is_stale) {
 		vy_cache_builder_break_link(builder);
 		return;
 	}
@@ -1799,9 +1854,13 @@ vy_cache_builder_on_read(struct vy_cache_builder *builder,
 	/* The cache is disabled. */
 	if (cache->env->mem_quota == 0)
 		return;
-	/* A reader below the latest data forms no links. */
-	if ((**builder->rv).vlsn != INT64_MAX)
-		return;
+	/*
+	 * A result served over observed links consulted no deeper
+	 * source in the gap it rode over, and the chain proves the
+	 * gap empty at every version: nothing above any read view
+	 * can have been skipped, so the links extend for every
+	 * reader.
+	 */
 	/*
 	 * Open the pending link in place: the entry is at hand --
 	 * under the cache iterator's cursor, or just inserted --
@@ -2235,7 +2294,16 @@ vy_cache_iterator_seek(struct vy_cache_iterator *itr, struct vy_entry last,
 		 * so the crossing into the start bound needs no
 		 * link to witness it (the forward direction reaches
 		 * the same conclusion via at_start). Step onto the
-		 * start bound and hop from there.
+		 * start bound and hop from there. The bound entry
+		 * is shared with any earlier scan's bound at the
+		 * same position, and DELETEs fused into it raise
+		 * its LSN: a page resumed at {40} lands on the
+		 * bound an earlier page left there, delete{20} at
+		 * LSN 2000 fused into it. A link is used only by
+		 * readers that see the entry it touches: to a
+		 * reader at read view 1500 the crossing into the
+		 * bound is not covered, and it descends -- {20}
+		 * is still alive for it.
 		 */
 		struct key_def *cmp_def = itr->cache->cmp_def;
 		if (last.stmt != NULL &&
@@ -2247,7 +2315,8 @@ vy_cache_iterator_seek(struct vy_cache_iterator *itr, struct vy_entry last,
 			    vy_entry_is_bound_of(bound->entry, last, dir,
 						 cmp_def)) {
 				itr->curr_pos = below;
-				*is_linked = true;
+				*is_linked =
+					vy_stmt_lsn(bound->entry.stmt) <= vlsn;
 				vy_cache_iterator_hop(itr, is_linked);
 				return;
 			}
@@ -2353,11 +2422,10 @@ vy_cache_iterator_restore(struct vy_cache_iterator *itr, struct vy_entry last,
 	 * a hop from it -- no tree descent -- re-examining the
 	 * range between the reader and its next candidate
 	 * against the new content. A reader whose chain is dead
-	 * -- broken, refused, or never built (a read below the
-	 * latest data) -- re-seeks instead. The re-seek is cheap
-	 * in context: such a reader is mid-descent into the
-	 * deeper sources, whose cost dwarfs the seek, or on a
-	 * rare path.
+	 * -- broken, refused, or never built -- re-seeks
+	 * instead. The re-seek is cheap in context: such a
+	 * reader is mid-descent into the deeper sources, whose
+	 * cost dwarfs the seek, or on a rare path.
 	 */
 	struct vy_cache_builder *builder = itr->builder;
 	struct vy_cache_entry *front = NULL;

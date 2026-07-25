@@ -2998,6 +2998,811 @@ g.test_snapshot_tx_does_not_cache_when_disk_skipped = function(cg)
     end)
 end
 
+-- A snapshot point lookup pinned at the old version, while the cache
+-- already holds the newer committed version, must return the old
+-- version but must not overwrite the cache with it. The newer version
+-- stays cached and a later latest read is still served it from the
+-- cache.
+--
+-- vy_point_lookup_scan_cache() skips the newer cached version without
+-- flagging staleness, but the same version is also in mem/disk, where
+-- the scan does flag it, so the stale result is kept out of the cache.
+g.test_snapshot_tx_point_does_not_overwrite_newer_cache = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'old'}
+        box.snapshot()
+
+        local saw
+        local to_tx = fiber.channel(0)
+        local from_tx = fiber.channel(0)
+        fiber.create(function()
+            box.begin({txn_isolation = 'snapshot'})
+            t.assert_equals(s:get(1), {1, 'old'}) -- pin the read view
+            from_tx:put('pinned')
+            to_tx:get()
+            saw = s:get(1)                        -- skips the cached 'new'
+            box.commit()
+            from_tx:put('done')
+        end)
+        from_tx:get()
+
+        -- A concurrent commit creates the newer version and an
+        -- autocommit read warms the cache with it.
+        s:replace{1, 'new'}
+        t.assert_equals(s:get(1), {1, 'new'})
+
+        local put_before = s.index.pk:stat().cache.put.rows
+        to_tx:put('go')
+        from_tx:get()
+        local put_after = s.index.pk:stat().cache.put.rows
+
+        -- The snapshot saw the old version but did not cache it.
+        t.assert_equals(saw, {1, 'old'})
+        t.assert_equals(put_after - put_before, 0,
+            'a stale snapshot point lookup must not overwrite the cache')
+
+        -- The newer version is still cached: a latest read hits it.
+        local get_before = s.index.pk:stat().cache.get.rows
+        t.assert_equals(s:get(1), {1, 'new'})
+        local get_after = s.index.pk:stat().cache.get.rows
+        t.assert_gt(get_after - get_before, 0,
+            'the newer version is still served from the cache')
+    end)
+end
+
+-- A read through a unique secondary index resolves the full tuple
+-- from the primary index. That resolved tuple must populate the
+-- primary cache so a later read finds it without repeating the
+-- lookup in the primary index. An autocommit read runs at the
+-- committed read view, which is finite (not the open global one), so
+-- caching here relies on the result being the latest, not on the
+-- read view.
+g.test_autocommit_secondary_read_populates_primary_cache = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {parts = {2, 'unsigned'}, unique = true})
+        s:replace{1, 100}
+        box.snapshot()
+
+        local before = s.index.pk:stat().cache.put.rows
+        t.assert_equals(s.index.sk:get(100), {1, 100})
+        local after = s.index.pk:stat().cache.put.rows
+
+        t.assert_equals(after - before, 1,
+            'an autocommit secondary read populates the ' ..
+            'primary cache')
+    end)
+end
+
+-- The same property for an explicit snapshot TX running at a finite
+-- read view. The TX reads key 2 and a concurrent write to key 2 pins
+-- it to a finite read view. Key 1 was never touched, so the secondary
+-- read resolves the latest primary tuple -- a fresh result that must
+-- be cached even though the read view is no longer the global one.
+g.test_snapshot_tx_secondary_read_populates_primary_cache = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {parts = {2, 'unsigned'}, unique = true})
+        s:replace{1, 100}
+        s:replace{2, 200}
+        box.snapshot()
+
+        box.begin()
+        -- Read key 2 so a concurrent change to it pins this TX to a
+        -- finite read view.
+        t.assert_equals(s:get(2), {2, 200})
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{2, 250}
+            ch:put(true)
+        end)
+        ch:get()
+
+        -- Key 1 is unchanged: the secondary read resolves the latest
+        -- primary tuple and must cache it.
+        local before = s.index.pk:stat().cache.put.rows
+        t.assert_equals(s.index.sk:get(100), {1, 100})
+        local after = s.index.pk:stat().cache.put.rows
+        box.commit()
+
+        t.assert_equals(after - before, 1,
+            'a fresh secondary read in a snapshot TX populates ' ..
+            'the primary cache')
+    end)
+end
+
+-- A secondary read whose lookup in the primary index skipped a newer version
+-- (invisible to the snapshot) is stale and must not populate the
+-- primary cache, or a later latest read would get the old tuple.
+-- The secondary key is unchanged, so the secondary entry still
+-- resolves to the same primary key; only the tuple resolved from the
+-- primary index is stale.
+g.test_snapshot_tx_secondary_read_skips_stale_primary_cache = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {parts = {2, 'unsigned'}, unique = true})
+        s:replace{1, 100, 'v1'}
+        box.snapshot()
+
+        box.begin()
+        -- Pin the read view at v1 (key 1 enters the read set).
+        t.assert_equals(s.index.sk:get(100), {1, 100, 'v1'})
+
+        -- A concurrent TX overwrites a non-indexed field.
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{1, 100, 'v2'}
+            ch:put(true)
+        end)
+        ch:get()
+
+        local before = s.index.pk:stat().cache.put.rows
+        -- The snapshot still sees v1, skipping v2: a stale result.
+        t.assert_equals(s.index.sk:get(100), {1, 100, 'v1'})
+        box.commit()
+
+        local after = s.index.pk:stat().cache.put.rows
+        t.assert_equals(after - before, 0,
+            'a stale secondary read must not populate the ' ..
+            'primary cache')
+    end)
+end
+
+-- A snapshot secondary read pinned at the old version, while the
+-- primary cache already holds the newer committed tuple for the same
+-- primary key, must return the old version but must not overwrite
+-- the cache with it. The newer tuple stays cached and a later latest
+-- secondary read is still served it from the primary cache.
+g.test_snapshot_tx_secondary_read_does_not_overwrite_newer_cache =
+function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {parts = {2, 'unsigned'}, unique = true})
+        s:replace{1, 100, 'v1'}
+        box.snapshot()
+
+        local saw
+        local to_tx = fiber.channel(0)
+        local from_tx = fiber.channel(0)
+        fiber.create(function()
+            box.begin({txn_isolation = 'snapshot'})
+            -- Pin the read view at v1.
+            t.assert_equals(s.index.sk:get(100), {1, 100, 'v1'})
+            from_tx:put('pinned')
+            to_tx:get()
+            saw = s.index.sk:get(100) -- resolves primary key 1 at v1
+            box.commit()
+            from_tx:put('done')
+        end)
+        from_tx:get()
+
+        -- A concurrent commit creates the newer version and an
+        -- autocommit secondary read warms the primary cache with it.
+        s:replace{1, 100, 'v2'}
+        t.assert_equals(s.index.sk:get(100), {1, 100, 'v2'})
+
+        local put_before = s.index.pk:stat().cache.put.rows
+        to_tx:put('go')
+        from_tx:get()
+        local put_after = s.index.pk:stat().cache.put.rows
+
+        -- The snapshot saw the old version but did not cache it.
+        t.assert_equals(saw, {1, 100, 'v1'})
+        t.assert_equals(put_after - put_before, 0,
+            'a stale secondary resolution must not overwrite the ' ..
+            'primary cache')
+
+        -- The newer tuple is still cached: the latest secondary
+        -- read serves it, and a primary point read is served from
+        -- the cache.
+        t.assert_equals(s.index.sk:get(100), {1, 100, 'v2'})
+        local get_before = s.index.pk:stat().cache.get.rows
+        t.assert_equals(s:get(1), {1, 100, 'v2'})
+        local get_after = s.index.pk:stat().cache.get.rows
+        t.assert_gt(get_after - get_before, 0,
+            'the newer tuple is still served from the primary cache')
+    end)
+end
+
+-- An autocommit range scan runs at the committed read view, which is
+-- finite. Its results are the latest, so the scan must populate the
+-- cache and let a later scan hit it instead of re-reading disk.
+g.test_autocommit_scan_caches_values = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1}
+        s:replace{2}
+        s:replace{3}
+        box.snapshot()
+
+        -- First scan warms the cache from disk.
+        t.assert_equals(s:select(), {{1}, {2}, {3}})
+
+        local before = s.index.pk:stat().cache.get.rows
+        -- Second scan must be served from the cache.
+        t.assert_equals(s:select(), {{1}, {2}, {3}})
+        local after = s.index.pk:stat().cache.get.rows
+
+        t.assert_gt(after - before, 0,
+            'an autocommit scan populates the cache so a later ' ..
+            'scan hits it')
+    end)
+end
+
+-- A scan skipping a deferred DELETE -- a compaction-only purge marker
+-- in a secondary index -- must still populate the cache. The marker
+-- hides nothing from any reader: the row's disappearance is
+-- discovered through the lookup in the primary index, and a gap
+-- cached across the marker is protected by the chain link LSN.
+g.test_scan_caches_across_deferred_delete = function(cg)
+    cg.server:exec(function()
+        local defer_deletes = box.cfg.vinyl_defer_deletes
+        box.cfg{vinyl_defer_deletes = true}
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {unique = false, parts = {{2, 'unsigned'}}})
+        s:replace{1, 10}
+        s:replace{2, 20}
+        box.snapshot()
+
+        -- The delete writes only the primary index. The deferred
+        -- DELETE for sk 10 is produced when primary compaction merges
+        -- the tombstone with the replace it shadows; it is committed
+        -- by a transaction of its own into the secondary index's
+        -- active in-memory level.
+        s:delete{1}
+        if s.index.sk:stat().memory.rows > 0 then
+            t.skip('the DELETE reaches the secondary index '
+                   .. 'immediately: no deferred DELETE to scan across')
+        end
+        box.snapshot()
+        s.index.pk:compact()
+        t.helpers.retrying({}, function()
+            t.assert_gt(s.index.sk:stat().memory.rows, 0,
+                        'the deferred DELETE must sit in the '
+                        .. 'secondary index memory')
+        end)
+
+        local before = s.index.sk:stat().cache.put.rows
+        -- sk 10 resolves to a deleted row and is filtered out; the
+        -- scan must still cache what it returns.
+        t.assert_equals(s.index.sk:select({}, {fullscan = true}),
+                        {{2, 20}})
+        local after = s.index.sk:stat().cache.put.rows
+        t.assert_gt(after - before, 0,
+            'a scan that skipped a deferred DELETE still populates '
+            .. 'the cache')
+        box.cfg{vinyl_defer_deletes = defer_deletes}
+    end)
+end
+
+g.after_test('test_scan_caches_across_deferred_delete', function(cg)
+    cg.server:exec(function()
+        box.cfg{vinyl_defer_deletes = false}
+    end)
+end)
+
+-- Same as the previous test, but the deferred DELETE is dumped to a
+-- run before the scan: skipping it from a disk source must not
+-- suppress caching either.
+g.test_scan_caches_across_deferred_delete_on_run = function(cg)
+    cg.server:exec(function()
+        local defer_deletes = box.cfg.vinyl_defer_deletes
+        box.cfg{vinyl_defer_deletes = true}
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        -- A high run count threshold keeps automatic compaction away:
+        -- it would annihilate the deferred DELETE with the replace it
+        -- purges before the scan gets to see it.
+        s:create_index('sk', {unique = false, parts = {{2, 'unsigned'}},
+                              run_count_per_level = 10})
+        s:replace{1, 10}
+        s:replace{2, 20}
+        box.snapshot()
+
+        s:delete{1}
+        if s.index.sk:stat().memory.rows > 0 then
+            t.skip('the DELETE reaches the secondary index '
+                   .. 'immediately: no deferred DELETE to scan across')
+        end
+        box.snapshot()
+        s.index.pk:compact()
+        t.helpers.retrying({}, function()
+            t.assert_gt(s.index.sk:stat().memory.rows, 0,
+                        'the deferred DELETE must sit in the '
+                        .. 'secondary index memory')
+        end)
+
+        -- Dump the deferred DELETE to a run of its own.
+        box.snapshot()
+        t.assert_equals(s.index.sk:stat().memory.rows, 0)
+        t.assert_equals(s.index.sk:stat().run_count, 2)
+
+        local before = s.index.sk:stat().cache.put.rows
+        t.assert_equals(s.index.sk:select({}, {fullscan = true}),
+                        {{2, 20}})
+        local after = s.index.sk:stat().cache.put.rows
+        t.assert_gt(after - before, 0,
+            'a scan that skipped a deferred DELETE on a run still '
+            .. 'populates the cache')
+
+        -- The reverse scan skips it from the other end. Reset the
+        -- cache first: the forward scan above cached the row and its
+        -- chain, and a re-read served by the cache admits nothing.
+        local cache_size = box.cfg.vinyl_cache
+        box.cfg{vinyl_cache = 0}
+        box.cfg{vinyl_cache = cache_size}
+
+        before = s.index.sk:stat().cache.put.rows
+        t.assert_equals(s.index.sk:select({}, {iterator = 'le',
+                                               fullscan = true}),
+                        {{2, 20}})
+        after = s.index.sk:stat().cache.put.rows
+        t.assert_gt(after - before, 0,
+            'a reverse scan that skipped a deferred DELETE on a run '
+            .. 'still populates the cache')
+        box.cfg{vinyl_defer_deletes = defer_deletes}
+    end)
+end
+
+g.after_test('test_scan_caches_across_deferred_delete_on_run',
+             function(cg)
+    cg.server:exec(function()
+        box.cfg{vinyl_defer_deletes = false}
+    end)
+end)
+
+-- A unique secondary read runs through the range iterator (the unique
+-- key is not a full cmp_def key). At the committed read view it must
+-- populate the secondary index's own cache, so a repeat read hits it.
+g.test_autocommit_secondary_read_populates_secondary_cache = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {parts = {2, 'unsigned'}, unique = true})
+        s:replace{1, 100}
+        box.snapshot()
+
+        -- First read warms the secondary cache.
+        t.assert_equals(s.index.sk:get(100), {1, 100})
+
+        local before = s.index.sk:stat().cache.get.rows
+        t.assert_equals(s.index.sk:get(100), {1, 100})
+        local after = s.index.sk:stat().cache.get.rows
+
+        t.assert_gt(after - before, 0,
+            'an autocommit secondary read populates the secondary ' ..
+            'cache so a later read hits it')
+    end)
+end
+
+-- A snapshot scan that skips a newer version of a key must not cache
+-- the stale value, or a later latest read would be served the old
+-- tuple from the cache.
+g.test_snapshot_tx_scan_does_not_cache_stale_value = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'old'}
+        s:replace{2, 'keep'}
+        box.snapshot()
+
+        box.begin()
+        -- A gap scan pins the read view.
+        t.assert_equals(s:select(), {{1, 'old'}, {2, 'keep'}})
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{1, 'new'}
+            ch:put(true)
+        end)
+        ch:get()
+
+        -- The snapshot still sees the old value, skipping the newer one.
+        t.assert_equals(s:select(), {{1, 'old'}, {2, 'keep'}})
+        box.commit()
+
+        -- A later latest read must see the new value, not a cached stale one.
+        t.assert_equals(s:select(), {{1, 'new'}, {2, 'keep'}})
+    end)
+end
+
+-- Two non-adjacent keys are each shadowed by a newer version that one
+-- source advance skips in a single sweep. The scan must not cache
+-- either stale value -- the second must not slip through after the
+-- first. (A per-step staleness reset would miss the second.)
+g.test_snapshot_tx_scan_multi_shadow_not_cached = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'old'}
+        s:replace{2, 'keep'}
+        s:replace{3, 'old'}
+        box.snapshot()
+
+        box.begin()
+        t.assert_equals(s:select(), {{1, 'old'}, {2, 'keep'}, {3, 'old'}})
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{1, 'new'}
+            s:replace{3, 'new'}
+            ch:put(true)
+        end)
+        ch:get()
+
+        t.assert_equals(s:select(), {{1, 'old'}, {2, 'keep'}, {3, 'old'}})
+        box.commit()
+
+        -- Both shadowed keys must read the new version afterwards.
+        t.assert_equals(s:select(), {{1, 'new'}, {2, 'keep'}, {3, 'new'}})
+    end)
+end
+
+-- A reverse scan whose result is shadowed by a newer version in the
+-- same source must not cache the stale value. The LE/LT search starts
+-- from the oldest version, so the staleness is detected only by the
+-- reverse reposition in find_lsn, not the forward skip loop.
+g.test_snapshot_tx_reverse_scan_does_not_cache_stale = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'old'}
+        s:replace{2, 'keep'}
+        -- No snapshot: {1, 'old'} stays in the active mem, so the old
+        -- and new versions end up in the same source.
+        box.begin()
+        t.assert_equals(s:select({}, {iterator = 'le'}),
+                        {{2, 'keep'}, {1, 'old'}})
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{1, 'new'}
+            ch:put(true)
+        end)
+        ch:get()
+
+        t.assert_equals(s:select({}, {iterator = 'le'}),
+                        {{2, 'keep'}, {1, 'old'}})
+        box.commit()
+
+        -- A later latest read must see the new value, not a cached
+        -- stale one (checked through both index orders).
+        t.assert_equals(s:get(1), {1, 'new'})
+        t.assert_equals(s:select({}, {iterator = 'le'}),
+                        {{2, 'keep'}, {1, 'new'}})
+    end)
+end
+
+-- Same as the previous test, but the shadowed key has two visible
+-- versions, not one. The reverse reposition then jumps straight to
+-- the newest visible version instead of stepping over the invisible
+-- one, and must still detect that the result is shadowed.
+g.test_snapshot_tx_reverse_scan_two_versions_does_not_cache_stale =
+function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'v1'}
+        s:replace{1, 'v2'}
+        s:replace{2, 'keep'}
+        box.begin()
+        t.assert_equals(s:select({}, {iterator = 'le'}),
+                        {{2, 'keep'}, {1, 'v2'}})
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{1, 'v3'}
+            ch:put(true)
+        end)
+        ch:get()
+
+        t.assert_equals(s:select({}, {iterator = 'le'}),
+                        {{2, 'keep'}, {1, 'v2'}})
+        box.commit()
+
+        -- A later latest read must see the newest version, not a
+        -- cached stale one.
+        t.assert_equals(s:get(1), {1, 'v3'})
+        t.assert_equals(s:select({}, {iterator = 'le'}),
+                        {{2, 'keep'}, {1, 'v3'}})
+    end)
+end
+
+-- A reverse snapshot scan meets a key whose newer version was
+-- committed after the view was pinned. The shadow provably concerns
+-- that key alone, so while the scan stands on it, its other
+-- results are still cached; only the overwritten key is withheld.
+g.test_snapshot_tx_reverse_scan_caches_fresh_before_updated_key =
+function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{20, 'disk'}
+        box.snapshot()
+        s:replace{10, 'old'}
+
+        box.begin()
+        -- Pin the read view with a miss: a point read of an existing
+        -- key would cache it right away and hide the scan's own
+        -- admission from the counter below.
+        t.assert_equals(s:get(999), nil)
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{10, 'new'}
+            ch:put(true)
+        end)
+        ch:get()
+
+        local before = s.index.pk:stat().cache.put.rows
+        t.assert_equals(s:select({}, {iterator = 'le'}),
+                        {{20, 'disk'}, {10, 'old'}})
+        local after = s.index.pk:stat().cache.put.rows
+        box.commit()
+
+        -- Key 20 is fresh and must be cached; only key 10 is
+        -- withheld.
+        t.assert_gt(after - before, 0,
+            'a fresh key next to a concurrently updated one is cached')
+
+        -- The updated key was not cached stale: a latest read sees it.
+        t.assert_equals(s:get(10), {10, 'new'})
+        t.assert_equals(s:select({}, {iterator = 'le'}),
+                        {{20, 'disk'}, {10, 'new'}})
+    end)
+end
+
+-- A full-key EQ select travels the range read iterator, not the point
+-- lookup. A source holding only an invisible newer version of the key
+-- skips it entirely and never joins the merge front, so its testimony
+-- must still reach the scan: the stale result must not be cached.
+g.test_snapshot_tx_eq_select_does_not_cache_stale = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1, 'old'}
+        box.snapshot()
+        -- A committed row in the same in-memory level as the
+        -- concurrent write, so the level is scanned rather than
+        -- pruned as entirely invisible.
+        s:replace{5, 'mem'}
+
+        box.begin()
+        t.assert_equals(s:select(2), {}) -- pin the read view
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{1, 'new'}
+            ch:put(true)
+        end)
+        ch:get()
+
+        t.assert_equals(s:select(1), {{1, 'old'}})
+        box.commit()
+
+        -- A later latest read must see the newest version, not a
+        -- cached stale one.
+        t.assert_equals(s:get(1), {1, 'new'})
+        t.assert_equals(s:select(1), {{1, 'new'}})
+    end)
+end
+
+-- A snapshot scan that skips a key concurrently inserted into a gap
+-- must not cache the gap as empty, or a later latest read would miss
+-- the inserted key.
+g.test_snapshot_tx_scan_does_not_cache_stale_gap = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1}
+        s:replace{3}
+        box.snapshot()
+
+        box.begin()
+        t.assert_equals(s:select(), {{1}, {3}})
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{2}
+            ch:put(true)
+        end)
+        ch:get()
+
+        t.assert_equals(s:select(), {{1}, {3}})
+        box.commit()
+
+        -- A later latest read must see the inserted key: the stale
+        -- gap must not have been cached as empty.
+        t.assert_equals(s:select(), {{1}, {2}, {3}})
+    end)
+end
+
+-- Same as the stale-gap case but for the gap past the last key (EOF):
+-- a key concurrently inserted beyond the snapshot's max must appear
+-- in a later latest scan.
+g.test_snapshot_tx_scan_does_not_cache_stale_eof = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1}
+        s:replace{2}
+        box.snapshot()
+
+        box.begin()
+        t.assert_equals(s:select(), {{1}, {2}})
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{3}
+            ch:put(true)
+        end)
+        ch:get()
+
+        t.assert_equals(s:select(), {{1}, {2}})
+        box.commit()
+
+        -- The key inserted beyond the snapshot's max must be visible.
+        t.assert_equals(s:select(), {{1}, {2}, {3}})
+    end)
+end
+
+-- A multikey index entry invisible to a snapshot read view sits on a run
+-- (dumped after the view was pinned). The snapshot scan must skip it
+-- without caching the gap across it; a cached "empty" gap would hide
+-- the key from later readers -- a consistency violation.
+g.test_multikey_snapshot_scan_skips_invisible_run_key = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('mk', {unique = false,
+                              parts = {{'[5][*]', 'unsigned'}}})
+
+        s:replace{1, 1, 1, 1, {10}}
+        s:replace{2, 1, 1, 1, {30}}
+        box.snapshot()
+
+        box.begin()
+        s.index.mk:count() -- pin the snapshot read view
+
+        -- Concurrently insert mk 20 (between 10 and 30) and dump it to a run,
+        -- so it is invisible to the pinned view yet lives on disk.
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{3, 1, 1, 1, {20}}
+            box.snapshot()
+            ch:put(true)
+        end)
+        ch:get()
+
+        -- Scan at the snapshot view: mk 20 is invisible and on a run. The
+        -- scan must not cache the gap 10..30 as empty.
+        t.assert_equals(s.index.mk:select({}, {fullscan = true}),
+                        {{1, 1, 1, 1, {10}}, {2, 1, 1, 1, {30}}})
+        box.commit()
+
+        -- A latest reader must still see mk 20; if the gap was cached, it is
+        -- served from the cache and mk 20 is lost.
+        t.assert_equals(s.index.mk:select({}, {fullscan = true}),
+                        {{1, 1, 1, 1, {10}}, {3, 1, 1, 1, {20}},
+                         {2, 1, 1, 1, {30}}})
+    end)
+end
+
+-- The following two tests characterize a known imperfection of the
+-- is_stale mechanism: it is a per-source bit, not per-key, so a source
+-- that skipped a newer invisible version conservatively suppresses
+-- caching of fresh keys it did not actually shadow. The results are
+-- still correct (we never cache a stale value); we just cache less
+-- than we safely could. They are marked xfail -- anyone is welcome to
+-- improve the solution (e.g. track per-key staleness), which will turn
+-- them green; remove the xfail marker then.
+
+-- A source yields a fresh value immediately after skipping an invisible
+-- newer version of a different key. The fresh value could be cached but
+-- is not, because the source is still flagged stale from the skip.
+-- xfail is asserted on the client, since the cache delta is measured
+-- inside the server.
+g.test_snapshot_tx_scan_caches_fresh_after_same_source_skip = function(cg)
+    local delta = cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{2, 'fresh'}
+        -- No snapshot: {2, 'fresh'} stays in the active mem, so the
+        -- skipped key and the fresh one share a source.
+        box.begin()
+        t.assert_equals(s:select(), {{2, 'fresh'}}) -- pin the read view
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{1, 'new'}
+            ch:put(true)
+        end)
+        ch:get()
+
+        local before = s.index.pk:stat().cache.put.rows
+        -- The scan skips {1, 'new'} and yields the fresh {2, 'fresh'}.
+        t.assert_equals(s:select(), {{2, 'fresh'}})
+        local after = s.index.pk:stat().cache.put.rows
+        box.commit()
+        return after - before
+    end)
+
+    t.xfail('is_stale is per-source, not per-key: the fresh value a '
+            .. 'source yields right after skipping an invisible key is '
+            .. 'not cached. Improving this (per-key staleness) is welcome.')
+    t.assert_gt(delta, 0,
+        'a fresh value after a same-source skip should be cached')
+end
+
+-- A scan returns fresh keys from one source while another source is
+-- positioned far ahead on an invisible key it skipped. The fresh keys could
+-- be cached but are not, because that source stays flagged stale for
+-- the whole scan even though it holds none of those keys. The read view
+-- is pinned via a key outside the scanned range so the measured scan is
+-- the first to cache 1, 2, 3 (no pre-cached intervals, no re-put).
+g.test_snapshot_tx_scan_caches_fresh_before_invisible = function(cg)
+    local delta = cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:replace{1}
+        s:replace{2}
+        s:replace{3}
+        s:replace{50, 'x'}
+        box.snapshot()
+
+        box.begin()
+        t.assert_equals(s:get(50), {50, 'x'}) -- pin outside the scan range
+
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            -- Overwriting key 50 pins the TX and leaves a far invisible
+            -- version in mem, ahead of the scanned range.
+            s:replace{50, 'y'}
+            ch:put(true)
+        end)
+        ch:get()
+
+        local before = s.index.pk:stat().cache.put.rows
+        -- Scan only 1, 2, 3; the mem source, positioned on the far invisible
+        -- {50, 'y'} it skipped, keeps the whole scan flagged stale.
+        t.assert_equals(s:select({1}, {iterator = 'ge', limit = 3}),
+                        {{1}, {2}, {3}})
+        local after = s.index.pk:stat().cache.put.rows
+        box.commit()
+        return after - before
+    end)
+
+    t.xfail('is_stale over-approximates: a far-ahead invisible write '
+            .. 'suppresses caching of earlier fresh keys the source '
+            .. 'does not hold. Improving this (per-key staleness) is welcome.')
+    t.assert_gt(delta, 0,
+        'fresh keys before an invisible write should be cached')
+end
+
 -- A blind write TX followed by a range scan. The scan goes
 -- through vinyl_index_create_iterator which must trigger lazy
 -- read view assignment. The concurrent commit between the
@@ -3302,4 +4107,134 @@ g.test_nonblind_replace_with_trigger = function(cg)
         t.assert_not(ok, 'REPLACE with trigger triggers vy_get, '
                          .. 'must conflict')
     end)
+end
+
+-- A frozen-read-view scan keeps a stale value or gap out of the tuple
+-- cache by flagging every skipped invisible statement (skipped_invisible),
+-- which the read iterator turns into a "do not cache" verdict. That flag is
+-- set in several places, and the place depends on both the iterator type
+-- (forward vs reverse find_lsn take different branches) and where the
+-- skipped statement lives relative to the resolved result:
+--
+--   same source as the result   -> find_lsn skips it (mem: M_top / M_rev;
+--                                   run: R_top / R_rev)
+--   a different, unscanned source -> the read iterator flags the whole
+--                                   source (RI_*_notvis)
+--
+-- The matrix below drives every iterator type past a shadowing invisible
+-- statement in each of those locations and checks that a later latest read
+-- sees the new data, never a cached stale value. It runs all cells on one
+-- space and one snapshot transaction per placement to stay fast.
+--
+-- Two skip kinds are covered: a newer invisible version of the resolved key
+-- (value staleness) and an invisible key stepped over in a traversed gap
+-- (gap staleness). Reverse value cells are run with one and two visible
+-- versions, which take different find_lsn sub-paths.
+local function skip_invisible_matrix(place)
+    local fiber = require('fiber')
+
+    -- Each cell gets a disjoint key window so cells never interfere.
+    local cells = {}
+    local base = 0
+    local function add(kind, it, nver)
+        base = base + 100
+        cells[#cells + 1] = {kind = kind, it = it, nver = nver, base = base}
+    end
+    for _, it in ipairs({'GE', 'GT', 'EQ', 'LE', 'LT', 'REQ'}) do
+        local rev = (it == 'LE' or it == 'LT' or it == 'REQ')
+        for _, nver in ipairs(rev and {1, 2} or {1}) do
+            add('value', it, nver)
+        end
+    end
+    for _, it in ipairs({'GE', 'GT', 'LE', 'LT'}) do
+        add('gap', it, 1)
+    end
+
+    local s = box.schema.space.create('test', {engine = 'vinyl'})
+    s:create_index('pk')
+    -- Visible data. value: key base+5 with nver versions. gap: boundary
+    -- keys base+4 and base+6 with base+5 the (later, invisible) gap key.
+    for _, c in ipairs(cells) do
+        if c.kind == 'value' then
+            for i = 1, c.nver do s:replace{c.base + 5, i} end
+        else
+            s:replace{c.base + 4}
+            s:replace{c.base + 6}
+        end
+    end
+
+    -- Where the shadow ends up relative to the result:
+    --   same_mem    - both in the active mem            (find_lsn, mem)
+    --   mem_vs_run  - result on a run, shadow in the mem (RI_*_notvis, mem)
+    --   same_run    - both on one run                   (find_lsn, run)
+    --   diff_run    - result on an older run, shadow on a newer run
+    --                                                   (RI_*_notvis, run)
+    local snap_before = (place == 'diff_run' or place == 'mem_vs_run')
+    local snap_after = (place == 'same_run' or place == 'diff_run')
+
+    if snap_before then box.snapshot() end
+
+    box.begin({txn_isolation = 'snapshot'})
+    s:get{1} -- pin the read view before the shadows are written
+
+    local ch = fiber.channel(1)
+    fiber.create(function()
+        for _, c in ipairs(cells) do
+            if c.kind == 'value' then
+                s:replace{c.base + 5, 'vnew'} -- newer invisible version
+            else
+                s:replace{c.base + 5}         -- invisible key in the gap
+            end
+        end
+        if snap_after then box.snapshot() end
+        ch:put(true)
+    end)
+    ch:get()
+
+    -- Scan every cell under the pinned view. value: resolve base+5
+    -- (base+4/base+6 are absent). gap: return both boundary keys, stepping
+    -- over the invisible base+5 between them.
+    for _, c in ipairs(cells) do
+        local k = c.base + 5
+        local sk, lim
+        if c.kind == 'value' then
+            sk = ({GE = k - 1, GT = k - 1, EQ = k,
+                   LE = k + 1, LT = k + 1, REQ = k})[c.it]
+            lim = 1
+        else
+            sk = ({GE = c.base + 4, GT = c.base + 3,
+                   LE = c.base + 6, LT = c.base + 7})[c.it]
+            lim = 2
+        end
+        s:select({sk}, {iterator = c.it, limit = lim})
+    end
+    box.commit()
+
+    -- A latest read must reflect the newer data, never a cached stale value.
+    local fails = {}
+    for _, c in ipairs(cells) do
+        local nm = ('%s/%s/n%d'):format(c.kind, c.it, c.nver)
+        if c.kind == 'value' then
+            local got = s:get{c.base + 5}
+            if not got or got[2] ~= 'vnew' then
+                fails[#fails + 1] = nm .. ' value=' ..
+                    require('json').encode(got)
+            end
+        else
+            local got = s:select({c.base + 4}, {iterator = 'GE', limit = 3})
+            if #got ~= 3 or got[2][1] ~= c.base + 5 then
+                fails[#fails + 1] = nm .. ' gap=' ..
+                    require('json').encode(got)
+            end
+        end
+    end
+    s:drop()
+    return fails
+end
+
+for _, place in ipairs({'same_mem', 'mem_vs_run', 'same_run', 'diff_run'}) do
+    g['test_skip_invisible_' .. place] = function(cg)
+        local fails = cg.server:exec(skip_invisible_matrix, {place})
+        t.assert_equals(fails, {}, place .. ' cached a stale value or gap')
+    end
 end

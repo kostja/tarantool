@@ -1196,6 +1196,52 @@ vy_run_iterator_next_pos(struct vy_run_iterator *itr,
 }
 
 /**
+ * File a skip of an invisible statement under the staleness flags,
+ * exactly like vy_mem_iterator_set_stale().
+ */
+static inline void
+vy_run_iterator_set_stale(struct vy_run_iterator *itr)
+{
+	if (itr->iterator_type == ITER_EQ &&
+	    vy_stmt_is_full_key(itr->key.stmt, itr->cmp_def))
+		itr->is_stale = true;
+	itr->is_stale_link = true;
+}
+
+/**
+ * Return true if the current statement must be skipped: a deferred
+ * DELETE purge marker or a statement invisible in the read view. The
+ * one place that classifies a skip: every skip except the purge
+ * marker taints the scan via the staleness flags. A run holds only
+ * confirmed data, so unlike vy_mem_iterator_should_skip_curr() there
+ * is no prepared case.
+ */
+static inline bool
+vy_run_iterator_should_skip_curr(struct vy_run_iterator *itr)
+{
+	struct tuple *stmt = itr->curr.stmt;
+	if (vy_stmt_flags(stmt) & VY_STMT_SKIP_READ) {
+		/*
+		 * A deferred DELETE: a compaction-only purge marker in a
+		 * secondary index, hidden from every read view. It is the
+		 * one skip that does not taint the scan, whatever its
+		 * LSN. See vy_mem_iterator_should_skip_curr().
+		 */
+		return true;
+	}
+	if (vy_stmt_lsn(stmt) > (**itr->read_view).vlsn) {
+		/*
+		 * Invisible in the read view: a version above it shadows
+		 * the result for this reader.
+		 * See vy_read_iterator::is_stale.
+		 */
+		vy_run_iterator_set_stale(itr);
+		return true;
+	}
+	return false;
+}
+
+/**
  * Find the next record with lsn <= itr->lsn record.
  * The current position must be at the beginning of a series of
  * records with the same key it terms of direction of iterator
@@ -1212,14 +1258,20 @@ vy_run_iterator_find_lsn(struct vy_run_iterator *itr, struct vy_entry *ret)
 
 	*ret = vy_entry_none();
 
+	/*
+	 * Recompute the skip flags for the position this call seeks
+	 * to. A no-op advance never reaches find_lsn, so the flags
+	 * persist while the iterator stays positioned on a skipped-over
+	 * key. See vy_read_iterator::is_stale.
+	 */
+	itr->is_stale = false;
+	itr->is_stale_link = false;
+
 	assert(itr->search_started);
 	assert(itr->curr.stmt != NULL);
 	assert(itr->curr_pos.page_no < slice->run->info.page_count);
 
-	while (vy_stmt_lsn(itr->curr.stmt) > (**itr->read_view).vlsn ||
-	       vy_stmt_flags(itr->curr.stmt) & VY_STMT_SKIP_READ) {
-		if (vy_stmt_lsn(itr->curr.stmt) > (**itr->read_view).vlsn)
-			itr->is_stale = true;
+	while (vy_run_iterator_should_skip_curr(itr)) {
 		if (vy_run_iterator_next_pos(itr, itr->iterator_type,
 					     &itr->curr_pos) != 0) {
 			vy_run_iterator_stop(itr);
@@ -1242,9 +1294,27 @@ vy_run_iterator_find_lsn(struct vy_run_iterator *itr, struct vy_entry *ret)
 			struct vy_entry test;
 			if (vy_run_iterator_read(itr, test_pos, &test) != 0)
 				return -1;
-			if (vy_stmt_lsn(test.stmt) > (**itr->read_view).vlsn ||
-			    vy_stmt_flags(test.stmt) & VY_STMT_SKIP_READ ||
+			if (vy_stmt_lsn(test.stmt) > (**itr->read_view).vlsn) {
+				/*
+				 * Invisible in the read view. If it is a
+				 * newer version of this key, the result
+				 * is stale.
+				 * See vy_read_iterator::is_stale.
+				 */
+				if (vy_entry_compare(itr->curr, test,
+						     cmp_def) == 0)
+					itr->is_stale = true;
+				tuple_unref(test.stmt);
+				break;
+			}
+			if (vy_stmt_flags(test.stmt) & VY_STMT_SKIP_READ ||
 			    vy_entry_compare(itr->curr, test, cmp_def) != 0) {
+				/*
+				 * A deferred DELETE below the view stops
+				 * the walk -- the result must not land on
+				 * it -- but is not reported, as in the
+				 * loop above.
+				 */
 				tuple_unref(test.stmt);
 				break;
 			}
@@ -1480,6 +1550,7 @@ vy_run_iterator_open(struct vy_run_iterator *itr,
 	itr->prev_page = NULL;
 	itr->search_started = false;
 	itr->is_stale = false;
+	itr->is_stale_link = false;
 
 	/*
 	 * Make sure the format we use to create tuples won't
@@ -1567,6 +1638,13 @@ next:
 	tuple_unref(itr->curr.stmt);
 	itr->curr = next;
 	itr->curr_pos = next_pos;
+	/*
+	 * Unlike the top-level skip in find_lsn, this skip does not
+	 * set the staleness flags: a SKIP_READ statement is invisible to every
+	 * read view, so excluding it from the history of an already
+	 * resolved key can not make the result differ from the
+	 * latest one.
+	 */
 	if (vy_stmt_flags(itr->curr.stmt) & VY_STMT_SKIP_READ)
 		goto next;
 

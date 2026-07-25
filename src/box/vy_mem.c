@@ -80,7 +80,7 @@ vy_mem_tree_extent_free(struct matras_allocator *allocator, void *p)
 	mempool_free(&env->tree_extent_pool, p);
 }
 
-/** Initialize a lazy-drain queue: empty FIFO, iterator parked invalid. */
+/** Initialize a lazy-drain queue: empty FIFO, iterator invalid. */
 static inline void
 vy_mem_drain_create(struct vy_mem_drain *drain)
 {
@@ -584,25 +584,75 @@ vy_mem_iterator_step(struct vy_mem_iterator *itr)
 }
 
 /**
- * Return true if the current statement should be skipped.
- * Note, the function may update min_skipped_plsn.
+ * File a skip of an invisible statement under the staleness flags.
+ * Only an EQ search with a full key -- a point lookup -- pins the
+ * skip to the searched key; any other search may have stepped past
+ * a whole key or a sibling under a partial EQ key, which only
+ * is_stale_link accounts for. A full-key EQ skip sets both flags:
+ * is_stale keeps the point lookup verdict exact, is_stale_link lets
+ * a source that skipped the key entirely -- and so never joins the
+ * merge front -- still testify to a range scan.
+ */
+static inline void
+vy_mem_iterator_set_stale(struct vy_mem_iterator *itr)
+{
+	if (itr->iterator_type == ITER_EQ &&
+	    vy_stmt_is_full_key(itr->key.stmt, itr->mem->cmp_def))
+		itr->is_stale = true;
+	itr->is_stale_link = true;
+}
+
+/**
+ * Return true if the current statement must be skipped: a deferred
+ * DELETE purge marker, a statement invisible in the read view, or
+ * unconfirmed data this reader must not observe. The one place that
+ * classifies a skip: every skip except the purge marker taints the
+ * scan via the staleness flags, and a prepared skip also records
+ * min_skipped_plsn.
  */
 static inline bool
 vy_mem_iterator_should_skip_curr(struct vy_mem_iterator *itr)
 {
 	struct tuple *stmt = itr->curr.stmt;
-	if (vy_stmt_flags(stmt) & VY_STMT_SKIP_READ)
+	if (vy_stmt_flags(stmt) & VY_STMT_SKIP_READ) {
+		/*
+		 * A deferred DELETE: a compaction-only purge marker in a
+		 * secondary index, hidden from every read view. It is the
+		 * one skip that does not taint the scan: a DELETE cannot
+		 * shadow the result with newer data, the row's absence is
+		 * rediscovered by the lookup in the primary index, and a
+		 * gap cached across the marker is protected by the chain
+		 * link LSN. A marker written at prepare time is exempt
+		 * too, and needs no send: it stays invisible to every
+		 * reader no matter how its transaction ends.
+		 * See vy_read_iterator_cache_add().
+		 */
 		return true;
+	}
+	if (vy_stmt_lsn(stmt) > (**itr->read_view).vlsn) {
+		/*
+		 * Invisible in the read view: a version above it shadows
+		 * the result for this reader.
+		 * See vy_read_iterator::is_stale.
+		 */
+		vy_mem_iterator_set_stale(itr);
+		return true;
+	}
 	if (!itr->is_prepared_ok && vy_stmt_is_prepared(stmt)) {
 		/*
-		 * Skipping a prepared statement sends the reader to a
-		 * read view (see min_skipped_plsn), which protects the
-		 * reader's results -- but not its cache claims: the
-		 * result is shadowed by the skipped statement and must
-		 * not be cached as the latest, so the skip taints it
-		 * like any skip of an invisible newer version.
+		 * A prepared statement, skipped because this reader must
+		 * not observe unconfirmed data. For a read view taken at
+		 * a confirmed LSN this check is redundant: every
+		 * pseudo-LSN lies above such a view, so the lsn branch
+		 * has already filtered prepared statements out. It fires
+		 * at the global read view, and at a view standing at the
+		 * pseudo-LSN of an older prepared statement, where the
+		 * skip sends the reader below this statement as well
+		 * (see min_skipped_plsn). The send protects the reader's
+		 * results, not its cache claims, so the skip taints like
+		 * any other.
 		 */
-		itr->is_stale = true;
+		vy_mem_iterator_set_stale(itr);
 		itr->min_skipped_plsn = MIN(itr->min_skipped_plsn,
 					    vy_stmt_lsn(stmt));
 		return true;
@@ -621,16 +671,21 @@ vy_mem_iterator_should_skip_curr(struct vy_mem_iterator *itr)
 static int
 vy_mem_iterator_find_lsn(struct vy_mem_iterator *itr)
 {
+	/*
+	 * Recompute the skip flags for the position this call seeks
+	 * to. A no-op advance never reaches find_lsn, so the flags
+	 * persist while the iterator stays positioned on a skipped-over
+	 * key. See vy_read_iterator::is_stale.
+	 */
+	itr->is_stale = false;
+	itr->is_stale_link = false;
 	/* Skip to the first statement visible in the read view. */
 	assert(!vy_mem_tree_iterator_is_invalid(&itr->curr_pos));
 	assert(vy_entry_is_equal(itr->curr,
 		*vy_mem_tree_iterator_get_elem(&itr->mem->tree,
 					       &itr->curr_pos)));
 	struct key_def *cmp_def = itr->mem->cmp_def;
-	while (vy_stmt_lsn(itr->curr.stmt) > (**itr->read_view).vlsn ||
-	       vy_mem_iterator_should_skip_curr(itr)) {
-		if (vy_stmt_lsn(itr->curr.stmt) > (**itr->read_view).vlsn)
-			itr->is_stale = true;
+	while (vy_mem_iterator_should_skip_curr(itr)) {
 		if (vy_mem_iterator_step(itr) != 0 ||
 		    (itr->iterator_type == ITER_EQ &&
 		     vy_entry_compare(itr->key, itr->curr, cmp_def))) {
@@ -653,14 +708,19 @@ vy_mem_iterator_find_lsn(struct vy_mem_iterator *itr)
 	}
 	struct vy_entry prev;
 	prev = *vy_mem_tree_iterator_get_elem(&itr->mem->tree, &prev_pos);
-	if (vy_stmt_lsn(prev.stmt) > (**itr->read_view).vlsn ||
-	    vy_entry_compare(itr->curr, prev, cmp_def) != 0) {
+	if (vy_stmt_lsn(prev.stmt) > (**itr->read_view).vlsn) {
 		/*
-		 * The next statement is either invisible in
-		 * the read view or for another key.
+		 * Invisible in the read view. If it is a newer version
+		 * of this key, the result is stale -- the main loop
+		 * above didn't see it because the LE/LT search starts
+		 * from the oldest version. See vy_read_iterator::is_stale.
 		 */
+		if (vy_entry_compare(itr->curr, prev, cmp_def) == 0)
+			itr->is_stale = true;
 		return 0;
 	}
+	if (vy_entry_compare(itr->curr, prev, cmp_def) != 0)
+		return 0;
 	/*
 	 * We could iterate linearly until a statement invisible
 	 * in the read view is found, but there's a good chance
@@ -676,6 +736,21 @@ vy_mem_iterator_find_lsn(struct vy_mem_iterator *itr)
 	assert(!vy_mem_tree_iterator_is_invalid(&itr->curr_pos));
 	itr->curr = *vy_mem_tree_iterator_get_elem(&itr->mem->tree,
 						   &itr->curr_pos);
+	/*
+	 * The lookup lands on the newest version visible in the read
+	 * view, jumping over any newer invisible ones. If the entry
+	 * right above the landing point holds the same key, it is such
+	 * a version and the result is stale. See vy_read_iterator::is_stale.
+	 */
+	prev_pos = itr->curr_pos;
+	vy_mem_tree_iterator_prev(&itr->mem->tree, &prev_pos);
+	if (!vy_mem_tree_iterator_is_invalid(&prev_pos)) {
+		prev = *vy_mem_tree_iterator_get_elem(&itr->mem->tree,
+						      &prev_pos);
+		if (vy_stmt_lsn(prev.stmt) > (**itr->read_view).vlsn &&
+		    vy_entry_compare(itr->curr, prev, cmp_def) == 0)
+			itr->is_stale = true;
+	}
 	while (vy_mem_iterator_should_skip_curr(itr)) {
 		vy_mem_tree_iterator_next(&itr->mem->tree, &itr->curr_pos);
 		assert(!vy_mem_tree_iterator_is_invalid(&itr->curr_pos));
@@ -776,6 +851,7 @@ vy_mem_iterator_open(struct vy_mem_iterator *itr, struct vy_mem_iterator_stat *s
 	itr->is_prepared_ok = is_prepared_ok;
 	itr->min_skipped_plsn = INT64_MAX;
 	itr->is_stale = false;
+	itr->is_stale_link = false;
 }
 
 /*
@@ -850,6 +926,13 @@ next:
 
 	itr->curr_pos = next_pos;
 	itr->curr = next;
+	/*
+	 * Unlike the top-level skip in find_lsn, this skip does not
+	 * set the staleness flags: a SKIP_READ statement is invisible to every
+	 * read view, so excluding it from the history of an already
+	 * resolved key can not make the result differ from the
+	 * latest one.
+	 */
 	if (vy_stmt_flags(itr->curr.stmt) & VY_STMT_SKIP_READ)
 		goto next;
 	return 0;

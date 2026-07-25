@@ -1162,13 +1162,14 @@ g.test_fuse_matrix = function(cg)
             h.release()
         end)
 
-        -- A reverse chain records the deletes it crosses as one
-        -- guarded DELETE entry, fusing both into it. A guarded
-        -- bound left in the gap by an earlier reverse scan
-        -- lingers above it -- a crossing scan does not fuse
-        -- it, eviction reclaims it once it cools -- but the
-        -- guard holds throughout: the pinned reader keeps
-        -- seeing both rows.
+        -- The DELETEs a reverse chain crosses are inside a
+        -- range an earlier reverse scan claimed, its bound
+        -- guarding the claim with the DELETEs' LSN. A recorded
+        -- DELETE entry would split the claim and strip the
+        -- guard from one half, so the DELETEs fuse into the
+        -- guarded bound, their successor. The claim stays
+        -- whole and the guard holds throughout: the pinned
+        -- reader keeps seeing both rows.
         scenario('reverse_delete_fusing_guards', function()
             local h = pin({70})
             s:delete{70, 2}
@@ -1182,7 +1183,7 @@ g.test_fuse_matrix = function(cg)
                 table.insert(rev, rows_except(70)[i])
             end
             t.assert_equals(s:select({}, {iterator = 'LE'}), rev)
-            t.assert_equals(overhead(), 4)
+            t.assert_equals(overhead(), 3)
             t.assert_equals(h.probe({70}), {{70, 1}, {70, 2}})
             served(function()
                 t.assert_equals(s:select({}, {iterator = 'LE'}),
@@ -1330,6 +1331,247 @@ g.test_fuse_matrix = function(cg)
                 end
             end
         end
+    end)
+end
+
+-- A scan fuses the DELETEs it crosses into one chain entry
+-- whose LSN becomes the newest of them: a reader above that
+-- LSN sees the deleted keys as simply absent, a reader below
+-- it must descend to the sources, where a row deleted above
+-- its read view is still alive. Here rows {13, 5, 3} and
+-- {12, 5, 2} are deleted in that order and a reader is pinned
+-- between the deletes: it records the DELETE of {13, 5, 3} --
+-- the one it sees -- into the fused range. The record must
+-- not let the reader use the range's links: they are valid
+-- only above the fused LSN, and {12, 5, 2} is still alive for
+-- the reader.
+g.test_read_below_fused_delete_sees_row = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {unique = false,
+                              parts = {{2, 'unsigned'},
+                                       {3, 'unsigned'}}})
+        s:replace{99, 9, 9}
+        s:replace{11, 5, 1}
+        s:replace{12, 5, 2}
+        s:replace{13, 5, 3}
+        s:replace{14, 5, 4}
+
+        -- A snapshot reader holding a view: the first pins its
+        -- view below both deletes, the second between them.
+        local function pin_reader()
+            local r = {go = fiber.channel(1), res = fiber.channel(1)}
+            local pinned = fiber.channel(1)
+            r.fiber = fiber.create(function()
+                box.begin({txn_isolation = 'snapshot'})
+                s:get{99}
+                pinned:put(true)
+                if r.go:get() then
+                    r.res:put(s.index.sk:select({5, 4},
+                                                {iterator = 'LE'}))
+                end
+                box.commit()
+            end)
+            r.fiber:set_joinable(true)
+            t.assert(pinned:get())
+            return r
+        end
+
+        local r0 = pin_reader()
+        s:delete{13}
+        local r2 = pin_reader()
+        s:delete{12}
+
+        -- A scan at the latest view fuses both DELETEs into
+        -- its resume bound: the first page ends at {14, 5, 4},
+        -- the second resumes after it, crosses the two deleted
+        -- keys and links {11, 5, 1} to its start bound.
+        t.assert_equals(s.index.sk:select({5, 4},
+                        {iterator = 'LE', limit = 1}),
+                        {{14, 5, 4}})
+        t.assert_equals(s.index.sk:select({5, 4},
+                        {iterator = 'LE', after = {14, 5, 4}}),
+                        {{11, 5, 1}})
+
+        -- The reader between the deletes sees the newer one as
+        -- not yet happened: it must keep the row.
+        r2.go:put(true)
+        t.assert_equals(r2.res:get(),
+                        {{14, 5, 4}, {12, 5, 2}, {11, 5, 1}})
+        r2.fiber:join()
+        r0.go:put(false)
+        r0.fiber:join()
+    end)
+end
+
+-- The forward variant of the same shape: the fusing scan, the
+-- resume bound and the pinned reader all walk in the other
+-- direction. The reader between the deletes must keep the row
+-- deleted above its read view just the same.
+g.test_forward_read_below_fused_delete_sees_row = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {unique = false,
+                              parts = {{2, 'unsigned'},
+                                       {3, 'unsigned'}}})
+        s:replace{99, 9, 9}
+        s:replace{11, 5, 1}
+        s:replace{12, 5, 2}
+        s:replace{13, 5, 3}
+        s:replace{14, 5, 4}
+
+        local function pin_reader()
+            local r = {go = fiber.channel(1), res = fiber.channel(1)}
+            local pinned = fiber.channel(1)
+            r.fiber = fiber.create(function()
+                box.begin({txn_isolation = 'snapshot'})
+                s:get{99}
+                pinned:put(true)
+                if r.go:get() then
+                    r.res:put(s.index.sk:select({5, 1},
+                                                {iterator = 'GE'}))
+                end
+                box.commit()
+            end)
+            r.fiber:set_joinable(true)
+            t.assert(pinned:get())
+            return r
+        end
+
+        local r0 = pin_reader()
+        s:delete{13}
+        local r2 = pin_reader()
+        s:delete{12}
+
+        -- The fusing scan walks forward: the first page ends
+        -- at {11, 5, 1}, the second resumes after it and fuses
+        -- the two DELETEs into its start bound.
+        t.assert_equals(s.index.sk:select({5, 1},
+                        {iterator = 'GE', limit = 1}),
+                        {{11, 5, 1}})
+        t.assert_equals(s.index.sk:select({5, 1},
+                        {iterator = 'GE', after = {11, 5, 1}}),
+                        {{14, 5, 4}, {99, 9, 9}})
+
+        r2.go:put(true)
+        t.assert_equals(r2.res:get(),
+                        {{11, 5, 1}, {12, 5, 2}, {14, 5, 4},
+                         {99, 9, 9}})
+        r2.fiber:join()
+        r0.go:put(false)
+        r0.fiber:join()
+    end)
+end
+
+-- A paginated scan resumes at its own start bound. The bound
+-- key is shared with the bound an earlier scan left at the
+-- same position, and a DELETE fused into that bound raised its
+-- LSN. A resumed reader below the LSN must not take the
+-- crossing into the bound as covered: the bound's link claims
+-- a range holding a row the reader still sees alive.
+g.test_resumed_read_below_fused_bound_sees_row = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {unique = false,
+                              parts = {{2, 'unsigned'},
+                                       {3, 'unsigned'}}})
+        s:replace{99, 9, 9}
+        s:replace{11, 5, 1}
+        s:replace{12, 5, 2}
+        s:replace{14, 5, 4}
+
+        local go = fiber.channel(1)
+        local res = fiber.channel(1)
+        local pinned = fiber.channel(1)
+        local reader = fiber.create(function()
+            box.begin({txn_isolation = 'snapshot'})
+            s:get{99}
+            pinned:put(true)
+            go:get()
+            local rows = s.index.sk:select({5, 4},
+                                           {iterator = 'LE',
+                                            limit = 1})
+            for _, tuple in ipairs(s.index.sk:select({5, 4},
+                    {iterator = 'LE', after = rows[1]})) do
+                table.insert(rows, tuple)
+            end
+            res:put(rows)
+            box.commit()
+        end)
+        reader:set_joinable(true)
+        t.assert(pinned:get())
+        s:delete{12}
+
+        -- A scan at the latest view fuses the DELETE into its
+        -- resume bound and links {11, 5, 1} to the bound.
+        t.assert_equals(s.index.sk:select({5, 4},
+                        {iterator = 'LE', limit = 1}),
+                        {{14, 5, 4}})
+        t.assert_equals(s.index.sk:select({5, 4},
+                        {iterator = 'LE', after = {14, 5, 4}}),
+                        {{11, 5, 1}})
+
+        -- The pinned reader resumes at the same position: the
+        -- shared bound's LSN is above its read view, so it
+        -- descends and keeps the row.
+        go:put(true)
+        t.assert_equals(res:get(),
+                        {{14, 5, 4}, {12, 5, 2}, {11, 5, 1}})
+        reader:join()
+    end)
+end
+
+-- A snapshot reader proves a deferred-delete orphan dead at
+-- its read view and records the DELETE into its chain. The row
+-- was re-created under the same secondary key above the
+-- reader's view, so the record holds at the reader's view
+-- alone, and no later write will break the links around it. A
+-- reader above the re-insert must not be served the record:
+-- the key is alive again.
+g.test_recorded_delete_does_not_hide_reinserted_key = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local defer = box.cfg.vinyl_defer_deletes
+        box.cfg{vinyl_defer_deletes = true}
+        local pad = string.rep('x', 100)
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk')
+        s:create_index('sk', {unique = false,
+                              parts = {{2, 'unsigned'},
+                                       {3, 'unsigned'}}})
+        s:replace{3, 4, 10, pad}
+        s:replace{99, 1, 1, pad}
+        -- The victim goes to a run: its deferred DELETE will
+        -- never reach the secondary index in memory.
+        box.snapshot()
+        s:replace{5, 4, 4, pad}
+        -- The overwrite orphans the victim's secondary key.
+        s:replace{3, 9, 9, pad}
+        -- The reader pins its view above the overwrite.
+        box.begin({txn_isolation = 'snapshot'})
+        s:get{99}
+        -- The key is re-created above the reader's view.
+        local w = fiber.create(function()
+            s:replace{3, 4, 10, pad}
+        end)
+        w:set_joinable(true)
+        t.assert_equals({w:join()}, {true})
+        -- The reader proves the orphan dead at its view -- the
+        -- newest primary version it sees is the overwrite --
+        -- and caches the verdict.
+        t.assert_equals(s.index.sk:select{4}, {{5, 4, 4, pad}})
+        box.commit()
+        -- Above the re-insert the key is alive again and the
+        -- cached verdict must not be served.
+        t.assert_equals(s.index.sk:select{4},
+                        {{5, 4, 4, pad}, {3, 4, 10, pad}})
+        box.cfg{vinyl_defer_deletes = defer}
     end)
 end
 

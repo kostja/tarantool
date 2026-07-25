@@ -50,6 +50,14 @@
 /**
  * Scan TX write set for given key.
  * Add one or no statement to the history list.
+ *
+ * This scan never reports staleness via history->is_stale, unlike the
+ * mem and run scans. The write set holds the transaction's own
+ * uncommitted writes, which are always visible to the transaction
+ * itself, so nothing is ever skipped by the read view. There is also
+ * at most one entry per key, and write set statements are uncommitted
+ * (lsn == INT64_MAX) and never enter the tuple cache -- vy_cache_add()
+ * drops them by that lsn.
  */
 static int
 vy_point_lookup_scan_txw(struct vy_lsm *lsm, struct vy_tx *tx,
@@ -81,6 +89,17 @@ vy_point_lookup_scan_cache(struct vy_lsm *lsm, const struct vy_read_view **rv,
 
 	/* Unconfirmed data never enters the cache: see vy_cache_insert(). */
 	assert(entry.stmt == NULL || !vy_stmt_is_prepared(entry.stmt));
+	/*
+	 * A newer cached version invisible in the read view is skipped
+	 * here without reporting staleness via history->is_stale, unlike
+	 * the mem and run scans below. This is safe because the tuple
+	 * cache is a read-through subset of the memory and disk levels:
+	 * any committed version it holds is also present in a mem or a
+	 * run, so the same version is skipped -- and flagged stale -- by
+	 * the mem or run scan. The result is therefore marked stale and
+	 * kept out of the cache regardless, so a stale read can't overwrite
+	 * a fresher cached version. Flagging it here too would be redundant.
+	 */
 	if (entry.stmt == NULL || vy_stmt_lsn(entry.stmt) > (*rv)->vlsn)
 		return 0;
 
