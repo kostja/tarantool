@@ -874,6 +874,14 @@ vy_cache_evict(struct vy_cache *cache, struct vy_entry entry)
 	vy_cache_evict_pos(cache, pos);
 }
 
+#ifndef NDEBUG
+/** AUDIT: the just-formed link verifier, defined below. */
+static void
+vy_cache_builder_audit_link(struct vy_cache_builder *builder,
+			    struct vy_entry prev, struct vy_entry next,
+			    int next_sign);
+#endif
+
 /**
  * Reconcile a freshly inserted entry with the links formed
  * before it appeared, and return the surviving entry -- the
@@ -1282,6 +1290,16 @@ vy_cache_insert(struct vy_cache *cache, struct vy_entry curr,
 	if (builder == NULL)
 		return node;
 	vy_cache_link(cache, pos, node, builder, prev);
+#ifndef NDEBUG
+	/*
+	 * The audit runs before the frontier update below: prev
+	 * is alive while builder->last still holds it. A bound
+	 * key's sign is the audited span's far side; a statement
+	 * has none.
+	 */
+	vy_cache_builder_audit_link(builder, prev, curr,
+				    vy_bound_sign(curr.stmt));
+#endif
 	vy_cache_builder_on_read(builder, node, pos);
 	return node;
 }
@@ -1907,6 +1925,30 @@ vy_cache_builder_break_link(struct vy_cache_builder *builder)
 	vy_cache_evict_pos(cache, pos);
 }
 
+#ifndef NDEBUG
+/**
+ * AUDIT: if a link now spans (prev, next), hand it to the env's
+ * verifier: no key alive in the deeper sources may sit inside.
+ */
+static void
+vy_cache_builder_audit_link(struct vy_cache_builder *builder,
+			    struct vy_entry prev, struct vy_entry next,
+			    int next_sign)
+{
+	struct vy_cache *cache = builder->cache;
+	int dir = iterator_direction(builder->order);
+	if (cache->env->audit_link == NULL || prev.stmt == NULL ||
+	    !vy_cache_pair_is_linked(cache, prev, dir))
+		return;
+	int prev_sign = vy_bound_sign(prev.stmt);
+	struct vy_entry lo = dir > 0 ? prev : next;
+	struct vy_entry hi = dir > 0 ? next : prev;
+	cache->env->audit_link(builder, lo, hi,
+			       dir > 0 ? prev_sign : next_sign,
+			       dir > 0 ? next_sign : prev_sign);
+}
+#endif
+
 /* }}} vy_cache_builder */
 
 /* {{{ vy_cache_iterator */
@@ -2419,3 +2461,61 @@ vy_cache_iterator_open(struct vy_cache_iterator *itr, struct vy_cache *cache,
 }
 
 /* }}} vy_cache_iterator */
+
+/* {{{ Link audit */
+
+#ifndef NDEBUG
+
+/** AUDIT: dump elements around @a prev with flags and versions. */
+void
+vy_cache_dump_around(struct vy_cache *cache, struct vy_entry prev)
+{
+	bool exact;
+	struct vy_cache_tree_iterator it =
+		vy_cache_tree_lower_bound(cache->tree,
+					  prev, &exact);
+	for (int k = 0; k < 3; k++)
+		vy_cache_tree_iterator_prev(cache->tree, &it);
+	for (int k = 0; k < 7; k++) {
+		if (vy_cache_tree_iterator_is_invalid(&it))
+			break;
+		struct vy_cache_entry *n =
+			vy_cache_tree_iterator_get_elem(cache->tree,
+							&it);
+		fprintf(stderr,
+			"AUDITDUMP fl=%x ver=%llu sign=%d %.100s\n",
+			(unsigned)(n->bits & 0xff),
+			(unsigned long long)n->scan_id,
+			vy_bound_sign(n->entry.stmt),
+			vy_stmt_str(n->entry.stmt));
+		vy_cache_tree_iterator_next(cache->tree, &it);
+	}
+}
+
+bool
+vy_cache_pair_is_linked(struct vy_cache *cache, struct vy_entry prev,
+			int direction)
+{
+	struct vy_cache_entry *found =
+		vy_cache_tree_find(cache->tree,
+				   prev);
+	if (found == NULL)
+		return false;
+	if (direction > 0)
+		return found->is_linked;
+	bool exact = false;
+	struct vy_cache_tree_iterator it =
+		vy_cache_tree_lower_bound(cache->tree,
+					  prev, &exact);
+	assert(exact);
+	vy_cache_tree_iterator_prev(cache->tree, &it);
+	if (vy_cache_tree_iterator_is_invalid(&it))
+		return false;
+	struct vy_cache_entry *before =
+		vy_cache_tree_iterator_get_elem(cache->tree, &it);
+	return before->is_linked;
+}
+
+#endif /* !defined(NDEBUG) */
+
+/* }}} Link audit */

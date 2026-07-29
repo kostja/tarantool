@@ -183,6 +183,18 @@ vy_read_iterator_open(struct vy_read_iterator *itr, struct vy_lsm *lsm,
 NODISCARD int
 vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result);
 
+#ifndef NDEBUG
+/**
+ * AUDIT: the cache builder's link verifier, wired into the cache
+ * environment by the server. Walks the in-memory level checking
+ * that no live key sits inside a just-formed link.
+ */
+void
+vy_audit_formed_link(const struct vy_cache_builder *builder,
+		     struct vy_entry lo, struct vy_entry hi,
+		     int lo_sign, int hi_sign);
+#endif
+
 /**
  * Close the iterator and free resources.
  */

@@ -2673,6 +2673,13 @@ vy_env_new(const char *path, size_t memory,
 				e->stmt_env.key_format) != 0)
 		goto error_cache_env;
 	e->cache_env.xm = e->xm;
+#ifndef NDEBUG
+	{
+		char buf[2];
+		if (getenv_safe("VY_LINK_AUDIT", buf, sizeof(buf)) != NULL)
+			e->cache_env.audit_link = vy_audit_formed_link;
+	}
+#endif
 	vy_run_env_create(&e->run_env, e->stmt_env.key_format,
 			  read_threads);
 	vy_log_init(e->path);
