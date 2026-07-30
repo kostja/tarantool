@@ -84,10 +84,10 @@ enum vy_stmt_meta_key {
  * Return flags that must be persisted when the given statement
  * is written to disk.
  */
-static inline uint8_t
+static inline uint16_t
 vy_stmt_persistent_flags(struct tuple *stmt, bool is_primary)
 {
-	uint8_t mask = VY_STMT_FLAGS_ALL;
+	uint16_t mask = VY_STMT_FLAGS_ALL;
 
 	/*
 	 * This flag is only used by the write iterator to turn
@@ -664,7 +664,7 @@ static int
 vy_stmt_meta_encode(struct tuple *stmt, struct request *request,
 		    bool is_primary)
 {
-	uint8_t flags = vy_stmt_persistent_flags(stmt, is_primary);
+	uint16_t flags = vy_stmt_persistent_flags(stmt, is_primary);
 	if (flags == 0)
 		return 0; /* nothing to encode */
 

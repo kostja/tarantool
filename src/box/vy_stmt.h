@@ -270,13 +270,18 @@ enum {
 struct vy_stmt {
 	struct tuple base;
 	uint8_t type; /* IPROTO_INSERT/REPLACE/UPSERT/DELETE */
-	uint8_t flags;
 	/**
 	 * Upserts count of the vinyl statement.
 	 * Only used for UPSERT statements allocated on lsregion, but always in
 	 * present in structure since it costs nothing.
 	 */
 	uint8_t n_upserts;
+	/*
+	 * The flag word. Only the bits of VY_STMT_FLAGS_ALL are
+	 * ever persisted; the rest are runtime state and fit
+	 * above the persisted range.
+	 */
+	uint16_t flags;
 	int64_t lsn;
 	/**
 	 * Offsets array concatenated with MessagePack fields
@@ -333,7 +338,7 @@ vy_stmt_set_type(struct tuple *stmt, enum iproto_type type)
 }
 
 /** Get flags of the vinyl statement. */
-static inline uint8_t
+static inline uint16_t
 vy_stmt_flags(struct tuple *stmt)
 {
 	return ((struct vy_stmt *)stmt)->flags;
@@ -341,7 +346,7 @@ vy_stmt_flags(struct tuple *stmt)
 
 /** Set flags of the vinyl statement. */
 static inline void
-vy_stmt_set_flags(struct tuple *stmt, uint8_t flags)
+vy_stmt_set_flags(struct tuple *stmt, uint16_t flags)
 {
 	assert(flags == 0 || ((struct vy_stmt *)stmt)->flags == 0);
 	((struct vy_stmt *)stmt)->flags = flags;
@@ -349,21 +354,21 @@ vy_stmt_set_flags(struct tuple *stmt, uint8_t flags)
 
 /** OR one or more flags into the vinyl statement's flag word. */
 static inline void
-vy_stmt_add_flag(struct tuple *stmt, uint8_t flag)
+vy_stmt_add_flag(struct tuple *stmt, uint16_t flag)
 {
 	((struct vy_stmt *)stmt)->flags |= flag;
 }
 
 /** Clear one or more flags in the vinyl statement's flag word. */
 static inline void
-vy_stmt_del_flag(struct tuple *stmt, uint8_t flag)
+vy_stmt_del_flag(struct tuple *stmt, uint16_t flag)
 {
 	((struct vy_stmt *)stmt)->flags &= ~flag;
 }
 
 /** Check if the vinyl statement has a given flag set. */
 static inline bool
-vy_stmt_has_flag(struct tuple *stmt, uint8_t flag)
+vy_stmt_has_flag(struct tuple *stmt, uint16_t flag)
 {
 	return vy_stmt_flags(stmt) & flag;
 }
@@ -941,7 +946,7 @@ vy_entry_compare_with_raw_key(struct vy_entry entry,
 static inline int
 vy_bound_sign(struct tuple *stmt)
 {
-	uint8_t flags = vy_stmt_flags(stmt);
+	uint16_t flags = vy_stmt_flags(stmt);
 	if (flags & VY_STMT_INFIMUM)
 		return -1;
 	if (flags & VY_STMT_SUPREMUM)
@@ -959,7 +964,7 @@ vy_bound_sign(struct tuple *stmt)
  * @retval VY_STMT_SUPREMUM for GT, LE and REQ.
  * @retval VY_STMT_INFIMUM for all others.
  */
-static inline uint8_t
+static inline uint16_t
 vy_bound_flag(enum iterator_type type)
 {
 	const unsigned mask = (1u << ITER_GT) | (1u << ITER_LE) |
