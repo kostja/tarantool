@@ -644,12 +644,22 @@ rescan_disk:
 	}
 done:
 #ifndef NDEBUG
-	/* Check that the statement meets search criteria. */
+	/*
+	 * Check that the statement meets search criteria. A
+	 * GT/LT scan demands results strictly past every match
+	 * of the key -- unless it is a resumed scan, e.g.
+	 * key = {3}, after = {3, 3}: then a result must be
+	 * > {3, 3}, but may be merely >= {3}.
+	 */
 	if (next.stmt != NULL) {
-		int cmp = vy_entry_compare(next, itr->key, itr->lsm->cmp_def);
-		cmp *= iterator_direction(itr->iterator_type);
-		if (itr->iterator_type == ITER_GT ||
-		    itr->iterator_type == ITER_LT)
+		int dir = iterator_direction(itr->iterator_type);
+		int cmp = dir * vy_entry_compare(next, itr->key,
+						 itr->lsm->cmp_def);
+		if ((itr->iterator_type == ITER_GT ||
+		     itr->iterator_type == ITER_LT) &&
+		    (itr->last.stmt == NULL ||
+		     dir * vy_entry_compare(itr->last, itr->key,
+					    itr->lsm->cmp_def) > 0))
 			assert(cmp > 0);
 		else
 			assert(cmp >= 0);
