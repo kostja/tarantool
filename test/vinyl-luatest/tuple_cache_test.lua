@@ -447,6 +447,58 @@ g.test_gap_reverse_scan_bounds_fuse = function(cg)
     end)
 end
 
+-- A paginated scan resumes after a position, and the position
+-- is only required to be a match of the searched key. A GT/LT
+-- search with a partial key returns the keys past every match,
+-- yet a position that is itself a match is admitted, and the
+-- scan resumes among the matches -- keys a positionless scan of
+-- the same type skips. Memtx is the reference for every case;
+-- each query repeats, so the second pass is served over
+-- whatever chain the first one recorded.
+g.test_scan_resumes_after_position_inside_prefix = function(cg)
+    cg.server:exec(function()
+        local function fill(s)
+            s:replace{2, 9}
+            s:replace{3, 1}
+            s:replace{3, 4}
+            s:replace{3, 5}
+        end
+        local function check(s)
+            for _ = 1, 2 do
+                t.assert_equals(
+                    s:select({3}, {iterator = 'GT', after = {3, 3},
+                                   limit = 5}),
+                    {{3, 4}, {3, 5}})
+                t.assert_equals(
+                    s:select({3}, {iterator = 'LT', after = {3, 4},
+                                   limit = 5}),
+                    {{3, 1}, {2, 9}})
+                t.assert_equals(
+                    s:select({3}, {iterator = 'EQ', after = {3, 4},
+                                   limit = 5}),
+                    {{3, 5}})
+                local ok, err = pcall(s.select, s, {3},
+                    {iterator = 'GE', after = {2, 5}, limit = 5})
+                t.assert_not(ok, 'a position beyond the key '..
+                                 'prefix is rejected')
+                t.assert_str_contains(tostring(err),
+                                      'position is invalid')
+            end
+        end
+        local m = box.schema.space.create('reference')
+        m:create_index('pk', {parts = {{1, 'unsigned'},
+                                       {2, 'unsigned'}}})
+        fill(m)
+        check(m)
+        m:drop()
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {parts = {{1, 'unsigned'},
+                                       {2, 'unsigned'}}})
+        fill(s)
+        check(s)
+    end)
+end
+
 --
 -- 3. DELETE recording and fusion.
 --
