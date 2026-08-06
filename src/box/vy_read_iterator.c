@@ -984,12 +984,30 @@ vy_read_iterator_track_read(struct vy_read_iterator *itr, struct vy_entry entry)
 			entry = itr->lsm->env->key_inf;
 	}
 
+	/*
+	 * Each step tracks the range from the previous result --
+	 * or from the resume position on the first step of a
+	 * resumed scan -- to the current one: the tracked ranges
+	 * add up to exactly the range the scan has observed.
+	 * Tracking from the key would track the wrong range for
+	 * a resumed scan: select({3}, {iterator = 'GT', after =
+	 * {3, 3}}) returns {3, 4}, and the range from the GT
+	 * boundary of {3} -- past every match of {3} -- down to
+	 * {3, 4} is empty.
+	 */
+	struct vy_entry prev = itr->key;
+	bool prev_belongs = itr->iterator_type != ITER_GT &&
+			    itr->iterator_type != ITER_LT;
+	if (itr->last.stmt != NULL) {
+		prev = itr->last;
+		prev_belongs = false;
+	}
 	if (iterator_direction(itr->iterator_type) >= 0) {
-		vy_tx_track(itr->tx, itr->lsm, itr->key,
-			    itr->iterator_type != ITER_GT, entry, true);
+		vy_tx_track(itr->tx, itr->lsm, prev, prev_belongs,
+			    entry, true);
 	} else {
 		vy_tx_track(itr->tx, itr->lsm, entry, true,
-			    itr->key, itr->iterator_type != ITER_LT);
+			    prev, prev_belongs);
 	}
 }
 

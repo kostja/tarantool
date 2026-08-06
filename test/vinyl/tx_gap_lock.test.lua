@@ -188,6 +188,32 @@ c4:commit()
 
 s:drop()
 ----------------------------------------------------------------
+-- gh-13033: SELECT with a pagination position tracks the
+-- interval from the position, not from the select's key.
+----------------------------------------------------------------
+s = box.schema.space.create('test', {engine = 'vinyl'})
+_ = s:create_index('pk', {parts = {1, 'unsigned', 2, 'unsigned'}})
+
+_ = s:insert{3, 4}
+_ = s:insert{3, 5}
+
+c1:begin()
+c2:begin()
+c1("s:select({3}, {iterator = 'GT', after = {3, 3}, limit = 1})") -- {3, 4}
+c2("s:select({3}, {iterator = 'LT', after = {3, 6}, limit = 1})") -- {3, 5}
+_ = s:insert{3, 3} -- at c1's position: tracked by neither
+c1("s:get({3, 3})") -- {3, 3}
+c2("s:get({3, 3})") -- {3, 3}
+_ = s:replace{3, 4, 1} -- send c1 to read view
+c1("s:get({3, 4})") -- {3, 4}
+c2("s:get({3, 4})") -- {3, 4, 1}
+_ = s:replace{3, 5, 2} -- send c2 to read view
+c2("s:get({3, 5})") -- {3, 5}
+c1:commit()
+c2:commit()
+
+s:drop()
+----------------------------------------------------------------
 -- SELECT EQ/REQ
 ----------------------------------------------------------------
 s = box.schema.space.create('test', {engine = 'vinyl'})
