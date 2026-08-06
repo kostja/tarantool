@@ -1113,12 +1113,27 @@ vy_read_iterator_track_read(struct vy_read_iterator *itr, struct vy_entry entry)
 			entry = itr->lsm->env->key_inf;
 	}
 
+	/*
+	 * The near end of the observed range is where this step
+	 * started reading: the previous result, or the resume
+	 * position of a resumed scan. The key alone would state
+	 * the wrong range for a scan resumed among the key's
+	 * matches -- an open end after every match of a GT key,
+	 * above the far end and so covering nothing.
+	 */
+	struct vy_entry near = itr->key;
+	bool near_belongs = itr->iterator_type != ITER_GT &&
+			    itr->iterator_type != ITER_LT;
+	if (itr->last.stmt != NULL) {
+		near = itr->last;
+		near_belongs = false;
+	}
 	if (iterator_direction(itr->iterator_type) >= 0) {
-		vy_tx_track(itr->tx, itr->lsm, itr->key,
-			    itr->iterator_type != ITER_GT, entry, true);
+		vy_tx_track(itr->tx, itr->lsm, near, near_belongs,
+			    entry, true);
 	} else {
 		vy_tx_track(itr->tx, itr->lsm, entry, true,
-			    itr->key, itr->iterator_type != ITER_LT);
+			    near, near_belongs);
 	}
 }
 

@@ -496,6 +496,49 @@ g.test_scan_resumes_after_position_inside_prefix = function(cg)
                                        {2, 'unsigned'}}})
         fill(s)
         check(s)
+        -- The same reads inside one transaction: the read
+        -- tracking sees the resumed intervals too.
+        box.begin()
+        check(s)
+        box.commit()
+    end)
+end
+
+-- A paginated read must claim the range it observed, which
+-- starts at its position, not at the search key: a GT scan's
+-- key claims the range after every match of the key, which for
+-- a scan resumed among the matches lies above the rows it
+-- returned -- a claim over nothing, and a concurrent write into
+-- the observed range would not conflict with the reader.
+g.test_paginated_read_claims_its_range = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('test', {engine = 'vinyl'})
+        s:create_index('pk', {parts = {{1, 'unsigned'},
+                                       {2, 'unsigned'}}})
+        s:replace{3, 4}
+        s:replace{3, 5}
+        box.begin()
+        t.assert_equals(
+            s:select({3}, {iterator = 'GT', after = {3, 3},
+                           limit = 1}),
+            {{3, 4}})
+        -- Overwrite the row the reader returned.
+        local ch = fiber.channel(1)
+        fiber.create(function()
+            s:replace{3, 4, 1}
+            ch:put(true)
+        end)
+        t.assert(ch:get())
+        -- The reader's own write forces the conflict check --
+        -- an aborted reader may already fail at the write.
+        local ok, err = pcall(function()
+            s:replace{7, 7}
+            box.commit()
+        end)
+        t.assert_not(ok, 'the reader must see the conflict')
+        t.assert_equals(err.code, box.error.TRANSACTION_CONFLICT)
+        box.rollback()
     end)
 end
 
