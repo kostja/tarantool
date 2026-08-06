@@ -985,6 +985,53 @@ vy_cache_relink(struct vy_cache *cache, struct vy_cache_tree_iterator *pos,
 	return vy_cache_tree_iterator_get_elem(cache->tree, pos);
 }
 
+#ifndef NDEBUG
+/** LINKLOG: trace formed links, enabled with the link audit. */
+static bool
+vy_linklog_is_enabled(void)
+{
+	char buf[2];
+	return getenv_safe("VY_LINK_AUDIT", buf, sizeof(buf)) != NULL;
+}
+
+/**
+ * LINKLOG: report a builder event, so a violation found later
+ * can be replayed from the forming scan's exact input stream.
+ */
+static void
+vy_linklog_event(struct vy_cache_builder *builder, const char *what,
+		 struct vy_entry e, int64_t lsn, int is_stale)
+{
+	if (!vy_linklog_is_enabled())
+		return;
+	fprintf(stderr, "EV %s cache=%p scan=%llu vlsn=%lld stale=%d "
+		"lsn=%lld stmt=%.60s\n", what, (void *)builder->cache,
+		(unsigned long long)builder->scan_id,
+		(long long)(**builder->rv).vlsn, is_stale,
+		(long long)lsn,
+		e.stmt == NULL ? "-" : vy_stmt_str(e.stmt));
+}
+
+/**
+ * LINKLOG: report a link the walk has just completed, so a
+ * violation found later can be traced back to the scan that
+ * stated it.
+ */
+static void
+vy_linklog_link(struct vy_cache_builder *builder,
+		struct vy_cache_entry *lo, struct vy_cache_entry *hi)
+{
+	if (!vy_linklog_is_enabled())
+		return;
+	fprintf(stderr, "LINK cache=%p scan=%llu type=%d key=%.40s "
+		"lo=%.60s hi=%.60s\n", (void *)builder->cache,
+		(unsigned long long)builder->scan_id, builder->order,
+		vy_stmt_str(builder->key.stmt),
+		vy_stmt_str(lo->entry.stmt),
+		vy_stmt_str(hi->entry.stmt));
+}
+#endif
+
 /**
  * Complete the link from the chain's previous entry @a prev, if
  * any, to the entry at @a pos, consuming the pending link opened
@@ -1122,6 +1169,10 @@ vy_cache_link(struct vy_cache *cache, struct vy_cache_tree_iterator pos,
 		if (!lo->is_linked) {
 			lo->is_linked = true;
 			changed = true;
+#ifndef NDEBUG
+			vy_linklog_link(builder, direction > 0 ? from : to,
+					direction > 0 ? to : from);
+#endif
 		}
 		from = to;
 	}
@@ -1633,6 +1684,11 @@ vy_cache_builder_add(struct vy_cache_builder *builder, struct vy_entry curr,
 	/* The cache is disabled. */
 	if (cache->env->mem_quota == 0)
 		return;
+#ifndef NDEBUG
+	vy_linklog_event(builder, curr.stmt == NULL ? "END" : "ADD", curr,
+			 curr.stmt == NULL ? 0 : vy_stmt_lsn(curr.stmt),
+			 is_stale);
+#endif
 	/* The end of matches: not an admission, close the chain. */
 	if (curr.stmt == NULL) {
 		/*
@@ -1702,6 +1758,9 @@ vy_cache_builder_add_delete(struct vy_cache_builder *builder,
 	/* The cache is disabled. */
 	if (cache->env->mem_quota == 0)
 		return;
+#ifndef NDEBUG
+	vy_linklog_event(builder, "DEL", delete_key, delete_lsn, is_stale);
+#endif
 	/*
 	 * No link may span a retractable shadow (see vy_cache.h),
 	 * and a stale verdict is shadowed by a version above the

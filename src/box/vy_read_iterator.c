@@ -973,6 +973,9 @@ vy_read_iterator_open_after(struct vy_read_iterator *itr, struct vy_lsm *lsm,
 	/* After the iterator type normalizations above. */
 	vy_cache_builder_create(&itr->cache_builder, &lsm->cache,
 				itr->iterator_type, key, last);
+#ifndef NDEBUG
+	itr->cache_builder.rv = rv;
+#endif
 
 	itr->check_exact_match =
 		(iterator_type == ITER_EQ || iterator_type == ITER_REQ ||

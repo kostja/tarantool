@@ -668,6 +668,10 @@ struct vy_cache_builder {
 	uint32_t chain_length;
 	/** The scan's id, stamped on the entries the chain touches. */
 	uint64_t scan_id;
+#ifndef NDEBUG
+	/** AUDIT: the scan's read view, for its report. */
+	const struct vy_read_view **rv;
+#endif
 };
 
 /**
