@@ -70,10 +70,20 @@ g.test_select_consistency = function(cg)
             local json = require('json')
             local log = require('log')
 
-            math.randomseed(os.time())
+            -- A failure reproduces from its seed: log it, and
+            -- take it from the environment to replay a run.
+            local seed = tonumber(os.getenv('VINYL_SEED')) or
+                (os.time() * 100000 + box.info.pid % 100000)
+            log.info('random seed %s', string.format('%d', seed))
+            math.randomseed(seed)
             box.stat.reset()
 
             local YIELD_PROBABILITY = 0.2
+            local PAGINATE_PROBABILITY = 0.5
+            -- Page sizes 2^0..2^8, log-uniform: mostly small
+            -- pages, for many resumes per scan, and sometimes a
+            -- page larger than the whole result set.
+            local PAGE_LIMIT_LOG2_MAX = 8
             local WRITE_FIBERS = 20
             local READ_FIBERS = 5
             local MAX_TX_STMTS = 10
@@ -171,9 +181,44 @@ g.test_select_consistency = function(cg)
                 end
             end
 
-            local function check_select(idx1, idx2, iterator)
+            -- Read the whole scan, either in one pass or page
+            -- by page. Every page but the first resumes after a
+            -- position instead of starting at the search key,
+            -- and must observe -- and claim as read -- the same
+            -- rows the single pass does.
+            local function read_all(idx, key, iterator, paginate,
+                                    res)
+                local page_limit
+                if paginate then
+                    page_limit =
+                        2 ^ math.random(0, PAGE_LIMIT_LOG2_MAX)
+                end
+                local pos
+                while true do
+                    local n = 0
+                    local last
+                    for _, tuple in idx:pairs(key,
+                            {iterator = iterator, after = pos}) do
+                        n = n + 1
+                        last = tuple
+                        tuple = tuple:totable()
+                        log.info('read %s', str_tuple(tuple))
+                        table.insert(res, tuple)
+                        inject_yield()
+                        if paginate and n == page_limit then
+                            break
+                        end
+                    end
+                    if not paginate or n < page_limit then
+                        return
+                    end
+                    pos = last
+                end
+            end
+
+            local function check_select(idx1, idx2, iterator,
+                                        paginate)
                 local key = math.random(MAX_VAL)
-                local opts = {iterator = iterator}
                 local res1 = {}
                 local res2 = {}
                 local ok, err = pcall(function()
@@ -181,20 +226,14 @@ g.test_select_consistency = function(cg)
                     log.info('begin %s', txn_isolation)
                     box.begin{txn_isolation = txn_isolation}
                     inject_yield()
-                    log.info('select %s %s from %s', iterator, key, idx1)
-                    for _, tuple in s.index[idx1]:pairs(key, opts) do
-                        tuple = tuple:totable()
-                        log.info('read %s', str_tuple(tuple))
-                        table.insert(res1, tuple)
-                        inject_yield()
-                    end
-                    log.info('select %s %s from %s', iterator, key, idx2)
-                    for _, tuple in s.index[idx2]:pairs(key, opts) do
-                        tuple = tuple:totable()
-                        log.info('read %s', str_tuple(tuple))
-                        table.insert(res2, tuple)
-                        inject_yield()
-                    end
+                    log.info('select %s %s from %s paginated %s',
+                             iterator, key, idx1, paginate)
+                    read_all(s.index[idx1], key, iterator, paginate,
+                             res1)
+                    log.info('select %s %s from %s paginated %s',
+                             iterator, key, idx2, paginate)
+                    read_all(s.index[idx2], key, iterator, paginate,
+                             res2)
                     log.info('commit')
                     box.commit()
                 end)
@@ -231,8 +270,18 @@ g.test_select_consistency = function(cg)
                     {'i2', 'i3', 'req'},
                     {'i4', 'i5', 'eq'},
                     {'i4', 'i5', 'req'},
+                    {'i2', 'i3', 'gt'},
+                    {'i2', 'i3', 'lt'},
+                    {'i2', 'i3', 'ge'},
+                    {'i2', 'i3', 'le'},
                 }
-                return check_select(unpack(variants[math.random(#variants)]))
+                local v = variants[math.random(#variants)]
+                -- Page through some of the reads, forward and
+                -- reverse alike. A multikey index takes no
+                -- position by tuple, so its scans never page.
+                local paginate = v[1] ~= 'i4' and
+                    math.random() < PAGINATE_PROBABILITY
+                return check_select(v[1], v[2], v[3], paginate)
             end
 
             local stop = false
