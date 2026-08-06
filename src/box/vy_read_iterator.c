@@ -216,6 +216,49 @@ vy_read_iterator_src_is_visible(struct vy_read_iterator *itr,
 	return (**itr->read_view).vlsn > next_src->max_lsn;
 }
 
+#ifndef NDEBUG
+/** TRACE: enabled together with the cache chain event log. */
+static bool
+vy_trace_is_enabled(void)
+{
+	char buf[2];
+	return getenv_safe("VY_CACHE_TRACE", buf, sizeof(buf)) != NULL;
+}
+
+/**
+ * TRACE: the cache granted the scan link authority for this
+ * step: the deeper sources are not consulted up to the cache
+ * candidate.
+ */
+static void
+vy_trace_authority(struct vy_read_iterator *itr, struct vy_history *history)
+{
+	if (!vy_trace_is_enabled())
+		return;
+	struct vy_entry cand = vy_history_last_stmt(history);
+	fprintf(stderr, "AUTH cache=%p scan=%llu vlsn=%lld last=%.60s "
+		"cand=%.60s\n", (void *)&itr->lsm->cache,
+		(unsigned long long)itr->cache_builder.scan_id,
+		(long long)(**itr->read_view).vlsn,
+		itr->last.stmt == NULL ? "-" : vy_stmt_str(itr->last.stmt),
+		cand.stmt == NULL ? "-" : vy_stmt_str(cand.stmt));
+}
+
+/** TRACE: the row this step of the scan returned, or its end. */
+static void
+vy_trace_serve(struct vy_read_iterator *itr, struct vy_entry entry)
+{
+	if (!vy_trace_is_enabled())
+		return;
+	fprintf(stderr, "SRV cache=%p scan=%llu vlsn=%lld stop=%d "
+		"stmt=%.60s\n", (void *)&itr->lsm->cache,
+		(unsigned long long)itr->cache_builder.scan_id,
+		(long long)(**itr->read_view).vlsn,
+		itr->skipped_src > itr->cache_src,
+		entry.stmt == NULL ? "-" : vy_stmt_str(entry.stmt));
+}
+#endif
+
 /**
  * Check if the statement at which the given read source
  * is positioned precedes the current candidate for the
@@ -403,6 +446,9 @@ vy_read_iterator_scan_cache(struct vy_read_iterator *itr,
 
 	vy_read_iterator_evaluate_src(itr, src, next, stop);
 	if (is_interval) {
+#ifndef NDEBUG
+		vy_trace_authority(itr, &src->history);
+#endif
 		itr->skipped_src = itr->cache_src + 1;
 		*stop = true;
 	}
@@ -917,6 +963,9 @@ vy_read_iterator_open_after(struct vy_read_iterator *itr, struct vy_lsm *lsm,
 	/* After the iterator type normalizations above. */
 	vy_cache_builder_create(&itr->cache_builder, &lsm->cache,
 				itr->iterator_type, key, last);
+#ifndef NDEBUG
+	itr->cache_builder.rv = rv;
+#endif
 
 	itr->check_exact_match =
 		(iterator_type == ITER_EQ || iterator_type == ITER_REQ ||
@@ -1218,6 +1267,9 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result)
 		}
 	}
 	vy_cache_builder_add(&itr->cache_builder, entry, itr->is_stale);
+#ifndef NDEBUG
+	vy_trace_serve(itr, entry);
+#endif
 	*result = entry;
 	return 0;
 }

@@ -159,6 +159,25 @@ vy_tx_manager_mem_used(struct vy_tx_manager *xm)
 	return ret;
 }
 
+#ifndef NDEBUG
+/** TRACE: read view births and deaths, with the cache trace. */
+static void
+vy_trace_read_view(struct vy_tx_manager *xm, const char *what, int64_t vlsn,
+		   int refs)
+{
+	char buf[2];
+	if (getenv_safe("VY_CACHE_TRACE", buf, sizeof(buf)) == NULL)
+		return;
+	int64_t head = INT64_MAX;
+	if (!rlist_empty(&xm->read_views))
+		head = rlist_first_entry(&xm->read_views, struct vy_read_view,
+					 in_read_views)->vlsn;
+	fprintf(stderr, "RV %s vlsn=%lld refs=%d lsn=%lld head=%lld\n",
+		what, (long long)vlsn, refs, (long long)xm->lsn,
+		(long long)head);
+}
+#endif
+
 struct vy_read_view *
 vy_tx_manager_read_view(struct vy_tx_manager *xm, int64_t plsn)
 {
@@ -186,6 +205,9 @@ vy_tx_manager_read_view(struct vy_tx_manager *xm, int64_t plsn)
 		if ((!tx_exists && rv->vlsn == xm->lsn) ||
 		    (tx_exists && rv->vlsn == MAX_LSN + tx->psn)) {
 			rv->refs++;
+#ifndef NDEBUG
+			vy_trace_read_view(xm, "reuse", rv->vlsn, rv->refs);
+#endif
 			return rv;
 		}
 	}
@@ -211,6 +233,9 @@ vy_tx_manager_read_view(struct vy_tx_manager *xm, int64_t plsn)
 		rv->refs = 1;
 	}
 	rlist_add_entry(&prev_rv->in_read_views, rv, in_read_views);
+#ifndef NDEBUG
+	vy_trace_read_view(xm, "new", rv->vlsn, rv->refs);
+#endif
 	if (old_rv != NULL)
 		vy_tx_manager_destroy_read_view(xm, old_rv);
 	return rv;
@@ -225,6 +250,9 @@ vy_tx_manager_destroy_read_view(struct vy_tx_manager *xm,
 	assert(rv->refs);
 	if (--rv->refs == 0) {
 		rlist_del_entry(rv, in_read_views);
+#ifndef NDEBUG
+		vy_trace_read_view(xm, "del", rv->vlsn, 0);
+#endif
 		mempool_free(&xm->read_view_mempool, rv);
 	}
 }
