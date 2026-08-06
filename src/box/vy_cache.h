@@ -407,17 +407,6 @@ struct vy_cache_env {
 	 * environment.
 	 */
 	struct vy_entry empty_key;
-#ifndef NDEBUG
-	/**
-	 * AUDIT: verify a just-formed link between @a lo and @a hi
-	 * against the deeper sources. Wired by the server when the
-	 * VY_LINK_AUDIT environment variable is set; NULL otherwise
-	 * and in unit tests.
-	 */
-	void (*audit_link)(const struct vy_cache_builder *builder,
-			   struct vy_entry lo, struct vy_entry hi,
-			   int lo_sign, int hi_sign);
-#endif
 	/** Common matras extent allocator. */
 	struct matras_allocator allocator;
 	/** Size of memory occupied by cached tuples */
@@ -669,7 +658,7 @@ struct vy_cache_builder {
 	/** The scan's id, stamped on the entries the chain touches. */
 	uint64_t scan_id;
 #ifndef NDEBUG
-	/** AUDIT: the scan's read view, for its report. */
+	/** LINKLOG: the scan's read view, for its trace. */
 	const struct vy_read_view **rv;
 #endif
 };
@@ -904,26 +893,6 @@ void
 vy_cache_iterator_close(struct vy_cache_iterator *itr);
 
 /* }}} vy_cache_iterator */
-
-/* {{{ Link audit */
-
-#ifndef NDEBUG
-/** AUDIT: dump entries around @a prev with flags and versions. */
-void
-vy_cache_dump_around(struct vy_cache *cache, struct vy_entry prev);
-
-/**
- * AUDIT: check the link of the entry holding @a prev.
- * @retval true the entry has a live link toward the read
- * direction.
- * @retval false no such entry or no link.
- */
-bool
-vy_cache_pair_is_linked(struct vy_cache *cache, struct vy_entry prev,
-			int direction);
-#endif
-
-/* }}} Link audit */
 
 #if defined(__cplusplus)
 } /* extern "C" { */

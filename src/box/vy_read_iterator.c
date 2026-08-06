@@ -216,23 +216,6 @@ vy_read_iterator_src_is_visible(struct vy_read_iterator *itr,
 	return (**itr->read_view).vlsn > next_src->max_lsn;
 }
 
-#ifndef NDEBUG
-/** @return true if the link audit is enabled via VY_LINK_AUDIT. */
-static bool
-vy_audit_is_enabled(void)
-{
-	char buf[2];
-	return getenv_safe("VY_LINK_AUDIT", buf, sizeof(buf)) != NULL;
-}
-
-/** AUDIT: the cache builder whose link is being audited. */
-static const struct vy_cache_builder *vy_audit_ctx;
-/** AUDIT forward declaration, see the definition below. */
-static void
-vy_audit_link(struct vy_lsm *lsm, struct vy_mem *mem, struct vy_entry lo,
-	      struct vy_entry hi, int lo_bound, int hi_bound);
-#endif
-
 /**
  * Check if the statement at which the given read source
  * is positioned precedes the current candidate for the
@@ -395,42 +378,6 @@ vy_read_iterator_scan_txw(struct vy_read_iterator *itr,
 	return 0;
 }
 
-#ifndef NDEBUG
-/**
- * AUDIT a cache interval: the observed links say there is
- * nothing between the scan position and the cache candidate.
- */
-static void
-vy_audit_cache_interval(struct vy_read_iterator *itr, struct vy_read_src *src)
-{
-	if (!vy_audit_is_enabled() ||
-	    (**itr->read_view).vlsn != INT64_MAX)
-		return;
-	int dir = iterator_direction(itr->iterator_type);
-	struct vy_entry cand = vy_history_last_stmt(&src->history);
-	struct vy_entry from = itr->last.stmt != NULL ? itr->last : itr->key;
-	int from_b = itr->last.stmt != NULL ?
-		     iterator_direction(itr->iterator_type) :
-		     vy_bound_sign(itr->key.stmt);
-	/*
-	 * A NULL candidate authorizes up to the end of the EQ
-	 * prefix: approximate with the search key's far side.
-	 */
-	struct vy_entry to = cand.stmt != NULL ? cand : itr->key;
-	int to_b = cand.stmt != NULL ? 0 :
-		   iterator_direction(itr->iterator_type);
-	struct vy_entry lo = dir > 0 ? from : to;
-	struct vy_entry hi = dir > 0 ? to : from;
-	int lo_b = dir > 0 ? from_b : to_b;
-	int hi_b = dir > 0 ? to_b : from_b;
-	vy_audit_ctx = &itr->cache_builder;
-	struct vy_mem *mem;
-	rlist_foreach_entry(mem, &itr->lsm->sealed, in_mems)
-		vy_audit_link(itr->lsm, mem, lo, hi, lo_b, hi_b);
-	vy_audit_link(itr->lsm, itr->lsm->mem, lo, hi, lo_b, hi_b);
-}
-#endif
-
 static NODISCARD int
 vy_read_iterator_scan_cache(struct vy_read_iterator *itr,
 			    struct vy_entry *next, bool *stop)
@@ -456,9 +403,6 @@ vy_read_iterator_scan_cache(struct vy_read_iterator *itr,
 
 	vy_read_iterator_evaluate_src(itr, src, next, stop);
 	if (is_interval) {
-#ifndef NDEBUG
-		vy_audit_cache_interval(itr, src);
-#endif
 		itr->skipped_src = itr->cache_src + 1;
 		*stop = true;
 	}
@@ -1277,155 +1221,6 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result)
 	*result = entry;
 	return 0;
 }
-
-#ifndef NDEBUG
-/**
- * AUDIT: find the newest committed statement of @a key across all
- * in-memory trees. A key is alive iff this is not a DELETE.
- * @retval the newest committed statement.
- * @retval NULL none exists.
- */
-static struct tuple *
-vy_audit_key_newest(struct vy_lsm *lsm, struct vy_entry key)
-{
-	struct tuple *newest = NULL;
-	struct vy_mem *mem = lsm->mem;
-	struct rlist *sealed = &lsm->sealed;
-	for (;;) {
-		struct vy_mem_tree_key tree_key;
-		tree_key.entry = key;
-		tree_key.lsn = INT64_MAX;
-		struct vy_mem_tree_iterator it =
-			vy_mem_tree_lower_bound(&mem->tree, &tree_key, NULL);
-		while (!vy_mem_tree_iterator_is_invalid(&it)) {
-			struct vy_entry e =
-				*vy_mem_tree_iterator_get_elem(&mem->tree,
-							       &it);
-			if (vy_entry_compare(e, key, lsm->cmp_def) != 0)
-				break;
-			if (!vy_stmt_is_prepared(e.stmt)) {
-				if (newest == NULL ||
-				    vy_stmt_lsn(e.stmt) >
-				    vy_stmt_lsn(newest))
-					newest = e.stmt;
-				break;
-			}
-			vy_mem_tree_iterator_next(&mem->tree, &it);
-		}
-		if (rlist_entry_is_head(mem, sealed, in_mems))
-			break;
-		if (mem == lsm->mem) {
-			if (rlist_empty(sealed))
-				break;
-			mem = rlist_first_entry(sealed, struct vy_mem,
-						in_mems);
-		} else {
-			if (rlist_next(&mem->in_mems) == sealed)
-				break;
-			mem = rlist_next_entry(mem, in_mems);
-		}
-	}
-	return newest;
-}
-
-/**
- * AUDIT: scan @a mem for a key strictly inside (lo, hi) whose newest
- * committed version is not a DELETE: such a key falsifies an
- * link. Ends with nonzero rank are marker positions of their key.
- */
-static void
-vy_audit_link(struct vy_lsm *lsm, struct vy_mem *mem, struct vy_entry lo,
-	      struct vy_entry hi, int lo_bound, int hi_bound)
-{
-	struct key_def *cmp_def = lsm->cmp_def;
-	struct vy_mem_tree_key tree_key;
-	tree_key.entry = lo;
-	tree_key.lsn = -1; /* after all versions of lo */
-	struct vy_mem_tree_iterator itr =
-		vy_mem_tree_lower_bound(&mem->tree, &tree_key, NULL);
-	struct vy_entry last = vy_entry_none();
-	struct vy_entry best = vy_entry_none();
-	while (!vy_mem_tree_iterator_is_invalid(&itr)) {
-		struct vy_entry e =
-			*vy_mem_tree_iterator_get_elem(&mem->tree, &itr);
-		int cl = vy_entry_compare(e, lo, cmp_def);
-		if (cl < 0 || (cl == 0 && lo_bound >= 0))
-			goto next;
-		int ch = vy_entry_compare(e, hi, cmp_def);
-		if (ch > 0 || (ch == 0 && hi_bound <= 0))
-			break;
-		if (last.stmt == NULL ||
-		    vy_entry_compare(e, last, cmp_def) != 0) {
-			/* Newest committed version of a fresh key. */
-			struct tuple *nw = best.stmt == NULL ? NULL :
-				vy_audit_key_newest(lsm, best);
-			if (nw != NULL &&
-			    vy_stmt_type(nw) != IPROTO_DELETE) {
-				const struct vy_cache_builder *b =
-					vy_audit_ctx;
-				fprintf(stderr, "VIOL-K %.100s\n",
-					vy_stmt_str(best.stmt));
-				fprintf(stderr, "VIOL-LO %d %.100s\n",
-					lo_bound, vy_stmt_str(lo.stmt));
-				fprintf(stderr, "VIOL-HI %d %.100s\n",
-					hi_bound, vy_stmt_str(hi.stmt));
-				fprintf(stderr, "VIOL-CTX type=%d key=%.60s "
-					"ver=%llu last=%.100s\n",
-					b->order,
-					vy_stmt_str(b->key.stmt),
-					(unsigned long long)b->scan_id,
-					b->last.stmt == NULL ? "-" :
-					vy_stmt_str(b->last.stmt));
-				vy_cache_dump_around(&lsm->cache, lo);
-				abort();
-			}
-			best = vy_entry_none();
-			last = e;
-		}
-		if (best.stmt == NULL && !vy_stmt_is_prepared(e.stmt))
-			best = e;
-next:
-		vy_mem_tree_iterator_next(&mem->tree, &itr);
-	}
-	struct tuple *nw = best.stmt == NULL ? NULL :
-		vy_audit_key_newest(lsm, best);
-	if (nw != NULL && vy_stmt_type(nw) != IPROTO_DELETE) {
-		const struct vy_cache_builder *b = vy_audit_ctx;
-		fprintf(stderr, "VIOL-K %.100s\n", vy_stmt_str(best.stmt));
-		fprintf(stderr, "VIOL-LO %d %.100s\n", lo_bound,
-			vy_stmt_str(lo.stmt));
-		fprintf(stderr, "VIOL-HI %d %.100s\n", hi_bound,
-			vy_stmt_str(hi.stmt));
-		fprintf(stderr, "VIOL-CTX type=%d key=%.60s ver=%llu "
-			"last=%.100s\n", b->order,
-			vy_stmt_str(b->key.stmt),
-			(unsigned long long)b->scan_id,
-			b->last.stmt == NULL ? "-" :
-			vy_stmt_str(b->last.stmt));
-		vy_cache_dump_around(&lsm->cache, lo);
-		abort();
-	}
-}
-#endif
-
-#ifndef NDEBUG
-/** See the comment in vy_read_iterator.h. */
-void
-vy_audit_formed_link(const struct vy_cache_builder *builder,
-		     struct vy_entry lo, struct vy_entry hi,
-		     int lo_sign, int hi_sign)
-{
-	if (!vy_audit_is_enabled())
-		return;
-	struct vy_lsm *lsm = container_of(builder->cache, struct vy_lsm,
-					  cache);
-	vy_audit_ctx = builder;
-	struct vy_mem *mem;
-	rlist_foreach_entry(mem, &lsm->sealed, in_mems)
-		vy_audit_link(lsm, mem, lo, hi, lo_sign, hi_sign);
-	vy_audit_link(lsm, lsm->mem, lo, hi, lo_sign, hi_sign);
-}
-#endif
 
 /**
  * Close the iterator and free resources
