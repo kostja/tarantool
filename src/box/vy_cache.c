@@ -204,7 +204,8 @@ vy_cache_clear_pending_links(struct vy_cache *cache,
 
 /** The eviction hand, defined below. */
 static void
-vy_cache_env_gc(struct vy_cache_env *env, size_t size);
+vy_cache_env_gc(struct vy_cache_env *env, size_t size,
+		bool armed);
 
 /**
  * Allocate a cache tree page.
@@ -247,6 +248,15 @@ vy_cache_env_create(struct vy_cache_env *e, struct tuple_format *key_format)
 	e->mem_quota = 0;
 	e->tuple.rows = 0;
 	e->tuple.bytes = 0;
+	e->shadow[0] = NULL;
+	e->shadow[1] = NULL;
+	e->shadow_mask = 0;
+	e->shadow_epoch = 0;
+	e->shadow_set_bits = 0;
+	e->door = NULL;
+	e->door_keys = 0;
+	e->door_set_bits = 0;
+	e->armed_walked = 0;
 	matras_allocator_create(&e->allocator,
 				VY_CACHE_TREE_EXTENT_SIZE,
 				vy_cache_tree_page_alloc,
@@ -265,8 +275,11 @@ vy_cache_env_destroy(struct vy_cache_env *e)
 	 */
 	e->mem_quota = 0;
 	while (e->mem_used > 0)
-		vy_cache_env_gc(e, 0);
+		vy_cache_env_gc(e, 0, 0);
 #endif
+	free(e->shadow[0]);
+	free(e->shadow[1]);
+	free(e->door);
 	tuple_unref(e->empty_key.stmt);
 	matras_allocator_destroy(&e->allocator);
 }
@@ -282,6 +295,246 @@ vy_cache_env_new_scan_id(struct vy_cache_env *env)
 		env->scan_id = 1;
 	return env->scan_id;
 }
+
+/* {{{ shadow map */
+
+enum {
+	/** Bytes per map array: quota >> SHIFT, clamped. */
+	VY_CACHE_SHADOW_QUOTA_SHIFT = 7,
+	VY_CACHE_SHADOW_MIN_BYTES = 16 * 1024,
+	VY_CACHE_SHADOW_MAX_BYTES = 256 * 1024,
+};
+
+/*
+ * The shadow map is the cache's memory of key re-reference,
+ * kept in three bloom filters: the doorkeeper and the two
+ * protected epochs, the young and the old.
+ *
+ * Every read recorded in the cache reports its key, see
+ * vy_cache_insert(). A key seen for the first time is stamped
+ * into the doorkeeper and that is all; when the doorkeeper
+ * fills to a set density it is wiped. A key found in the
+ * doorkeeper -- read twice within the doorkeeper's window --
+ * is promoted: stamped into the young protected epoch, as is,
+ * on every read, a key already protected. Protection is
+ * re-reference the incumbents' heat can no longer outrank,
+ * since heat cannot tell a resident the readers still use
+ * from a resident of a dead working set that merely has not
+ * cooled yet.
+ *
+ * Protection acts twice in the eviction walk, see
+ * vy_cache_env_gc(). A protected key's read runs the walk
+ * armed: the eviction threshold rises from zero to the
+ * admission credit, and any unprotected entry the credit
+ * covers yields its room, cooled or not. And on every walk,
+ * armed or not, an entry whose key is in the young epoch is
+ * reprieved at any heat. The verdict is recency where heat is
+ * blind: a dead set stops being read, drops out of the young
+ * epoch, and is evicted by the armed stream of the set
+ * replacing it -- a working set change converges about as
+ * fast as under plain LRU -- while the live set is restamped
+ * on every read and cannot be washed out.
+ *
+ * The doorkeeper is what makes this scan resistant. A sweep
+ * touches each key once, so a sweep never promotes: it fills
+ * and refills the doorkeeper, whose window is the resident
+ * row count -- a sweep does not fit the cache by definition,
+ * so it reappears, if it reappears at all, after its stamps
+ * were wiped. Sweep reads run unarmed, never flip the
+ * protected epochs, and meet reprieved incumbents: a sweep of
+ * any length, one-shot or repeated, is refused admission and
+ * cannot displace the protected set. A recurring set short
+ * enough to promote is not a sweep -- it fits the cache, and
+ * arming lets it claim the room from colder incumbents.
+ *
+ * The protected epochs age by armed traffic only: the young
+ * epoch flips -- the old array is wiped and becomes young --
+ * when it fills to a set density, or when armed walks have
+ * covered a full revolution of the resident bytes. Either
+ * way the flip is driven by promoted keys competing for the
+ * cache, never by sweeps. A false positive reprieves or
+ * elevates one key -- a nudged eviction order, never a wrong
+ * result.
+ */
+
+/** Size the arrays for the quota; a change wipes the map. */
+static void
+vy_cache_env_shadow_resize(struct vy_cache_env *env)
+{
+	size_t bytes = env->mem_quota >> VY_CACHE_SHADOW_QUOTA_SHIFT;
+	if (bytes < VY_CACHE_SHADOW_MIN_BYTES)
+		bytes = VY_CACHE_SHADOW_MIN_BYTES;
+	if (bytes > VY_CACHE_SHADOW_MAX_BYTES)
+		bytes = VY_CACHE_SHADOW_MAX_BYTES;
+	if (env->mem_quota == 0)
+		bytes = 0;
+	/* A power of two, for mask indexing. */
+	if (bytes != 0)
+		bytes = 1UL << (64 - bit_clz_u64(bytes - 1));
+	uint64_t mask = bytes == 0 ? 0 : bytes * 8 - 1;
+	if (mask == env->shadow_mask)
+		return;
+	free(env->shadow[0]);
+	free(env->shadow[1]);
+	free(env->door);
+	env->shadow[0] = bytes != 0 ? xcalloc(bytes / 8, 8) : NULL;
+	env->shadow[1] = bytes != 0 ? xcalloc(bytes / 8, 8) : NULL;
+	env->door = bytes != 0 ? xcalloc(bytes / 8, 8) : NULL;
+	env->shadow_mask = mask;
+	env->shadow_epoch = 0;
+	env->shadow_set_bits = 0;
+	env->door_keys = 0;
+	env->door_set_bits = 0;
+	env->armed_walked = 0;
+}
+
+/** The map can carry the key: it hashes by the cmp_def. */
+static bool
+vy_cache_is_shadowed(struct vy_cache *cache, struct tuple *stmt)
+{
+	return !vy_stmt_is_cache_meta(stmt) &&
+	       !cache->cmp_def->is_multikey &&
+	       !cache->cmp_def->for_func_index;
+}
+
+/**
+ * The map key: the statement's key hashed by the cache's
+ * cmp_def, salted with the cache identity -- equal keys of
+ * different indexes are different map keys -- and the hint.
+ */
+static uint64_t
+vy_cache_shadow_hash(struct vy_cache *cache, struct vy_entry entry)
+{
+	uint64_t h = tuple_hash(entry.stmt, cache->cmp_def);
+	h ^= (uint64_t)(uintptr_t)cache;
+	h *= 0x9e3779b97f4a7c15;
+	h ^= (uint64_t)entry.hint;
+	h *= 0x9e3779b97f4a7c15;
+	h ^= h >> 32;
+	return h;
+}
+
+/** True if the array holds the key. */
+static bool
+vy_cache_shadow_probe(struct vy_cache_env *env, uint64_t *arr,
+		      uint64_t h)
+{
+	for (int i = 0; i < 3; i++) {
+		uint64_t bit = (h >> (21 * i)) & env->shadow_mask;
+		if ((arr[bit >> 6] & (1UL << (bit & 63))) == 0)
+			return false;
+	}
+	return true;
+}
+
+/** Stamp the key into the array; count the new bits. */
+static uint64_t
+vy_cache_shadow_stamp(struct vy_cache_env *env, uint64_t *arr,
+		      uint64_t h)
+{
+	uint64_t set = 0;
+	for (int i = 0; i < 3; i++) {
+		uint64_t bit = (h >> (21 * i)) & env->shadow_mask;
+		uint64_t word = 1UL << (bit & 63);
+		if ((arr[bit >> 6] & word) == 0) {
+			arr[bit >> 6] |= word;
+			set++;
+		}
+	}
+	return set;
+}
+
+/** The set density that wipes an array: a third of its bits. */
+static bool
+vy_cache_shadow_is_full(struct vy_cache_env *env, uint64_t set_bits)
+{
+	return set_bits * 3 >= env->shadow_mask + 1;
+}
+
+/** Flip the epochs: the old array is wiped and becomes young. */
+static void
+vy_cache_shadow_flip(struct vy_cache_env *env)
+{
+	env->shadow_set_bits = 0;
+	env->armed_walked = 0;
+	env->shadow_epoch ^= 1;
+	memset(env->shadow[env->shadow_epoch], 0,
+	       (env->shadow_mask + 1) / 8);
+}
+
+/**
+ * Report a recorded read of the key; @return true if the key
+ * is protected -- the caller's walk runs armed.
+ */
+static bool
+vy_cache_shadow_record(struct vy_cache_env *env, uint64_t h)
+{
+	if (env->shadow_mask == 0)
+		return false;
+	uint64_t *young = env->shadow[env->shadow_epoch];
+	uint64_t *old = env->shadow[env->shadow_epoch ^ 1];
+	bool armed = vy_cache_shadow_probe(env, young, h) ||
+		     vy_cache_shadow_probe(env, old, h) ||
+		     vy_cache_shadow_probe(env, env->door, h);
+	if (armed) {
+		env->shadow_set_bits +=
+			vy_cache_shadow_stamp(env, young, h);
+		if (vy_cache_shadow_is_full(env, env->shadow_set_bits))
+			vy_cache_shadow_flip(env);
+		return true;
+	}
+	/*
+	 * The doorkeeper's window is the resident row count: a
+	 * key reappearing within it belongs to a set small
+	 * enough to fit the cache, and is promoted. A longer
+	 * recurring set -- a sweep by another name -- reappears
+	 * after its stamps were wiped, and never promotes. The
+	 * density bound is a backstop keeping the false
+	 * positive rate down.
+	 */
+	env->door_keys++;
+	env->door_set_bits += vy_cache_shadow_stamp(env, env->door, h);
+	if (env->door_keys >= (uint64_t)MAX(env->tuple.rows, 1024) ||
+	    vy_cache_shadow_is_full(env, env->door_set_bits)) {
+		env->door_keys = 0;
+		env->door_set_bits = 0;
+		memset(env->door, 0, (env->shadow_mask + 1) / 8);
+	}
+	return false;
+}
+
+/**
+ * True if either protected epoch holds the key: reprieved.
+ * Both epochs count, so one flip does not strip a live set
+ * of protection before its reads restamp the young epoch --
+ * the price is that a dead set ages out over two flips.
+ */
+static bool
+vy_cache_shadow_is_protected(struct vy_cache_env *env, uint64_t h)
+{
+	if (env->shadow_mask == 0)
+		return false;
+	return vy_cache_shadow_probe(env, env->shadow[0], h) ||
+	       vy_cache_shadow_probe(env, env->shadow[1], h);
+}
+
+/**
+ * Track the armed walks' progress; a revolution of armed
+ * walking flips the epochs even below the density trigger,
+ * so a dead protected set is aged out by the armed stream
+ * competing with it.
+ */
+static void
+vy_cache_shadow_armed_walk(struct vy_cache_env *env, size_t walked)
+{
+	if (env->shadow_mask == 0)
+		return;
+	env->armed_walked += walked;
+	if (env->armed_walked >= env->mem_used)
+		vy_cache_shadow_flip(env);
+}
+
+/* }}} shadow map */
 
 /** Advance the eviction hand to the next cache, if there is one. */
 static void
@@ -337,7 +590,8 @@ vy_cache_env_del_cache(struct vy_cache_env *env, struct vy_cache *cache)
  * cache's tree, it moves to the next cache.
  */
 static void
-vy_cache_env_gc(struct vy_cache_env *env, size_t size)
+vy_cache_env_gc(struct vy_cache_env *env, size_t size,
+		bool armed)
 {
 	/*
 	 * The budget is in bytes walked. It is proportional to
@@ -361,6 +615,7 @@ vy_cache_env_gc(struct vy_cache_env *env, size_t size)
 	size_t pressure = env->mem_used > env->mem_quota ?
 			  VY_CACHE_TREE_EXTENT_SIZE : 0;
 	ssize_t budget = MAX(size, pressure) * VY_CACHE_GC_FACTOR;
+	ssize_t budget_start = budget;
 	/*
 	 * The weighting unit of the visit below: log2 of the
 	 * mean resident tuple size, snapshot once per walk so
@@ -439,6 +694,15 @@ vy_cache_env_gc(struct vy_cache_env *env, size_t size)
 			node->heat--;
 		}
 		/*
+		 * The eviction threshold: normally zero -- only a
+		 * fully cooled entry goes. A protected key's walk
+		 * runs armed: the threshold rises to the admission
+		 * credit, and any unprotected entry it covers
+		 * yields its room, cooled or not, see the shadow
+		 * map section.
+		 */
+		unsigned threshold = armed ? VY_CACHE_ADMIT_HEAT : 0;
+		/*
 		 * A meta entry and a secondary tuple entry live by
 		 * their entry's own heat -- a secondary's interest
 		 * in the row is local. A primary tuple entry is
@@ -448,13 +712,25 @@ vy_cache_env_gc(struct vy_cache_env *env, size_t size)
 		 * maybe-stale entry is collected regardless of
 		 * heat.
 		 */
-		bool warm;
-		if (vy_stmt_maybe_stale(stmt, cache->is_primary))
-			warm = false;
-		else if (is_tuple && cache->is_primary)
-			warm = vy_stmt_heat(stmt) > 0;
-		else
-			warm = node->heat > 0;
+		bool stale = vy_stmt_maybe_stale(stmt, cache->is_primary);
+		unsigned post_heat = is_tuple && cache->is_primary ?
+			vy_stmt_heat(stmt) : node->heat;
+		bool warm = !stale && post_heat > threshold;
+		/*
+		 * The reprieve: a protected entry is not evicted
+		 * at any heat, on any walk -- its key is being
+		 * read, whatever its heat says, see the shadow
+		 * map section. A standing overage overrules it:
+		 * a lowered quota must be reached whatever the
+		 * map holds, or the reclaim would never end.
+		 */
+		if (!warm && !stale &&
+		    env->mem_used <= env->mem_quota &&
+		    vy_cache_is_shadowed(cache, stmt)) {
+			uint64_t h = vy_cache_shadow_hash(cache,
+							  node->entry);
+			warm = vy_cache_shadow_is_protected(env, h);
+		}
 		if (warm) {
 			vy_cache_tree_iterator_next(cache->tree,
 						    &itr);
@@ -503,6 +779,8 @@ rotate:
 		if (env->gc_cache == first)
 			break;
 	}
+	if (armed && budget_start > budget)
+		vy_cache_shadow_armed_walk(env, budget_start - budget);
 	/* Save the hand position, referenced: the walk is over. */
 	if (!vy_cache_tree_iterator_is_invalid(&itr)) {
 		struct vy_cache_entry *node =
@@ -517,8 +795,9 @@ void
 vy_cache_env_set_quota(struct vy_cache_env *env, size_t quota)
 {
 	env->mem_quota = quota;
+	vy_cache_env_shadow_resize(env);
 	while (env->mem_used > env->mem_quota) {
-		vy_cache_env_gc(env, 0);
+		vy_cache_env_gc(env, 0, 0);
 		if (env->mem_used <= env->mem_quota)
 			break;
 		/*
@@ -1289,9 +1568,18 @@ vy_cache_insert(struct vy_cache *cache, struct vy_entry curr,
 	 * eviction -- when the bounded walk cannot reclaim
 	 * enough from caches full of hot entries, a fresh
 	 * admission is refused below.
+	 *
+	 * The read is recorded in the shadow map; a protected
+	 * key's walk runs armed -- eviction goes by recency, not
+	 * heat, see the shadow map section.
 	 */
 	size_t size = vy_cache_entry_size(cache->is_primary, &el);
-	vy_cache_env_gc(cache->env, size);
+	bool armed = false;
+	if (vy_cache_is_shadowed(cache, curr.stmt)) {
+		uint64_t hash = vy_cache_shadow_hash(cache, curr);
+		armed = vy_cache_shadow_record(cache->env, hash);
+	}
+	vy_cache_env_gc(cache->env, size, armed);
 	bool exact;
 	struct vy_cache_tree_iterator pos;
 	if (vy_cache_tree_find_or_insert(cache->tree, el, &pos,

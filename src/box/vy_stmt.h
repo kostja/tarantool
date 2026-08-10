@@ -252,6 +252,17 @@ enum {
 	 */
 	VY_STMT_HEAT_SHIFT		= 8,
 	VY_STMT_HEAT_MASK		= 7 << VY_STMT_HEAT_SHIFT,
+	/*
+	 * The heat cap: the retention grades run 0..3, matching
+	 * VY_CACHE_HEAT_MAX. The field could count to 7, but a
+	 * lap of retention is a full hand revolution over the
+	 * resident set, and every lap above the cap delays the
+	 * eviction of a set that fell out of use by another
+	 * revolution -- more grades slow the cache's response to
+	 * a working set change without earning the hot set any
+	 * protection the cap does not already give.
+	 */
+	VY_STMT_HEAT_MAX		= 3,
 	/**
 	 * The statement is held by its space's primary tuple
 	 * cache. Set when the primary cache admits the statement,
@@ -409,7 +420,7 @@ vy_stmt_heat(struct tuple *stmt)
 static inline void
 vy_stmt_inc_heat(struct tuple *stmt)
 {
-	if ((vy_stmt_flags(stmt) & VY_STMT_HEAT_MASK) != VY_STMT_HEAT_MASK)
+	if (vy_stmt_heat(stmt) < VY_STMT_HEAT_MAX)
 		((struct vy_stmt *)stmt)->flags += 1 << VY_STMT_HEAT_SHIFT;
 }
 

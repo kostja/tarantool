@@ -418,6 +418,27 @@ struct vy_cache_env {
 	struct vy_stmt_counter tuple;
 	/** Max memory size that can be used for cache */
 	size_t mem_quota;
+	/**
+	 * The shadow map: the protected epoch pair and the
+	 * doorkeeper below, three bloom filters over the keys
+	 * of recorded reads, see the vy_cache.c section. NULL,
+	 * with a zero mask, while the cache is disabled.
+	 */
+	uint64_t *shadow[2];
+	/** Bits per map array minus one: the index mask. */
+	uint64_t shadow_mask;
+	/** The index of the young epoch array in shadow[]. */
+	unsigned shadow_epoch;
+	/** Set bits in the young array; drives the epoch flip. */
+	uint64_t shadow_set_bits;
+	/** The doorkeeper: first-touch keys, wiped per window. */
+	uint64_t *door;
+	/** Keys stamped in the doorkeeper; drives its wipe. */
+	uint64_t door_keys;
+	/** Set bits in the doorkeeper; the wipe's FP backstop. */
+	uint64_t door_set_bits;
+	/** Bytes walked armed since a flip; drives the flip too. */
+	size_t armed_walked;
 };
 
 /**
