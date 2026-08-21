@@ -696,13 +696,8 @@ void
 vy_slice_stream_open(struct vy_slice_stream *stream, struct vy_slice *slice,
 		     struct key_def *cmp_def, struct tuple_format *format);
 
-/**
- * Run_writer fills a created run with statements one by one,
- * splitting them into pages.
- */
-struct vy_run_writer {
-	/** Run to fill. */
-	struct vy_run *run;
+/** Construction parameters of a run writer, stored whole. */
+struct vy_run_writer_opts {
 	/** Path to directory with run files. */
 	const char *dirpath;
 	/** Identifier of a space owning the run. */
@@ -719,6 +714,20 @@ struct vy_run_writer {
 	struct key_def *key_def;
 	/** Various options, e.g. minimal page size. */
 	struct index_opts index_opts;
+	/** Dictionary training context (sample collection + output). */
+	struct vy_dict_sample *dict_sample;
+};
+
+/** Run writer, filling a run with a sorted statement stream. */
+/**
+ * Run_writer fills a created run with statements one by one,
+ * splitting them into pages.
+ */
+struct vy_run_writer {
+	/** Run to fill. */
+	struct vy_run *run;
+	/** Construction parameters, see vy_run_writer_opts. */
+	struct vy_run_writer_opts opts;
 	/**
 	 * Current page info capacity. Can grow with page number.
 	 */
@@ -729,8 +738,6 @@ struct vy_run_writer {
 	struct tuple_bloom_builder *bloom;
 	/** Buffer of a current page row offsets. */
 	struct ibuf row_index_buf;
-	/** Dictionary training context (sample collection + output). */
-	struct vy_dict_sample *dict_sample;
 	/**
 	 * Remember a last written statement to use it as a source
 	 * of max key of a finished run.
@@ -743,10 +750,7 @@ struct vy_run_writer {
 /** Create a run writer to fill a run with statements. */
 int
 vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
-		     const char *dirpath, uint32_t space_id, uint32_t iid,
-		     struct key_def *cmp_def, struct key_def *key_def,
-		     struct index_opts *index_opts,
-		     struct vy_dict_sample *dict_sample);
+		     const struct vy_run_writer_opts *opts);
 
 /**
  * Write a specified statement into a run.

@@ -1153,14 +1153,18 @@ vy_task_write_run(struct vy_task *task)
 			       "vinyl dump"); return -1;});
 	ERROR_INJECT_SLEEP(ERRINJ_VY_RUN_WRITE_DELAY);
 
+	struct vy_run_writer_opts opts = {
+		.dirpath = lsm->env->path,
+		.space_id = lsm->space_id,
+		.iid = lsm->index_id,
+		.cmp_def = task->cmp_def,
+		.key_def = task->key_def,
+		.index_opts = task->index_opts,
+		.dict_sample = &task->dict_sample,
+	};
 	struct vy_run_writer writer;
-	if (vy_run_writer_create(&writer, task->new_run, lsm->env->path,
-				 lsm->space_id, lsm->index_id,
-				 task->cmp_def, task->key_def,
-				 &task->index_opts,
-				 &task->dict_sample) != 0) {
+	if (vy_run_writer_create(&writer, task->new_run, &opts) != 0)
 		goto fail;
-	}
 
 	if (wi->iface->start(wi) != 0)
 		goto fail_abort_writer;

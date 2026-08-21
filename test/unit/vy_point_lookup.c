@@ -26,10 +26,16 @@ write_run(struct vy_run *run, const char *dir_name,
 	index_opts.bloom_fpr = 0.1;
 	struct vy_dict_sample dict_sample;
 	memset(&dict_sample, 0, sizeof(dict_sample));
-	if (vy_run_writer_create(&writer, run, dir_name,
-				 lsm->space_id, lsm->index_id,
-				 lsm->cmp_def, lsm->key_def,
-				 &index_opts, &dict_sample) != 0)
+	struct vy_run_writer_opts opts = {
+		.dirpath = dir_name,
+		.space_id = lsm->space_id,
+		.iid = lsm->index_id,
+		.cmp_def = lsm->cmp_def,
+		.key_def = lsm->key_def,
+		.index_opts = index_opts,
+		.dict_sample = &dict_sample,
+	};
+	if (vy_run_writer_create(&writer, run, &opts) != 0)
 		goto fail;
 
 	if (wi->iface->start(wi) != 0)

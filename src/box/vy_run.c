@@ -2194,22 +2194,14 @@ fail:
 
 int
 vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
-		     const char *dirpath, uint32_t space_id, uint32_t iid,
-		     struct key_def *cmp_def, struct key_def *key_def,
-		     struct index_opts *index_opts,
-		     struct vy_dict_sample *dict_sample)
+		     const struct vy_run_writer_opts *opts)
 {
 	memset(writer, 0, sizeof(*writer));
 	writer->run = run;
-	writer->dirpath = dirpath;
-	writer->space_id = space_id;
-	writer->iid = iid;
-	writer->cmp_def = cmp_def;
-	writer->key_def = key_def;
-	writer->index_opts = *index_opts;
-	writer->dict_sample = dict_sample;
-	if (writer->index_opts.bloom_fpr < 1) {
-		writer->bloom = tuple_bloom_builder_new(key_def->part_count);
+	writer->opts = *opts;
+	if (writer->opts.index_opts.bloom_fpr < 1) {
+		writer->bloom = tuple_bloom_builder_new(
+				writer->opts.key_def->part_count);
 		if (writer->bloom == NULL)
 			return -1;
 	}
@@ -2234,9 +2226,9 @@ vy_run_writer_create_xlog(struct vy_run_writer *writer)
 {
 	assert(!xlog_is_open(&writer->data_xlog));
 	char path[PATH_MAX];
-	vy_run_snprint_path(path, sizeof(path), writer->dirpath,
-			    writer->space_id, writer->iid, writer->run->id,
-			    VY_FILE_RUN);
+	vy_run_snprint_path(path, sizeof(path), writer->opts.dirpath,
+			    writer->opts.space_id, writer->opts.iid,
+			    writer->run->id, VY_FILE_RUN);
 	say_info("writing `%s'", path);
 	struct xlog_meta meta;
 	xlog_meta_create(&meta, XLOG_META_TYPE_RUN, &INSTANCE_UUID,
@@ -2244,7 +2236,7 @@ vy_run_writer_create_xlog(struct vy_run_writer *writer)
 	struct xlog_opts opts = xlog_opts_default;
 	opts.rate_limit = writer->run->env->snap_io_rate_limit;
 	opts.sync_interval = VY_RUN_SYNC_INTERVAL;
-	opts.compression_level = writer->index_opts.compression_level;
+	opts.compression_level = writer->opts.index_opts.compression_level;
 	if (writer->run->dict != NULL) {
 		opts.dict = writer->run->dict->data;
 		opts.dict_size = writer->run->dict->size;
@@ -2270,11 +2262,12 @@ vy_run_writer_start_page(struct vy_run_writer *writer,
 	if (run->info.page_count >= writer->page_info_capacity &&
 	    vy_run_alloc_page_info(run, &writer->page_info_capacity) != 0)
 		return -1;
+	struct key_def *cmp_def = writer->opts.cmp_def;
 	const char *key = vy_stmt_is_key(first_entry.stmt) ?
 			  tuple_data(first_entry.stmt) :
-			  tuple_extract_key(first_entry.stmt, writer->cmp_def,
+			  tuple_extract_key(first_entry.stmt, cmp_def,
 					    vy_entry_multikey_idx(first_entry,
-								  writer->cmp_def),
+								  cmp_def),
 					    NULL);
 	if (key == NULL)
 		return -1;
@@ -2304,7 +2297,7 @@ static int
 vy_run_writer_write_to_page(struct vy_run_writer *writer, struct vy_entry entry)
 {
 	if (writer->bloom != NULL &&
-	    vy_bloom_builder_add(writer->bloom, entry, writer->key_def) != 0)
+	    vy_bloom_builder_add(writer->bloom, entry, writer->opts.key_def) != 0)
 		return -1;
 	if (writer->last.stmt != NULL)
 		vy_stmt_unref_if_possible(writer->last.stmt);
@@ -2319,10 +2312,10 @@ vy_run_writer_write_to_page(struct vy_run_writer *writer, struct vy_entry entry)
 		return -1;
 	}
 	*offset = page->unpacked_size;
-	vy_dict_sample_add(writer->dict_sample, tuple_data(entry.stmt),
+	vy_dict_sample_add(writer->opts.dict_sample, tuple_data(entry.stmt),
 			   tuple_bsize(entry.stmt));
 	if (vy_run_dump_stmt(entry, &writer->data_xlog, page,
-			     writer->cmp_def, writer->iid == 0) != 0)
+			     writer->opts.cmp_def, writer->opts.iid == 0) != 0)
 		return -1;
 	int64_t lsn = vy_stmt_lsn(entry.stmt);
 	run->info.min_lsn = MIN(run->info.min_lsn, lsn);
@@ -2382,7 +2375,7 @@ vy_run_writer_append_stmt(struct vy_run_writer *writer, struct vy_entry entry)
 		goto out;
 	if (vy_run_writer_write_to_page(writer, entry) != 0)
 		goto out;
-	size_t page_size = (size_t)writer->index_opts.page_size;
+	size_t page_size = (size_t)writer->opts.index_opts.page_size;
 	if (obuf_size(&writer->data_xlog.obuf) >= page_size &&
 	    vy_run_writer_end_page(writer) != 0)
 		goto out;
@@ -2429,11 +2422,12 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 	}
 
 	assert(writer->last.stmt != NULL);
+	struct key_def *cmp_def = writer->opts.cmp_def;
 	const char *key = vy_stmt_is_key(writer->last.stmt) ?
 		          tuple_data(writer->last.stmt) :
-			  tuple_extract_key(writer->last.stmt, writer->cmp_def,
+			  tuple_extract_key(writer->last.stmt, cmp_def,
 					    vy_entry_multikey_idx(writer->last,
-								  writer->cmp_def),
+								  cmp_def),
 					    NULL);
 	if (key == NULL)
 		goto out;
@@ -2451,12 +2445,13 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 	    xlog_rename(&writer->data_xlog) < 0)
 		goto out;
 
-	if (writer->bloom != NULL)
-		run->info.bloom = tuple_bloom_new(writer->bloom,
-						  writer->index_opts.bloom_fpr);
+	if (writer->bloom != NULL) {
+		run->info.bloom = tuple_bloom_new(
+			writer->bloom, writer->opts.index_opts.bloom_fpr);
+	}
 
-	vy_dict_sample_finish(writer->dict_sample,
-			      writer->index_opts.compression_level);
+	vy_dict_sample_finish(writer->opts.dict_sample,
+			      writer->opts.index_opts.compression_level);
 
 	if (lcp_builder_finish(&writer->lcp_index_builder) != 0) {
 		diag_set(OutOfMemory, 0, "malloc", "lcp index");
@@ -2473,8 +2468,8 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 	}
 	run->page_index_size += run->lcp_index.mem_used;
 
-	if (vy_run_write_index(run, writer->dirpath,
-			       writer->space_id, writer->iid) != 0)
+	if (vy_run_write_index(run, writer->opts.dirpath,
+			       writer->opts.space_id, writer->opts.iid) != 0)
 		goto out;
 
 	run->fd = writer->data_xlog.fd;
