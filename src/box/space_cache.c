@@ -142,6 +142,7 @@ refresh_space_wal_ext_cb(struct space *sp, void *unused)
 {
 	(void)unused;
 	sp->wal_ext = wal_ext();
+	space_update_blind_write_mask(sp);
 	return 0;
 }
 
@@ -234,6 +235,7 @@ space_cache_replace(struct space *old_space, struct space *new_space)
 		 * dangling (already freed) memory.
 		 */
 		new_space->wal_ext = wal_ext();
+		space_update_blind_write_mask(new_space);
 	} else {
 		/*
 		 * Delete @old_space from @spaces cache.

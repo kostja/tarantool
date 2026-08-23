@@ -206,7 +206,9 @@ struct space {
 	bool has_foreign_keys;
 	/**
 	 * Bitmask of DML types written without an old-tuple
-	 * lookup. Used by vinyl for space:len().
+	 * lookup, see space_update_blind_write_mask(). Used by
+	 * vinyl to choose between a blind write and a
+	 * read-first one, and for space:len().
 	 */
 	uint32_t blind_write_mask;
 	/**
@@ -655,6 +657,14 @@ space_dump_def(const struct space *space, struct rlist *key_list);
 /** Rebuild index map in a space after a series of swap index. */
 void
 space_fill_index_map(struct space *space);
+
+/**
+ * Recompute the blind write mask. Called whenever one of its
+ * inputs changes: the space structure on creation and alter,
+ * and the WAL extension configuration.
+ */
+void
+space_update_blind_write_mask(struct space *space);
 
 /** Find a constraint identifier by name. */
 struct constraint_id *

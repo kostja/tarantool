@@ -1291,8 +1291,8 @@ vinyl_space_len(struct space *space)
 	struct vy_lsm_stat *stat = &lsm->stat;
 	struct vy_stmt_stat mem = vy_lsm_mem_stmt_stat(lsm);
 	uint32_t mask = space->blind_write_mask;
-	/* Triggers and wal_ext force vy_get at runtime. */
-	if (!rlist_empty(&space->on_replace) || space->wal_ext != NULL)
+	/* Triggers force vy_get at runtime. */
+	if (!rlist_empty(&space->on_replace))
 		mask = 0;
 	/*
 	 * Baseline: (inserts - deletes). Exact across the
@@ -1758,16 +1758,26 @@ vy_unique_key_validate(struct vy_lsm *lsm, const char *key,
 }
 
 /**
- * Returns true if the deferred DELETE optimization should be enabled for the
- * given space. It is regulated by a per-space knob, but we also disable it if
- * the space has UPSERT statements, because the deferred DELETE optimization
- * doesn't handle them properly, see vy_write_iterator_deferred_delete().
+ * Return true if a request of the given type writes to the
+ * space without an old tuple lookup.
  */
 static inline bool
-vy_defer_deletes(struct space *space, struct vy_lsm *pk)
+vy_is_blind_write(struct space *space, struct vy_lsm *pk, uint16_t type)
 {
-	return space->def->opts.defer_deletes &&
-		pk->stat.disk.stmt.upserts == 0;
+	return (space->blind_write_mask & (1 << type)) != 0 &&
+	       rlist_empty(&space->on_replace) &&
+	       /*
+		* With secondary keys present, every upsert is
+		* converted to REPLACE on entry. However, the space
+		* still may have upserts in its runs if secondary
+		* keys were added over a non-empty space. In this
+		* case we can't defer deletes until we compact these
+		* upserts out: we don't implement building a
+		* deferred delete for an UPSERT key during
+		* compaction.
+		*/
+	       (space->index_count <= 1 ||
+		pk->stat.disk.stmt.upserts == 0);
 }
 
 /**
@@ -1800,18 +1810,12 @@ vy_delete(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 	if (vy_unique_key_validate(lsm, key, part_count))
 		return -1;
 	/*
-	 * There are four cases when we need to get the full tuple
-	 * before deletion.
-	 * - if the space has on_replace triggers and need to pass
-	 *   to them the old tuple.
-	 * - if deletion is done by a secondary index.
-	 * - if the space has a secondary index and deferred DELETES are
-	 *   disabled.
-	 * - CDC is enabled.
+	 * Get the full tuple first unless the delete is blind. A
+	 * delete by a secondary key always resolves the primary
+	 * one.
 	 */
-	if ((space->index_count > 1 && !vy_defer_deletes(space, pk)) ||
-	    lsm->index_id > 0 || !rlist_empty(&space->on_replace) ||
-	    space->wal_ext != NULL) {
+	if (!vy_is_blind_write(space, pk, IPROTO_DELETE) ||
+	    lsm->index_id > 0) {
 		if (vy_get_by_raw_key(lsm, tx, vy_tx_read_view(tx),
 				      key, part_count, &stmt->old_tuple) != 0)
 			return -1;
@@ -2199,8 +2203,7 @@ vy_upsert(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 	if (tuple_validate_raw(pk->mem_format, tuple))
 		return -1;
 
-	if (space->index_count == 1 && rlist_empty(&space->on_replace) &&
-	    !space->has_foreign_keys && space->wal_ext == NULL)
+	if (vy_is_blind_write(space, pk, IPROTO_UPSERT))
 		return vy_lsm_upsert(tx, pk, tuple, tuple_end, ops, ops_end);
 
 	const char *old_tuple, *old_tuple_end;
@@ -2361,18 +2364,7 @@ vy_replace(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 	if (vy_check_is_unique(env, tx, space, stmt->new_tuple,
 			       COLUMN_MASK_FULL) != 0)
 		return -1;
-	/*
-	 * There are three cases when we need to get the full tuple on replace.
-	 * - if the space has on_replace triggers and need to pass
-	 *   to them the old tuple.
-	 * - if the space has a secondary index and deferred DELETES are
-	 *   disabled.
-	 * - if the space has WAL extensions.
-	 */
-	bool is_blind = (space->index_count <= 1 ||
-			 vy_defer_deletes(space, pk)) &&
-			rlist_empty(&space->on_replace) &&
-			space->wal_ext == NULL;
+	bool is_blind = vy_is_blind_write(space, pk, IPROTO_REPLACE);
 	if (!is_blind) {
 		if (vy_get(pk, tx, vy_tx_read_view(tx),
 			   stmt->new_tuple, &stmt->old_tuple) != 0)

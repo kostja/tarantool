@@ -120,19 +120,28 @@ space_fill_index_map(struct space *space)
 			space->index[index_count++] = index;
 		}
 	}
+	space_update_blind_write_mask(space);
+}
+
+void
+space_update_blind_write_mask(struct space *space)
+{
+	uint32_t mask = 0;
 	/*
-	 * REPLACE and DELETE are blind when vy_replace/vy_delete
-	 * skip vy_get: no secondary indexes or defer_deletes is on.
-	 * UPSERT is blind on PK-only spaces (fast path).
-	 * Triggers and wal_ext are checked dynamically.
+	 * A WAL extension appends the old tuple to the journal
+	 * row, so every write must read it first.
 	 */
-	space->blind_write_mask = 0;
-	if (space->index_count <= 1 || space->def->opts.defer_deletes) {
-		space->blind_write_mask |= (1 << IPROTO_REPLACE);
-		space->blind_write_mask |= (1 << IPROTO_DELETE);
+	if (!wal_ext_is_enabled()) {
+		/* On_replace triggers are checked dynamically. */
+		if (space->index_count <= 1 ||
+		    space->def->opts.defer_deletes) {
+			mask |= (1 << IPROTO_REPLACE);
+			mask |= (1 << IPROTO_DELETE);
+		}
+		if (space->index_count <= 1 && !space->has_foreign_keys)
+			mask |= (1 << IPROTO_UPSERT);
 	}
-	if (space->index_count <= 1)
-		space->blind_write_mask |= (1 << IPROTO_UPSERT);
+	space->blind_write_mask = mask;
 }
 
 bool
@@ -189,8 +198,7 @@ space_init_constraints(struct space *space)
 		}
 	}
 	space->has_foreign_keys = has_foreign_keys;
-	if (has_foreign_keys)
-		space->blind_write_mask &= ~(1 << IPROTO_UPSERT);
+	space_update_blind_write_mask(space);
 	return 0;
 }
 
