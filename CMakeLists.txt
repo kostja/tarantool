@@ -545,8 +545,7 @@ endif()
 #
 # Wal extensions
 #
-set(ENABLE_WAL_EXT ON)
-set(WAL_EXT_SOURCES wal_ext_impl.c lua/wal_ext.c)
+set(WAL_EXT_SOURCES wal_ext.c lua/wal_ext.c)
 
 #
 # Export libcurl symbols if the library is linked statically.

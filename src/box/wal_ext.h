@@ -5,37 +5,40 @@
  */
 #pragma once
 
-#include "trivia/config.h"
-
-#if defined(ENABLE_WAL_EXT)
-# include "wal_ext_impl.h"
-#else /* !defined(ENABLE_WAL_EXT) */
-
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
 
 #include <stddef.h>
+#include <stdbool.h>
+#include <lua.h>
 
 /** Initialize WAL extensions cache. */
-static inline void
-wal_ext_init(void)
-{
-}
+void
+wal_ext_init(void);
 
 /** Cleanup extensions cache and default value. */
-static inline void
-wal_ext_free(void)
-{
-}
-
-/**
- * Load WAL extensions configuration.
- * This reads `box.wal_ext` lua value to figure out which extensions to
- * enable.
- */
 void
-wal_ext_load_cfg(void);
+wal_ext_free(void);
+
+/** The set of WAL extensions enabled by box.cfg.wal_ext. */
+struct wal_extensions_config {
+	/** Append the old and new tuples to journaled rows. */
+	bool new_old;
+};
+
+/** Parse WAL extensions config from lua value */
+int
+luaT_wal_ext_config_create(struct lua_State *L, int idx,
+			   struct wal_extensions_config *ext_config);
+
+/** Load WAL extensions configuration. */
+void
+wal_ext_set_cfg(struct wal_extensions_config *ext_config);
+
+/** True if any WAL extension is currently enabled. */
+bool
+wal_ext_is_enabled(void);
 
 struct space_wal_ext;
 struct txn_stmt;
@@ -45,29 +48,18 @@ struct request;
  * Fills in @a request with data from @a stmt depending on space's WAL
  * extensions.
  */
-static inline void
+void
 space_wal_ext_process_request(struct space_wal_ext *ext, struct txn_stmt *stmt,
-			      struct request *request)
-{
-	(void)ext;
-	(void)stmt;
-	(void)request;
-}
+			      struct request *request);
 
 /**
- * Return reference to corresponding WAL extension by given space name.
- * Returned object MUST NOT be freed or changed in any way; it should be
- * read-only.
+ * Return the WAL extension to attach to a space, NULL if none
+ * is enabled. The returned object MUST NOT be freed or changed
+ * in any way; it should be read-only.
  */
-static inline struct space_wal_ext *
-space_wal_ext_by_name(const char *space_name)
-{
-	(void)space_name;
-	return NULL;
-}
+struct space_wal_ext *
+wal_ext(void);
 
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif /* defined(__cplusplus) */
-
-#endif /* !defined(ENABLE_WAL_EXT) */

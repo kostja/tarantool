@@ -5,7 +5,7 @@
 #include "box/engine.h"
 #include "box/journal.h"
 #include "box/lua/misc.h"
-#include "box/wal_ext_impl.h"
+#include "box/wal_ext.h"
 #include "box/space_cache.h"
 
 /**

@@ -47,13 +47,11 @@ extern "C" {
 int
 cfg_get_uri_set(const char *param, struct uri_set *uri_set);
 
-#if defined(ENABLE_WAL_EXT)
 /**
  * Parse WAL extensions config table.
  */
 int
 cfg_get_wal_ext(const char *param, struct wal_extensions_config *ext_config);
-#endif
 
 int
 cfg_geti(const char *param);

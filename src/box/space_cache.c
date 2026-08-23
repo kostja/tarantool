@@ -141,7 +141,7 @@ static int
 refresh_space_wal_ext_cb(struct space *sp, void *unused)
 {
 	(void)unused;
-	sp->wal_ext = space_wal_ext_by_name(space_name(sp));
+	sp->wal_ext = wal_ext();
 	return 0;
 }
 
@@ -233,7 +233,7 @@ space_cache_replace(struct space *old_space, struct space *new_space)
 		 * be reconfigured; as a result space->wal_ext will point to
 		 * dangling (already freed) memory.
 		 */
-		new_space->wal_ext = space_wal_ext_by_name(name);
+		new_space->wal_ext = wal_ext();
 	} else {
 		/*
 		 * Delete @old_space from @spaces cache.

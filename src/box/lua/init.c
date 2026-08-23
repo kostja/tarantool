@@ -85,10 +85,8 @@ void
 box_lua_audit_init(struct lua_State *L);
 #endif
 
-#if ENABLE_WAL_EXT
 void
 box_lua_wal_ext_init(struct lua_State *L);
-#endif
 
 #if ENABLE_READ_VIEW
 void
@@ -710,9 +708,7 @@ box_lua_init(struct lua_State *L)
 #ifdef ENABLE_RETENTION_PERIOD
 	box_lua_wal_retention_period_init(L);
 #endif
-#ifdef ENABLE_WAL_EXT
 	box_lua_wal_ext_init(L);
-#endif
 #ifdef ENABLE_READ_VIEW
 	box_lua_read_view_init(L);
 #endif

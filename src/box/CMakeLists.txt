@@ -273,9 +273,7 @@ if(ENABLE_FLIGHT_RECORDER)
     list(APPEND box_sources ${FLIGHT_RECORDER_SOURCES})
 endif()
 
-if(ENABLE_WAL_EXT)
-    list(APPEND box_sources ${WAL_EXT_SOURCES})
-endif()
+list(APPEND box_sources ${WAL_EXT_SOURCES})
 
 if(ENABLE_READ_VIEW)
     list(APPEND box_sources ${READ_VIEW_SOURCES})

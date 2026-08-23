@@ -141,7 +141,7 @@ space_foreach(int (*func)(struct space *sp, void *udata), void *udata);
  * -- existing spaces would keep their stale pointer for the
  * rest of their lifetime.
  *
- * Safe to call unsynchronized: space_wal_ext_by_name() returns
+ * Safe to call unsynchronized: wal_ext() returns
  * either NULL or the address of a static singleton, never a
  * dynamically-allocated object, so an aligned pointer store is
  * visible atomically and there is no use-after-free risk on

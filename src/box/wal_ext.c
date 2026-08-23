@@ -1,4 +1,4 @@
-#include "box/wal_ext_impl.h"
+#include "box/wal_ext.h"
 #include "stdio.h"
 #include "trivia/util.h"
 #include "tuple.h"
@@ -142,9 +142,8 @@ space_wal_ext_process_request(struct space_wal_ext *ext, struct txn_stmt *stmt,
 }
 
 struct space_wal_ext *
-space_wal_ext_by_name(const char *space_name)
+wal_ext(void)
 {
-	(void)space_name;
 	if (global_extensions.new_old) {
 		return &new_old_ext;
 	}
