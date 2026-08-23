@@ -2002,32 +2002,31 @@ vy_update(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 }
 
 /**
- * Insert the tuple in the space without checking duplicates in
- * the primary index.
- * @param env       Vinyl environment.
- * @param tx        Current transaction.
- * @param space     Space in which insert.
- * @param stmt      Tuple to upsert.
- *
- * @retval  0 Success.
- * @retval -1 Memory error or a secondary index duplicate error.
+ * An INSERT writes the statement to the primary index and to
+ * every secondary index. This function performs an INSERT in
+ * the given transaction write set after the tuple has been
+ * validated against the space format.
  */
 static int
-vy_insert_first_upsert(struct vy_env *env, struct vy_tx *tx,
-		       struct space *space, struct tuple *stmt)
+vy_perform_insert(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
+		  struct space *space, struct vy_lsm *pk,
+		  struct request *request)
 {
 	assert(tx != NULL && tx->state == VINYL_TX_READY);
-	assert(space->index_count > 0);
-	assert(vy_stmt_type(stmt) == IPROTO_INSERT);
-	if (vy_check_is_unique(env, tx, space, stmt, COLUMN_MASK_FULL) != 0)
+	stmt->new_tuple = vy_stmt_new_insert(pk->mem_format, request->tuple,
+					     request->tuple_end);
+	if (stmt->new_tuple == NULL)
 		return -1;
-	struct vy_lsm *pk = vy_lsm(space->index[0]);
-	assert(pk->index_id == 0);
-	if (vy_tx_set(tx, pk, stmt) != 0)
+	if (vy_check_is_unique(env, tx, space, stmt->new_tuple,
+			       COLUMN_MASK_FULL) != 0)
 		return -1;
-	for (uint32_t i = 1; i < space->index_count; ++i) {
-		struct vy_lsm *lsm = vy_lsm(space->index[i]);
-		if (vy_tx_set(tx, lsm, stmt) != 0)
+	if (vy_tx_set(tx, pk, stmt->new_tuple) != 0)
+		return -1;
+	for (uint32_t iid = 1; iid < space->index_count; ++iid) {
+		struct vy_lsm *lsm = vy_lsm(space->index[iid]);
+		if (vy_is_committed(env, lsm))
+			continue;
+		if (vy_tx_set(tx, lsm, stmt->new_tuple) != 0)
 			return -1;
 	}
 	return 0;
@@ -2233,13 +2232,8 @@ vy_upsert(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 	 * If the old tuple was not found then UPSERT
 	 * turns into INSERT.
 	 */
-	if (stmt->old_tuple == NULL) {
-		stmt->new_tuple = vy_stmt_new_insert(pk->mem_format,
-						     tuple, tuple_end);
-		if (stmt->new_tuple == NULL)
-			return -1;
-		return vy_insert_first_upsert(env, tx, space, stmt->new_tuple);
-	}
+	if (stmt->old_tuple == NULL)
+		return vy_perform_insert(env, tx, stmt, space, pk, request);
 	uint32_t old_size;
 	old_tuple = tuple_data_range(stmt->old_tuple, &old_size);
 	old_tuple_end = old_tuple + old_size;
@@ -2308,25 +2302,7 @@ vy_insert(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 		return 0;
 	if (tuple_validate_raw(pk->mem_format, request->tuple))
 		return -1;
-	/* First insert into the primary index. */
-	stmt->new_tuple = vy_stmt_new_insert(pk->mem_format, request->tuple,
-					     request->tuple_end);
-	if (stmt->new_tuple == NULL)
-		return -1;
-	if (vy_check_is_unique(env, tx, space, stmt->new_tuple,
-			       COLUMN_MASK_FULL) != 0)
-		return -1;
-	if (vy_tx_set(tx, pk, stmt->new_tuple) != 0)
-		return -1;
-
-	for (uint32_t iid = 1; iid < space->index_count; ++iid) {
-		struct vy_lsm *lsm = vy_lsm(space->index[iid]);
-		if (vy_is_committed(env, lsm))
-			continue;
-		if (vy_tx_set(tx, lsm, stmt->new_tuple) != 0)
-			return -1;
-	}
-	return 0;
+	return vy_perform_insert(env, tx, stmt, space, pk, request);
 }
 
 /**
