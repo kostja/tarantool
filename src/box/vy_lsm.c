@@ -90,8 +90,8 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 		  int64_t *p_generation, struct tuple_format *key_format,
 		  vy_upsert_thresh_cb upsert_thresh_cb,
 		  void *upsert_thresh_arg,
-		  vy_compaction_trigger_cb compaction_trigger_cb,
-		  void *compaction_trigger_arg)
+		  vy_compaction_cb compaction_cb,
+		  void *compaction_cb_arg)
 {
 	/*
 	 * The bounds of the whole key space: the empty key marked
@@ -119,8 +119,8 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 	tuple_format_ref(key_format);
 	env->upsert_thresh_cb = upsert_thresh_cb;
 	env->upsert_thresh_arg = upsert_thresh_arg;
-	env->compaction_trigger_cb = compaction_trigger_cb;
-	env->compaction_trigger_arg = compaction_trigger_arg;
+	env->compaction_cb = compaction_cb;
+	env->compaction_cb_arg = compaction_cb_arg;
 	env->too_long_threshold = TIMEOUT_INFINITY;
 	env->lsm_count = 0;
 	memset(&env->dict_stat, 0, sizeof(env->dict_stat));
@@ -1059,7 +1059,7 @@ vy_lsm_add_range(struct vy_lsm *lsm, struct vy_range *range)
 	vy_range_update_compaction_priority(range, &lsm->opts,
 					    vy_lsm_range_size(lsm));
 	vy_lsm_acct_range(lsm, range);
-	vy_range_heap_update(&lsm->range_heap, range);
+	vy_lsm_update_range_heap(lsm, range);
 }
 
 void
@@ -1131,25 +1131,28 @@ vy_lsm_acct_read_amp(struct vy_lsm *lsm, struct vy_range *range,
 	if (waste <= range->count.bytes * VY_READ_AMP_THRESHOLD)
 		return;
 	/*
-	 * The waste has crossed the threshold.  Invoke the
-	 * callback to recompute the compaction priority and
-	 * reschedule the LSM tree.
+	 * The waste has crossed the threshold. Re-plan the range:
+	 * vy_compaction_plan_check_read_amp() resets the stats and
+	 * sets threshold_version to suppress further triggers
+	 * until the slice set changes.
 	 *
-	 * The callback calls vy_lsm_update_range ->
-	 * vy_compaction_plan_check_read_amp, which resets
-	 * the stats and sets threshold_version to suppress
-	 * further triggers until the slice set changes.
-	 *
-	 * Zero the counters again after the callback as a
-	 * safety net: if compaction completes during a scan
-	 * yield and reduces the range to <= 1 slice,
-	 * check_read_amp returns early without resetting.
-	 * The redundant reset for the normal path is harmless.
+	 * Zero the counters again after the re-plan as a safety
+	 * net: if compaction completes during a scan yield and
+	 * reduces the range to <= 1 slice, check_read_amp returns
+	 * early without resetting. The redundant reset for the
+	 * normal path is harmless.
 	 */
-	if (lsm->env->compaction_trigger_cb != NULL)
-		lsm->env->compaction_trigger_cb(lsm, range,
-				lsm->env->compaction_trigger_arg);
+	vy_lsm_update_range(lsm, range, NULL, NULL);
 	vy_read_amp_stat_reset(&range->read_amp);
+}
+
+void
+vy_lsm_update_range_heap(struct vy_lsm *lsm, struct vy_range *range)
+{
+	vy_range_heap_update(&lsm->range_heap, range);
+	if (lsm->env->compaction_cb != NULL)
+		lsm->env->compaction_cb(lsm, range,
+					lsm->env->compaction_cb_arg);
 }
 
 void
@@ -1179,7 +1182,7 @@ vy_lsm_update_range(struct vy_lsm *lsm, struct vy_range *range,
 	 * A dump or forced compaction may happen concurrently.
 	 */
 	if (!heap_node_is_stray(&range->heap_node)) {
-		vy_range_heap_update(&lsm->range_heap, range);
+		vy_lsm_update_range_heap(lsm, range);
 	}
 	/*
 	 * If the new slice is last, reset the blind write probe

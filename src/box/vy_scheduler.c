@@ -422,6 +422,13 @@ vy_worker_pool_put(struct vy_worker *worker)
 	stailq_add_entry(&pool->idle_workers, worker, in_idle);
 }
 
+/**
+ * A range's compaction timer: hand the range to the scheduler
+ * for a re-plan. The reclaim clock the plan is measured against
+ * only advances when the TTL controller says so, so nudge it
+ * too -- the timer expected the clock to have moved, and the
+ * controller's own rate limit keeps the nudge cheap.
+ */
 void
 vy_scheduler_create(struct vy_scheduler *scheduler, int write_threads,
 		    struct vy_run_env *run_env, struct rlist *read_views,
@@ -554,12 +561,16 @@ vy_scheduler_add_lsm(struct vy_scheduler *scheduler, struct vy_lsm *lsm)
 }
 
 void
-vy_scheduler_update_lsm(struct vy_scheduler *scheduler, struct vy_lsm *lsm)
+vy_scheduler_compaction_cb(struct vy_lsm *lsm, struct vy_range *range,
+			   void *arg /* struct vy_scheduler */)
 {
-	assert(! heap_node_is_stray(&lsm->in_dump));
-	assert(! heap_node_is_stray(&lsm->in_compaction));
-	vy_dump_heap_update(&scheduler->dump_heap, lsm);
+	struct vy_scheduler *scheduler = arg;
+	(void)range;
+	/* The node is stray during recovery. */
+	if (heap_node_is_stray(&lsm->in_compaction))
+		return;
 	vy_compaction_heap_update(&scheduler->compaction_heap, lsm);
+	fiber_cond_signal(&scheduler->scheduler_cond);
 }
 
 static void
@@ -567,7 +578,7 @@ vy_scheduler_pin_lsm(struct vy_scheduler *scheduler, struct vy_lsm *lsm)
 {
 	assert(!lsm->is_dumping);
 	if (lsm->pin_count++ == 0)
-		vy_scheduler_update_lsm(scheduler, lsm);
+		vy_dump_heap_update(&scheduler->dump_heap, lsm);
 }
 
 static void
@@ -576,7 +587,7 @@ vy_scheduler_unpin_lsm(struct vy_scheduler *scheduler, struct vy_lsm *lsm)
 	assert(!lsm->is_dumping);
 	assert(lsm->pin_count > 0);
 	if (--lsm->pin_count == 0)
-		vy_scheduler_update_lsm(scheduler, lsm);
+		vy_dump_heap_update(&scheduler->dump_heap, lsm);
 }
 
 void
@@ -629,15 +640,6 @@ vy_scheduler_dump(struct vy_scheduler *scheduler)
 		fiber_cond_wait(&scheduler->dump_cond);
 	}
 	return 0;
-}
-
-void
-vy_scheduler_force_compaction(struct vy_scheduler *scheduler,
-			      struct vy_lsm *lsm)
-{
-	vy_lsm_force_compaction(lsm);
-	vy_scheduler_update_lsm(scheduler, lsm);
-	fiber_cond_signal(&scheduler->scheduler_cond);
 }
 
 bool
@@ -1357,7 +1359,7 @@ vy_task_dump_complete(struct vy_task *task)
 						    vy_lsm_range_size(lsm));
 		vy_lsm_acct_range(lsm, range);
 		if (!heap_node_is_stray(&range->heap_node))
-			vy_range_heap_update(&lsm->range_heap, range);
+			vy_lsm_update_range_heap(lsm, range);
 	}
 	free(new_slices);
 
@@ -1373,7 +1375,8 @@ delete_mems:
 	/* The iterator has been cleaned up in a worker thread. */
 	task->wi->iface->close(task->wi);
 
-	vy_scheduler_update_lsm(scheduler, lsm);
+	/* The dump freed the mems and cleared is_dumping. */
+	vy_dump_heap_update(&scheduler->dump_heap, lsm);
 
 	if (lsm->index_id != 0)
 		vy_scheduler_unpin_lsm(scheduler, lsm->pk);
@@ -1415,7 +1418,7 @@ vy_task_dump_abort(struct vy_task *task)
 	vy_run_discard(task->new_run);
 
 	lsm->is_dumping = false;
-	vy_scheduler_update_lsm(scheduler, lsm);
+	vy_dump_heap_update(&scheduler->dump_heap, lsm);
 
 	if (lsm->index_id != 0)
 		vy_scheduler_unpin_lsm(scheduler, lsm->pk);
@@ -1477,8 +1480,11 @@ vy_task_dump_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	}
 
 	if (dump_lsn < 0) {
-		/* Nothing to do, pick another LSM tree. */
-		vy_scheduler_update_lsm(scheduler, lsm);
+		/*
+		 * Nothing to do, pick another LSM tree: the empty
+		 * mems deleted above changed its generation.
+		 */
+		vy_dump_heap_update(&scheduler->dump_heap, lsm);
 		vy_scheduler_complete_dump(scheduler);
 		return 0;
 	}
@@ -1521,7 +1527,7 @@ vy_task_dump_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 			    new_run->dict);
 
 	lsm->is_dumping = true;
-	vy_scheduler_update_lsm(scheduler, lsm);
+	vy_dump_heap_update(&scheduler->dump_heap, lsm);
 
 	if (lsm->index_id != 0) {
 		/*
@@ -1587,6 +1593,8 @@ vy_task_compaction_complete(struct vy_task *task)
 	 */
 	if (lsm->is_dropped) {
 		vy_run_discard(new_run);
+		/* The re-plan below, which re-orders, is skipped. */
+		vy_compaction_heap_update(&scheduler->compaction_heap, lsm);
 		goto out;
 	}
 
@@ -1741,7 +1749,6 @@ vy_task_compaction_complete(struct vy_task *task)
 out:
 	/* The iterator has been cleaned up in worker. */
 	task->wi->iface->close(task->wi);
-	vy_scheduler_update_lsm(scheduler, lsm);
 
 	say_verbose("%s: completed compacting range %s",
 		    vy_lsm_name(lsm), vy_range_str(range));
@@ -1751,7 +1758,6 @@ out:
 static void
 vy_task_compaction_abort(struct vy_task *task)
 {
-	struct vy_scheduler *scheduler = task->scheduler;
 	struct vy_lsm *lsm = task->lsm;
 	struct vy_range *range = task->range;
 
@@ -1774,7 +1780,6 @@ vy_task_compaction_abort(struct vy_task *task)
 	vy_run_discard(task->new_run);
 	/* Rebuild the compaction plan - it was moved out in vy_task_new. */
 	vy_lsm_update_range(lsm, range, NULL, NULL);
-	vy_scheduler_update_lsm(scheduler, lsm);
 }
 
 static int
@@ -1845,7 +1850,7 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	 * so that it doesn't get selected again.
 	 */
 	vy_range_heap_delete(&lsm->range_heap, range);
-	vy_scheduler_update_lsm(scheduler, lsm);
+	vy_compaction_heap_update(&scheduler->compaction_heap, lsm);
 
 	say_verbose("%s: started compacting range %s, runs %d/%d",
 		    vy_lsm_name(lsm), vy_range_str(range),
@@ -2070,7 +2075,6 @@ retry:
 	 * and non-empty small ranges.
 	 */
 	if (vy_lsm_coalesce_range(lsm, range)) {
-		vy_scheduler_update_lsm(scheduler, lsm);
 		vy_lsm_unref(lsm);
 		goto retry;
 	}
@@ -2081,7 +2085,6 @@ retry:
 	if (range->compaction_plan.split_key != NULL &&
 	    vy_lsm_split_range(lsm, range,
 			       range->compaction_plan.split_key)) {
-		vy_scheduler_update_lsm(scheduler, lsm);
 		vy_lsm_unref(lsm);
 		goto retry;
 	}

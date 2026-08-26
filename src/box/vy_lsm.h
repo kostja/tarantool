@@ -57,6 +57,7 @@ struct histogram;
 struct tuple;
 struct tuple_format;
 struct vy_lsm;
+struct vy_scheduler;
 struct vy_mem;
 struct vy_mem_env;
 struct vy_recovery;
@@ -67,14 +68,13 @@ typedef void
 (*vy_upsert_thresh_cb)(struct vy_lsm *lsm, struct vy_entry entry, void *arg);
 
 /**
- * Callback invoked when read-amp waste in a range crosses the
- * compaction threshold.  The callback should recompute the
- * compaction priority for the range (e.g. via
- * vy_lsm_update_range) and reschedule the LSM tree.
+ * Callback invoked when a range's compaction priority has
+ * changed, see vy_lsm_update_range_heap(). The scheduler
+ * re-orders its queues and starts the range's compaction timer
+ * with the plan that has just been computed.
  */
 typedef void
-(*vy_compaction_trigger_cb)(struct vy_lsm *lsm, struct vy_range *range,
-			    void *arg);
+(*vy_compaction_cb)(struct vy_lsm *lsm, struct vy_range *range, void *arg);
 
 /** Common LSM tree environment. */
 struct vy_lsm_env {
@@ -143,12 +143,12 @@ struct vy_lsm_env {
 	/** Memory pool for vy_history_node allocations. */
 	struct mempool history_node_pool;
 	/**
-	 * Callback invoked when read-amp waste crosses the
-	 * compaction threshold, see vy_compaction_trigger_cb.
+	 * Callback invoked when a range's compaction priority
+	 * has changed, see vy_compaction_cb.
 	 */
-	vy_compaction_trigger_cb compaction_trigger_cb;
-	/** Argument passed to compaction_trigger_cb. */
-	void *compaction_trigger_arg;
+	vy_compaction_cb compaction_cb;
+	/** Argument passed to compaction_cb. */
+	void *compaction_cb_arg;
 };
 
 /** Look up a dictionary by id in the LSM tree's dict hash. */
@@ -187,8 +187,8 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 		  int64_t *p_generation, struct tuple_format *key_format,
 		  vy_upsert_thresh_cb upsert_thresh_cb,
 		  void *upsert_thresh_arg,
-		  vy_compaction_trigger_cb compaction_trigger_cb,
-		  void *compaction_trigger_arg);
+		  vy_compaction_cb compaction_cb,
+		  void *compaction_cb_arg);
 
 /** Destroy a common LSM tree environment. */
 void
@@ -749,6 +749,19 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
  */
 bool
 vy_lsm_coalesce_range(struct vy_lsm *lsm, struct vy_range *range);
+
+/**
+ * Update the range's position in the tree's compaction queue
+ * after its compaction priority changed, and tell the
+ * scheduler, see vy_compaction_cb. Keep it a single entry point
+ * to re-plan, as time-based schedules, e.g. compaction on TTL
+ * expiration, rely on this.
+ *
+ * @param lsm   The tree the range belongs to.
+ * @param range The re-planned range.
+ */
+void
+vy_lsm_update_range_heap(struct vy_lsm *lsm, struct vy_range *range);
 
 /**
  * Mark all ranges of an LSM tree for major compaction.

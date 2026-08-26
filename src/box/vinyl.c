@@ -1389,9 +1389,7 @@ vinyl_index_bsize(struct index *index)
 static void
 vinyl_index_compact(struct index *index)
 {
-	struct vy_lsm *lsm = vy_lsm(index);
-	struct vy_env *env = vy_env(index->engine);
-	vy_scheduler_force_compaction(&env->scheduler, lsm);
+	vy_lsm_force_compaction(vy_lsm(index));
 }
 
 /* {{{ Public API of transaction control: start/end transaction,
@@ -2572,21 +2570,6 @@ static void
 vy_squash_schedule(struct vy_lsm *lsm, struct vy_entry entry,
 		   void /* struct vy_env */ *arg);
 
-/**
- * Callback invoked when read-amp waste in a range crosses
- * the compaction threshold.  Recomputes the range's compaction
- * priority and updates the scheduler's compaction heap.
- */
-static void
-vy_env_compaction_trigger(struct vy_lsm *lsm, struct vy_range *range,
-			  void *arg /* struct vy_env */)
-{
-	struct vy_env *env = arg;
-	vy_lsm_update_range(lsm, range, NULL, NULL);
-	vy_scheduler_update_lsm(&env->scheduler, lsm);
-	fiber_cond_signal(&env->scheduler.scheduler_cond);
-}
-
 static struct vy_env *
 vy_env_new(const char *path, size_t memory,
 	   int read_threads, int write_threads, bool force_recovery)
@@ -2629,7 +2612,8 @@ vy_env_new(const char *path, size_t memory,
 			      &e->scheduler.generation,
 			      e->stmt_env.key_format,
 			      vy_squash_schedule, e,
-			      vy_env_compaction_trigger, e) != 0)
+			      vy_scheduler_compaction_cb,
+			      &e->scheduler) != 0)
 		goto error_lsm_env;
 
 	struct slab_cache *slab_cache = cord_slab_cache();

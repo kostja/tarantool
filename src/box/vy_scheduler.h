@@ -49,6 +49,7 @@ extern "C" {
 
 struct fiber;
 struct vy_lsm;
+struct vy_range;
 struct vy_quota;
 struct vy_run_env;
 struct vy_worker;
@@ -212,6 +213,16 @@ int
 vy_scheduler_add_lsm(struct vy_scheduler *, struct vy_lsm *);
 
 /**
+ * The compaction callback of the LSM environment, see
+ * vy_compaction_cb: re-order the scheduler's queues and start
+ * the range's compaction timer with the plan that has just
+ * been computed.
+ */
+void
+vy_scheduler_compaction_cb(struct vy_lsm *lsm, struct vy_range *range,
+			   void *arg /* struct vy_scheduler */);
+
+/**
  * Trigger dump of all currently existing in-memory trees.
  */
 void
@@ -224,21 +235,6 @@ vy_scheduler_trigger_dump(struct vy_scheduler *scheduler);
 int
 vy_scheduler_dump(struct vy_scheduler *scheduler);
 
-/**
- * Force major compaction of an LSM tree.
- */
-void
-vy_scheduler_force_compaction(struct vy_scheduler *scheduler,
-			      struct vy_lsm *lsm);
-
-/**
- * Update the position of @a lsm in the dump and compaction heaps.
- * Call after changing the compaction priority of a range or
- * the dump priority of the LSM tree.
- */
-void
-vy_scheduler_update_lsm(struct vy_scheduler *scheduler,
-			struct vy_lsm *lsm);
 
 /**
  * Schedule a checkpoint. Please call vy_scheduler_wait_checkpoint()
