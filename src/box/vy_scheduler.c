@@ -1358,8 +1358,7 @@ vy_task_dump_complete(struct vy_task *task)
 		vy_range_update_compaction_priority(range, &lsm->opts,
 						    vy_lsm_range_size(lsm));
 		vy_lsm_acct_range(lsm, range);
-		if (!heap_node_is_stray(&range->heap_node))
-			vy_lsm_update_range_heap(lsm, range);
+		vy_lsm_update_range_heap(lsm, range);
 	}
 	free(new_slices);
 
@@ -1582,9 +1581,6 @@ vy_task_compaction_complete(struct vy_task *task)
 
 	vy_dict_stat_add(&lsm->env->dict_stat,
 			 &task->dict_sample.stat_delta);
-	/* Put the range back into the compaction queue. */
-	assert(heap_node_is_stray(&range->heap_node));
-	vy_range_heap_insert(&lsm->range_heap, range);
 	/*
 	 * The LSM tree could have been dropped while we were writing the new
 	 * run. In this case all the information about the LSM tree ranges
@@ -1593,8 +1589,9 @@ vy_task_compaction_complete(struct vy_task *task)
 	 */
 	if (lsm->is_dropped) {
 		vy_run_discard(new_run);
-		/* The re-plan below, which re-orders, is skipped. */
-		vy_compaction_heap_update(&scheduler->compaction_heap, lsm);
+		/* Give the plan back: the re-plan below is skipped. */
+		vy_range_return_plan(range);
+		vy_lsm_update_range(lsm, range, NULL, NULL);
 		goto out;
 	}
 
@@ -1702,6 +1699,7 @@ vy_task_compaction_complete(struct vy_task *task)
 	 * threshold is actually crossed.
 	 */
 	vy_read_amp_stat_reset(&range->read_amp);
+	vy_range_return_plan(range);
 	vy_lsm_update_range(lsm, range, new_slice, plan->slices);
 	/*
 	 * Sweep 3: propagate shared runs to neighbor ranges now that
@@ -1764,14 +1762,6 @@ vy_task_compaction_abort(struct vy_task *task)
 	/* The iterator has been cleaned up in worker. */
 	task->wi->iface->close(task->wi);
 
-	/*
-	 * The range is already in the queue if it's an abort of
-	 * compaction complete hook.
-	 */
-	if (heap_node_is_stray(&range->heap_node)) {
-		vy_range_heap_insert(&lsm->range_heap, range);
-	}
-
 	struct error *e = diag_last_error(&task->diag);
 	error_log(e);
 	say_error("%s: failed to compact range %s",
@@ -1779,6 +1769,7 @@ vy_task_compaction_abort(struct vy_task *task)
 
 	vy_run_discard(task->new_run);
 	/* Rebuild the compaction plan - it was moved out in vy_task_new. */
+	vy_range_return_plan(range);
 	vy_lsm_update_range(lsm, range, NULL, NULL);
 }
 
@@ -1845,19 +1836,18 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 			    lsm->dict_last.train_period,
 			    new_run->dict);
 
-	/*
-	 * Remove the range we are going to compact from the heap
-	 * so that it doesn't get selected again.
-	 */
-	vy_range_heap_delete(&lsm->range_heap, range);
-	vy_compaction_heap_update(&scheduler->compaction_heap, lsm);
-
 	say_verbose("%s: started compacting range %s, runs %d/%d",
 		    vy_lsm_name(lsm), vy_range_str(range),
 		    plan->count, range->slice_count);
-	/* Move the compaction plan from the range to the task. */
+	/*
+	 * Move the compaction plan from the range to the task.
+	 * The range keeps its place in the queue: with no plan
+	 * left it has no priority either, so it sinks to the
+	 * bottom and is not selected again.
+	 */
 	vy_compaction_plan_move(&task->compaction_plan,
 				&range->compaction_plan);
+	vy_lsm_update_range_heap(lsm, range);
 
 	*p_task = task;
 	return 0;

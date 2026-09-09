@@ -203,9 +203,21 @@ struct vy_compaction_plan {
 	 * lcp_group->key. It is safe because no run can be freed
 	 * between plan computation and scheduling: run files are
 	 * only deleted after compaction completes, and a range
-	 * is removed from the scheduler heap while its task runs.
+	 * with a scheduled plan is never selected.
 	 */
 	const char *split_key;
+	/**
+	 * True while a compaction task holds this plan, see
+	 * vy_compaction_plan_move(). An empty plan does not mean
+	 * the same thing: a dump re-plans every range it touches,
+	 * including one a task is compacting, so the range would
+	 * regain a plan and a priority within milliseconds of
+	 * losing them, and a second task would compact the slices
+	 * the first one is about to delete. The flag outlives
+	 * such a re-plan, and the range is not selected, split or
+	 * coalesced until the task gives the plan back.
+	 */
+	bool is_scheduled;
 	/**
 	 * True if this is a single-slice bloat compaction:
 	 * a slice whose run file has significant unreferenced
@@ -353,11 +365,22 @@ vy_range_heap_less(struct vy_range *r1, struct vy_range *r2)
 #undef HEAP_LESS
 #undef HEAP_NAME
 
+/**
+ * Give the compaction plan back to the range once its task is
+ * over, so that the range can be planned and selected again.
+ * The counterpart of vy_compaction_plan_move().
+ */
+static inline void
+vy_range_return_plan(struct vy_range *range)
+{
+	range->compaction_plan.is_scheduled = false;
+}
+
 /** Return true if a task is scheduled for a given range. */
 static inline bool
 vy_range_is_scheduled(struct vy_range *range)
 {
-	return heap_node_is_stray(&range->heap_node);
+	return range->compaction_plan.is_scheduled;
 }
 
 /**

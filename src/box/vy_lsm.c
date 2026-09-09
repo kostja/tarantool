@@ -1065,7 +1065,8 @@ vy_lsm_add_range(struct vy_lsm *lsm, struct vy_range *range)
 void
 vy_lsm_remove_range(struct vy_lsm *lsm, struct vy_range *range)
 {
-	assert(! heap_node_is_stray(&range->heap_node));
+	assert(!vy_range_is_scheduled(range));
+	assert(!heap_node_is_stray(&range->heap_node));
 	vy_range_heap_delete(&lsm->range_heap, range);
 	vy_range_tree_remove(&lsm->range_tree, range);
 	if (lsm->last_range == range)
@@ -1177,13 +1178,7 @@ vy_lsm_update_range(struct vy_lsm *lsm, struct vy_range *range,
 	vy_range_update_compaction_priority(range, &lsm->opts,
 					    vy_lsm_range_size(lsm));
 	vy_lsm_acct_range(lsm, range);
-	/*
-	 * The range is removed from the LSM heap during compaction.
-	 * A dump or forced compaction may happen concurrently.
-	 */
-	if (!heap_node_is_stray(&range->heap_node)) {
-		vy_lsm_update_range_heap(lsm, range);
-	}
+	vy_lsm_update_range_heap(lsm, range);
 	/*
 	 * If the new slice is last, reset the blind write probe
 	 * stats built against the old bloom filter.

@@ -165,6 +165,14 @@ vy_compaction_plan_seal(struct vy_range *range)
 		 */
 		range->needs_compaction = false;
 	}
+	if (plan->is_scheduled) {
+		/*
+		 * A task is compacting this range: whatever the
+		 * plan says, the range must not be selected again
+		 * until the task gives the plan back.
+		 */
+		plan->priority = 0;
+	}
 	plan->slices[plan->count] = NULL;
 }
 
@@ -180,7 +188,10 @@ vy_compaction_plan_move(struct vy_compaction_plan *dst,
 			struct vy_compaction_plan *src)
 {
 	assert(dst->slices == NULL);
+	assert(!src->is_scheduled);
 	*dst = *src;
+	dst->is_scheduled = false;
+	src->is_scheduled = true;
 	src->slices = NULL;
 	src->count = 0;
 	src->capacity = 0;
